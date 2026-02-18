@@ -31,7 +31,7 @@ from ouroboros.utils import (
     utc_now_iso, read_text, append_jsonl, clip_text,
     truncate_for_log, sanitize_tool_result_for_log, sanitize_tool_args_for_log,
 )
-from ouroboros.llm import LLMClient
+from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ class BackgroundConsciousness:
         self._wakeup_event = threading.Event()
         self._next_wakeup_sec: float = 300.0
         self._observations: queue.Queue = queue.Queue()
+        self._deferred_events: list = []
 
         # Budget tracking
         self._bg_spent_usd: float = 0.0
@@ -79,10 +80,7 @@ class BackgroundConsciousness:
 
     @property
     def _model(self) -> str:
-        # BG consciousness uses a cheap-but-capable model to minimize cost.
-        # Override via OUROBOROS_MODEL_LIGHT env var (Colab secret).
-        # Qwen3.5-Plus: $0.40/MTok prompt vs Gemini-3-Pro $2.0/MTok → 5x cheaper
-        return os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "qwen/qwen3.5-plus-02-15"
+        return os.environ.get("OUROBOROS_MODEL_LIGHT", "") or DEFAULT_LIGHT_MODEL
 
     def start(self) -> str:
         if self.is_running:
@@ -107,9 +105,13 @@ class BackgroundConsciousness:
         self._paused = True
 
     def resume(self) -> None:
-        """Resume after task completes."""
+        """Resume after task completes. Flush any deferred events first."""
+        if self._deferred_events and self._event_queue is not None:
+            for evt in self._deferred_events:
+                self._event_queue.put(evt)
+            self._deferred_events.clear()
         self._paused = False
-        self._wakeup_event.set()  # Wake up to check state
+        self._wakeup_event.set()
 
     def inject_observation(self, text: str) -> None:
         """Push an event the consciousness should notice."""
@@ -188,6 +190,8 @@ class BackgroundConsciousness:
 
         try:
             for round_idx in range(1, self._MAX_BG_ROUNDS + 1):
+                if self._paused:
+                    break
                 msg, usage = self._llm.chat(
                     messages=messages,
                     model=model,
@@ -234,6 +238,9 @@ class BackgroundConsciousness:
                 content = msg.get("content") or ""
                 tool_calls = msg.get("tool_calls") or []
 
+                if self._paused:
+                    break
+
                 # If we have content but no tool calls, we're done
                 if content and not tool_calls:
                     final_content = content
@@ -254,10 +261,13 @@ class BackgroundConsciousness:
                 # If neither content nor tool_calls, stop
                 break
 
-            # Forward all accumulated events to supervisor
+            # Forward or defer accumulated events
             if all_pending_events and self._event_queue is not None:
-                for evt in all_pending_events:
-                    self._event_queue.put(evt)
+                if self._paused:
+                    self._deferred_events.extend(all_pending_events)
+                else:
+                    for evt in all_pending_events:
+                        self._event_queue.put(evt)
 
             # Log the thought with round count
             append_jsonl(self._drive_root / "logs" / "events.jsonl", {
