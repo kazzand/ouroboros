@@ -407,37 +407,62 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
-    """Synthesize text via OpenAI TTS and send as Telegram voice message."""
-    import base64 as b64mod, os
+    """Synthesize text via TTS and send as Telegram voice message.
+    Primary: gTTS (Google, no API key needed, reliable).
+    Fallback: OpenAI TTS (if OPENAI_API_KEY available and gTTS fails).
+    """
+    import os, io
     try:
         chat_id = int(evt.get("chat_id") or 0)
         text = str(evt.get("text") or "")
         voice = str(evt.get("voice") or "alloy")
+        lang = str(evt.get("lang") or "ru")
         if not chat_id or not text:
             return
 
-        # OpenAI TTS — returning OGG bytes via requests
-        import requests as req
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
+        audio_bytes = None
+        error_info = []
+
+        # Primary: gTTS (Google TTS, free, no rate limits)
+        try:
+            from gtts import gTTS
+            tts = gTTS(text=text[:5000], lang=lang)
+            buf = io.BytesIO()
+            tts.write_to_fp(buf)
+            buf.seek(0)
+            audio_bytes = buf.read()
+        except Exception as e:
+            error_info.append(f"gTTS failed: {e}")
+
+        # Fallback: OpenAI TTS
+        if audio_bytes is None:
+            try:
+                import requests as req
+                api_key = os.environ.get("OPENAI_API_KEY", "")
+                if api_key:
+                    resp = req.post(
+                        "https://api.openai.com/v1/audio/speech",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={"model": "tts-1", "input": text[:4096],
+                              "voice": voice, "response_format": "opus"},
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    audio_bytes = resp.content
+                else:
+                    error_info.append("OpenAI TTS: no API key")
+            except Exception as e:
+                error_info.append(f"OpenAI TTS failed: {e}")
+
+        if audio_bytes is None:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                 "type": "send_voice_error", "error": "OPENAI_API_KEY not set"},
+                 "type": "send_voice_error", "errors": error_info},
             )
             return
 
-        resp = req.post(
-            "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": "tts-1", "input": text[:4096],
-                  "voice": voice, "response_format": "opus"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        ogg_bytes = resp.content
-
-        ok, err = ctx.TG.send_voice(chat_id, ogg_bytes)
+        ok, err = ctx.TG.send_voice(chat_id, audio_bytes)
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -450,7 +475,6 @@ def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
             {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
              "type": "send_voice_event_error", "error": repr(e)},
         )
-
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
