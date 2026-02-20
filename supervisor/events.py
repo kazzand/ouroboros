@@ -404,6 +404,53 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to log owner_message_injected event", exc_info=True)
 
 
+
+
+def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
+    """Synthesize text via OpenAI TTS and send as Telegram voice message."""
+    import base64 as b64mod, os
+    try:
+        chat_id = int(evt.get("chat_id") or 0)
+        text = str(evt.get("text") or "")
+        voice = str(evt.get("voice") or "alloy")
+        if not chat_id or not text:
+            return
+
+        # OpenAI TTS — returning OGG bytes via requests
+        import requests as req
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            ctx.append_jsonl(
+                ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                 "type": "send_voice_error", "error": "OPENAI_API_KEY not set"},
+            )
+            return
+
+        resp = req.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": "tts-1", "input": text[:4096],
+                  "voice": voice, "response_format": "opus"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        ogg_bytes = resp.content
+
+        ok, err = ctx.TG.send_voice(chat_id, ogg_bytes)
+        if not ok:
+            ctx.append_jsonl(
+                ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                 "type": "send_voice_error", "chat_id": chat_id, "error": err},
+            )
+    except Exception as e:
+        ctx.append_jsonl(
+            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "type": "send_voice_event_error", "error": repr(e)},
+        )
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -420,6 +467,7 @@ EVENT_HANDLERS = {
     "schedule_task": _handle_schedule_task,
     "cancel_task": _handle_cancel_task,
     "send_photo": _handle_send_photo,
+    "send_voice": _handle_send_voice,
     "toggle_evolution": _handle_toggle_evolution,
     "toggle_consciousness": _handle_toggle_consciousness,
     "owner_message_injected": _handle_owner_message_injected,

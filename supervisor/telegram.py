@@ -132,6 +132,33 @@ class TelegramClient:
                 time.sleep(0.8 * (attempt + 1))
         return False, last_err
 
+
+    def send_voice(self, chat_id: int, ogg_bytes: bytes,
+                   caption: str = "") -> Tuple[bool, str]:
+        """Send a voice message (OGG/Opus) to a Telegram chat."""
+        last_err = "unknown"
+        for attempt in range(3):
+            try:
+                files = {"voice": ("voice.ogg", ogg_bytes, "audio/ogg")}
+                data: Dict[str, Any] = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption[:1024]
+                r = requests.post(
+                    f"{self.base}/sendVoice",
+                    data=data, files=files, timeout=30,
+                )
+                r.raise_for_status()
+                resp = r.json()
+                if resp.get("ok") is True:
+                    return True, "ok"
+                last_err = f"telegram_api_error: {resp}"
+            except Exception as e:
+                last_err = repr(e)
+            if attempt < 2:
+                import time
+                time.sleep(0.8 * (attempt + 1))
+        return False, last_err
+
     def download_file_base64(self, file_id: str, max_bytes: int = 10_000_000) -> Tuple[Optional[str], str]:
         """Download a file from Telegram and return (base64_data, mime_type). Returns (None, "") on failure."""
         try:

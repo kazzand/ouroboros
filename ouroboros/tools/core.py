@@ -90,6 +90,26 @@ def _send_photo(ctx: ToolContext, image_base64: str, caption: str = "") -> str:
     return "OK: photo queued for delivery to owner."
 
 
+
+
+def _send_voice(ctx: ToolContext, text: str, voice: str = "alloy") -> str:
+    """Synthesize text to speech and send as a voice message to the owner's Telegram.
+    
+    Uses OpenAI TTS API (tts-1 model). Voice options: alloy, echo, fable, onyx, nova, shimmer.
+    """
+    if not ctx.current_chat_id:
+        return "⚠️ No active chat — cannot send voice."
+    if not text or not text.strip():
+        return "⚠️ text is empty."
+
+    ctx.pending_events.append({
+        "type": "send_voice",
+        "chat_id": ctx.current_chat_id,
+        "text": text[:4096],
+        "voice": voice,
+    })
+    return f"OK: voice message queued (voice={voice}, chars={len(text)})."
+
 # ---------------------------------------------------------------------------
 # Codebase digest
 # ---------------------------------------------------------------------------
@@ -373,7 +393,18 @@ def get_tools() -> List[ToolEntry]:
                 "caption": {"type": "string", "description": "Optional caption for the photo"},
             }, "required": ["image_base64"]},
         }, _send_photo),
-        ToolEntry("codebase_digest", {
+        ToolEntry("send_voice", {
+            "name": "send_voice",
+            "description": (
+                "Synthesize text to speech and send as a voice message to the owner's Telegram. "
+                "Uses OpenAI TTS. Voice options: alloy, echo, fable, onyx, nova, shimmer."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "text": {"type": "string", "description": "Text to synthesize (max 4096 chars)"},
+                "voice": {"type": "string", "description": "Voice name: alloy (default), echo, fable, onyx, nova, shimmer"},
+            }, "required": ["text"]},
+        }, _send_voice),
+                ToolEntry("codebase_digest", {
             "name": "codebase_digest",
             "description": "Get a compact digest of the entire codebase: files, sizes, classes, functions. One call instead of many repo_read calls.",
             "parameters": {"type": "object", "properties": {}, "required": []},
