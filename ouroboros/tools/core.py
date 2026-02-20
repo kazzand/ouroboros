@@ -92,10 +92,12 @@ def _send_photo(ctx: ToolContext, image_base64: str, caption: str = "") -> str:
 
 
 
-def _send_voice(ctx: ToolContext, text: str, voice: str = "alloy") -> str:
-    """Synthesize text to speech and send as a voice message to the owner's Telegram.
+def _send_voice(ctx: ToolContext, text: str, lang: str = "ru", voice: str = "alloy") -> str:
+    """Synthesize text to speech via gTTS + ffmpeg (OGG Opus) and send as a Telegram voice message.
     
-    Uses OpenAI TTS API (tts-1 model). Voice options: alloy, echo, fable, onyx, nova, shimmer.
+    Uses gTTS (Google TTS, free, no API key needed). ffmpeg converts MP3->OGG Opus.
+    lang: language code for gTTS (ru, en, de, fr, es...). Default: ru.
+    voice: fallback OpenAI voice if gTTS fails (alloy, echo, fable, onyx, nova, shimmer).
     """
     if not ctx.current_chat_id:
         return "⚠️ No active chat — cannot send voice."
@@ -106,9 +108,10 @@ def _send_voice(ctx: ToolContext, text: str, voice: str = "alloy") -> str:
         "type": "send_voice",
         "chat_id": ctx.current_chat_id,
         "text": text[:4096],
+        "lang": lang,
         "voice": voice,
     })
-    return f"OK: voice message queued (voice={voice}, chars={len(text)})."
+    return f"OK: voice message queued (lang={lang}, chars={len(text)})."
 
 # ---------------------------------------------------------------------------
 # Codebase digest
@@ -396,12 +399,14 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("send_voice", {
             "name": "send_voice",
             "description": (
-                "Synthesize text to speech and send as a voice message to the owner's Telegram. "
-                "Uses OpenAI TTS. Voice options: alloy, echo, fable, onyx, nova, shimmer."
+                "Synthesize text to speech via gTTS + ffmpeg (OGG Opus) and send as a Telegram voice message. "
+                "Uses Google TTS (free, no API key). lang controls language (ru, en, de, fr, etc). "
+                "Use this to send voice/audio messages to the owner."
             ),
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Text to synthesize (max 4096 chars)"},
-                "voice": {"type": "string", "description": "Voice name: alloy (default), echo, fable, onyx, nova, shimmer"},
+                "lang": {"type": "string", "description": "Language code for gTTS: ru, en, de, fr, es, etc. Default: ru"},
+                "voice": {"type": "string", "description": "Fallback OpenAI voice if gTTS fails: alloy, echo, fable, onyx, nova, shimmer"},
             }, "required": ["text"]},
         }, _send_voice),
                 ToolEntry("codebase_digest", {

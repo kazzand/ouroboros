@@ -408,10 +408,10 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
     """Synthesize text via TTS and send as Telegram voice message.
-    Primary: gTTS (Google, no API key needed, reliable).
-    Fallback: OpenAI TTS (if OPENAI_API_KEY available and gTTS fails).
+    Primary: gTTS (Google, no API key needed) + ffmpeg MP3->OGG Opus conversion.
+    Fallback: raw MP3 if ffmpeg fails; then OpenAI TTS opus format.
     """
-    import os, io
+    import os, io, subprocess, tempfile
     try:
         chat_id = int(evt.get("chat_id") or 0)
         text = str(evt.get("text") or "")
@@ -423,18 +423,48 @@ def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
         audio_bytes = None
         error_info = []
 
-        # Primary: gTTS (Google TTS, free, no rate limits)
+        # Primary: gTTS -> MP3 -> OGG Opus via ffmpeg
         try:
             from gtts import gTTS
             tts = gTTS(text=text[:5000], lang=lang)
             buf = io.BytesIO()
             tts.write_to_fp(buf)
             buf.seek(0)
-            audio_bytes = buf.read()
+            mp3_bytes = buf.read()
+
+            # Convert MP3 -> OGG Opus (Telegram voice format)
+            mp3_path = None
+            ogg_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3f:
+                    mp3f.write(mp3_bytes)
+                    mp3_path = mp3f.name
+                ogg_path = mp3_path.replace(".mp3", ".ogg")
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-i", mp3_path,
+                     "-c:a", "libopus", "-b:a", "48k", ogg_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0 and os.path.exists(ogg_path):
+                    with open(ogg_path, "rb") as f:
+                        audio_bytes = f.read()
+                else:
+                    error_info.append(f"ffmpeg rc={result.returncode}: {result.stderr[-200:]}")
+                    audio_bytes = mp3_bytes  # fallback: raw MP3
+            except Exception as fe:
+                error_info.append(f"ffmpeg exception: {fe}")
+                audio_bytes = mp3_bytes  # fallback: raw MP3
+            finally:
+                for p in [mp3_path, ogg_path]:
+                    if p:
+                        try:
+                            os.unlink(p)
+                        except Exception:
+                            pass
         except Exception as e:
             error_info.append(f"gTTS failed: {e}")
 
-        # Fallback: OpenAI TTS
+        # Fallback: OpenAI TTS (opus format)
         if audio_bytes is None:
             try:
                 import requests as req
@@ -469,6 +499,9 @@ def _handle_send_voice(evt: Dict[str, Any], ctx: Any) -> None:
                 {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                  "type": "send_voice_error", "chat_id": chat_id, "error": err},
             )
+        if error_info:
+            import logging
+            logging.getLogger(__name__).debug("send_voice warnings: %s", error_info)
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
