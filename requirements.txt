@@ -1,5 +1,5 @@
-
 openai>=1.0.0
 requests
 playwright
 playwright-stealth
+gtts>=2.5.0
