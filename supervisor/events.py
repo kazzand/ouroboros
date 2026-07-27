@@ -396,6 +396,12 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     required_capabilities = fields.get("required_capabilities") if isinstance(fields.get("required_capabilities"), list) else []
     workspace_root = str(fields.get("workspace_root") or "")
     workspace_mode = str(fields.get("workspace_mode") or "")
+    executor_ref = fields.get("executor_ref") if isinstance(fields.get("executor_ref"), dict) else {}
+    placement_metadata = (
+        dict(fields.get("metadata"))
+        if isinstance(fields.get("metadata"), dict)
+        else {}
+    )
     project_id = str(fields.get("project_id") or "")
     allowed_resources = fields.get("allowed_resources") if isinstance(fields.get("allowed_resources"), dict) else {}
     task_contract = fields.get("task_contract") if isinstance(fields.get("task_contract"), dict) else {}
@@ -431,6 +437,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "required_capabilities": required_capabilities,
         "workspace_root": workspace_root,
         "workspace_mode": workspace_mode,
+        "executor_ref": executor_ref,
         "project_id": project_id,
         "allowed_resources": allowed_resources,
         "task_contract": task_contract,
@@ -443,6 +450,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
         "metadata": {
+            **placement_metadata,
             "parent_task_id": parent_id,
             "root_task_id": root_task_id,
             "session_id": session_id,
@@ -455,6 +463,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "child_drive_root": child_drive_root,
             "workspace_root": workspace_root,
             "workspace_mode": workspace_mode,
+            **({"executor_ref": executor_ref} if executor_ref else {}),
             "allowed_resources": allowed_resources,
             "task_contract": task_contract,
             "model_lane": requested_model_lane,
@@ -477,6 +486,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     if not required_capabilities:
         task.pop("required_capabilities", None)
         task["metadata"].pop("required_capabilities", None)
+    if not executor_ref:
+        task.pop("executor_ref", None)
     if parent_id:
         task["parent_task_id"] = parent_id
     return task
@@ -1290,6 +1301,17 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
         except Exception:
             final_task_result = {}
+        if task:
+            try:
+                from ouroboros.remote_workspace import finish_remote_task
+
+                finish_remote_task(task, str(task_id))
+            except Exception:
+                log.warning(
+                    "Failed to release remote task lease for %s",
+                    task_id,
+                    exc_info=True,
+                )
 
     outcome_axes = normalize_outcome_axes({**evt, **(final_task_result if isinstance(final_task_result, dict) else {})})
     reason_code = final_task_result.get("reason_code") or evt.get("reason_code")
@@ -1957,7 +1979,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> None:
             target=str(outcome.get("task_id") or evt.get("task_id") or ""),
             status=str(outcome.get("status") or "needs_manual_target"),
         )
-        if str(outcome.get("status") or "") != "scheduled":
+        if str(outcome.get("status") or "") not in {"scheduled", "requested", "connecting"}:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
@@ -1985,6 +2007,60 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> None:
                 "event_repr": repr(evt)[:500],
             },
         )
+
+
+def _handle_remote_admission_result(evt: Dict[str, Any], ctx: Any) -> None:
+    """Finish the queue-owned REQUESTED transition on the supervisor loop."""
+
+    from supervisor.task_lifecycle import complete_requested_admission
+
+    outcome = complete_requested_admission(
+        str(evt.get("task_id") or ""),
+        admission_id=str(evt.get("admission_id") or ""),
+        admitted_task=(
+            evt.get("admitted_task")
+            if isinstance(evt.get("admitted_task"), dict)
+            else None
+        ),
+        error=str(evt.get("error") or ""),
+        reason_code=str(evt.get("reason_code") or "remote_admission_failed"),
+    )
+    from ouroboros.gateway.tasks import finish_remote_task_admission
+
+    finish_remote_task_admission(
+        str(evt.get("task_id") or ""),
+        str(evt.get("admission_id") or ""),
+    )
+    try:
+        from ouroboros.gateway.connections import _broadcast_connection_state
+
+        scheduled = outcome.get("ok") and outcome.get("status") == "scheduled"
+        evidence = {}
+        if isinstance(evt.get("diagnostic"), dict) and evt["diagnostic"]:
+            evidence["diagnostic"] = evt["diagnostic"]
+        if isinstance(evt.get("log_refs"), list) and evt["log_refs"]:
+            evidence["log_refs"] = evt["log_refs"]
+        _broadcast_connection_state(
+            str(evt.get("connection_id") or ""),
+            {
+                "status": "ready" if scheduled else "degraded",
+                "phase": "admission",
+                "completion": "scheduled" if scheduled else str(
+                    outcome.get("status") or "failed"
+                ),
+                "task_id": str(evt.get("task_id") or ""),
+                "project_id": str(evt.get("project_id") or ""),
+                "error_code": "" if scheduled else str(
+                    outcome.get("reason_code")
+                    or evt.get("reason_code")
+                    or "remote_admission_failed"
+                ),
+                "action": "" if scheduled else "inspect_remote_diagnostics",
+                **evidence,
+            },
+        )
+    except Exception:
+        log.debug("remote admission state broadcast failed", exc_info=True)
 
 
 def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
@@ -2264,12 +2340,79 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     ]
     workspace_root = str(evt.get("workspace_root") or "").strip()
     workspace_mode = str(evt.get("workspace_mode") or "").strip()
+    event_metadata = (
+        dict(evt.get("metadata"))
+        if isinstance(evt.get("metadata"), dict)
+        else {}
+    )
+    executor_ref = (
+        dict(evt.get("executor_ref"))
+        if isinstance(evt.get("executor_ref"), dict)
+        else dict(event_metadata.get("executor_ref"))
+        if isinstance(event_metadata.get("executor_ref"), dict)
+        else {}
+    )
+    placement_metadata: Dict[str, Any] = {}
+    placement_reject_detail = ""
+    workspace_ref = None
+    try:
+        from ouroboros.workspace_ref import normalize_workspace_ref
+
+        workspace_ref = normalize_workspace_ref(
+            event_metadata.get("_sealed_workspace_ref")
+        )
+    except ValueError as exc:
+        placement_reject_detail = (
+            f"Subagent rejected: invalid sealed workspace placement: {exc}"
+        )
+    if workspace_ref is not None:
+        placement_metadata["_sealed_workspace_ref"] = dict(workspace_ref)
+    if executor_ref:
+        placement_metadata["executor_ref"] = executor_ref
+    if workspace_ref and workspace_ref["kind"] == "ssh" and not placement_reject_detail:
+        if workspace_root:
+            placement_reject_detail = (
+                "Subagent rejected: SSH workspace placement must not carry a Home workspace_root."
+            )
+        elif workspace_mode != "external":
+            placement_reject_detail = (
+                "Subagent rejected: SSH workspace placement requires workspace_mode='external'."
+            )
+        else:
+            try:
+                from ouroboros.workspace_executor import normalize_executor_ref
+
+                normalized_executor = normalize_executor_ref(executor_ref)
+                if (
+                    normalized_executor is None
+                    or normalized_executor.kind != "ssh_exec"
+                    or normalized_executor.executor_id
+                    != workspace_ref["connection_id"]
+                    or normalized_executor.workspace_id
+                    != workspace_ref["workspace_id"]
+                ):
+                    placement_reject_detail = (
+                        "Subagent rejected: SSH workspace and executor identities differ."
+                    )
+            except ValueError as exc:
+                placement_reject_detail = (
+                    f"Subagent rejected: invalid SSH executor placement: {exc}"
+                )
     project_id = str(evt.get("project_id") or "").strip()
     acting_reject_detail = ""
     if delegation_role == "subagent":
         task_constraint, workspace_root, workspace_mode, acting_reject_detail = _resolve_subagent_constraint(
             ctx, tid=tid, requested_constraint=task_constraint, workspace_root=workspace_root,
             workspace_mode=workspace_mode, base_sha=str(evt.get("base_sha") or ""), parent_task_id=str(parent_id or ""))
+    if (
+        workspace_ref
+        and workspace_ref["kind"] == "ssh"
+        and workspace_root
+        and not placement_reject_detail
+    ):
+        placement_reject_detail = (
+            "Subagent rejected: SSH workspace placement cannot be rebound to a Home workspace_root."
+        )
     allowed_resources = normalize_allowed_resources(evt.get("allowed_resources") or {})
     task_contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else build_task_contract({
         "id": tid,
@@ -2299,7 +2442,10 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "constraints": constraints,
         "context": task_context,
         "workspace_root": workspace_root,
-        "workspace_mode": workspace_mode, "project_id": project_id,
+        "workspace_mode": workspace_mode,
+        "executor_ref": executor_ref,
+        "metadata": placement_metadata,
+        "project_id": project_id,
         "allowed_resources": allowed_resources,
         "task_contract": task_contract,
         "chat_id": chat_id or None,
@@ -2329,21 +2475,26 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         )
         return
 
-    if delegation_role == "subagent" and acting_reject_detail:
-        log.warning("Acting subagent request rejected: task_id=%s detail=%s", tid, acting_reject_detail[:160])
+    subagent_reject_detail = placement_reject_detail or acting_reject_detail
+    if delegation_role == "subagent" and subagent_reject_detail:
+        log.warning(
+            "Subagent request rejected: task_id=%s detail=%s",
+            tid,
+            subagent_reject_detail[:160],
+        )
         _record_delegation_constraint(
             root_task_id,
             task_id=tid,
             role=role,
             directive="block_surface",
             scope={"surface": str((task_constraint or {}).get("surface") or evt.get("write_surface") or "")},
-            rationale=acting_reject_detail,
+            rationale=subagent_reject_detail,
             advisory=True,
         )
         _reject_schedule_task(
             ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
             parent_id=parent_id, root_task_id=root_task_id, role=role,
-            result_fields=result_fields, detail=acting_reject_detail,
+            result_fields=result_fields, detail=subagent_reject_detail,
         )
         return
 
@@ -2530,6 +2681,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_constraint": task_constraint,
             "workspace_root": workspace_root,
             "workspace_mode": workspace_mode,
+            "executor_ref": executor_ref,
+            "metadata": placement_metadata,
             "project_id": project_id,
             "allowed_resources": allowed_resources,
             "task_contract": task_contract,
@@ -2992,6 +3145,7 @@ EVENT_HANDLERS = {
     "schedule_task": _handle_schedule_task,
     "schedule_subagent": _handle_schedule_task,
     "promote_chat_to_task": _handle_promote_chat_to_task,
+    "remote_admission_result": _handle_remote_admission_result,
     "ensure_project_scope": _handle_ensure_project_scope,
     "routing_manual_target": _handle_routing_manual_target,
     "steer_task": _handle_steer_task,

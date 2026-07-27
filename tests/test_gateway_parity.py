@@ -9,8 +9,17 @@ from ouroboros.gateway.contracts import (
     WS_MESSAGE_TYPES,
     ChatInbound,
     ChatOutbound,
+    ConnectionActionResponse,
+    ConnectionAddRequest,
+    ConnectionDirsResponse,
+    ConnectionEntry,
+    ConnectionListResponse,
+    ConnectionStateOutbound,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    ProjectCreateRequest,
+    ProjectEntry,
+    ProjectWorkspaceRef,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
@@ -103,6 +112,23 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    for cls in (
+        ProjectWorkspaceRef,
+        ProjectCreateRequest,
+        ProjectEntry,
+        ConnectionEntry,
+        ConnectionAddRequest,
+        ConnectionListResponse,
+        ConnectionActionResponse,
+        ConnectionDirsResponse,
+        ConnectionStateOutbound,
+    ):
+        expected = set(get_type_hints(cls, include_extras=True))
+        actual = _js_typedef_fields(text, cls.__name__)
+        assert actual == expected, (
+            f"{cls.__name__} JSDoc fields drifted: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+        )
     assert re.search(r"@property \{boolean\} context_mode_auto_low\b", text), (
         "StateResponse.context_mode_auto_low must be a JSDoc boolean — the owner control branches on it"
     )
@@ -138,6 +164,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
     assert {"chat", "command", "photo", "video", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
     assert "message_annotation" in WS_MESSAGE_TYPES
+    assert "connection_state" in WS_MESSAGE_TYPES
     assert _js_typedef_fields(text, "MessageAnnotationOutbound") == {
         "type",
         "annotation_type",
@@ -169,6 +196,52 @@ def test_gateway_money_contracts_keep_unavailable_distinct_from_zero():
     ):
         assert _contains_none(chat_hints[field]), f"ChatOutbound.{field} must admit ledger-unavailable null"
     assert {"cost_accounting_status", "cost_final", "cost_with_children_partial"} <= set(chat_hints)
+
+
+def test_remote_connections_browser_surface_uses_named_gateway_helpers():
+    root = pathlib.Path(__file__).resolve().parent.parent
+    api_client = (root / "web" / "modules" / "api_client.js").read_text(
+        encoding="utf-8"
+    )
+    for helper in (
+        "connections",
+        "connectionAdd",
+        "connectionTest",
+        "connectionBootstrap",
+        "connectionReconnect",
+        "connectionRetrust",
+        "connectionRetire",
+        "connectionDirs",
+        "ownerLogin",
+    ):
+        assert re.search(rf"\b{helper}\s*:", api_client)
+    settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(
+        encoding="utf-8"
+    )
+    settings = (root / "web" / "modules" / "settings.js").read_text(
+        encoding="utf-8"
+    )
+    connections_ui = (
+        root / "web" / "modules" / "connections_ui.js"
+    ).read_text(encoding="utf-8")
+    project_create = (
+        root / "web" / "modules" / "project_create.js"
+    ).read_text(encoding="utf-8")
+    assert "{ value: 'connections', label: 'Connections' }" in settings_ui
+    assert 'id="settings-connections-root"' in settings_ui
+    assert "initConnectionsUI({ root: page, apiClient, ws })" in settings
+    for action in ("test", "bootstrap", "reconnect", "retrust", "retire"):
+        assert f"data-conn-action=\"{action}\"" in connections_ui
+    assert "renderSafeField" in connections_ui
+    assert "collectSafeFieldValues" in connections_ui
+    assert "data-conn-auth" in connections_ui
+    assert "owner_auth_not_configured" in connections_ui
+    assert "settings-ghost-btn" not in connections_ui
+    assert 'value="ssh"' in project_create
+    assert "apiClient.connectionDirs" in project_create
+    assert "payload.workspace_ref" in project_create
+    assert "isSelectableRemoteConnection" in project_create
+    assert 'role="alert"' in project_create
 
 
 def test_skill_lifecycle_queue_contract_matches_runtime_shape():

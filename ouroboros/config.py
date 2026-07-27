@@ -28,6 +28,9 @@ DATA_DIR = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR", APP_ROOT / "data"))
 SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR / "settings.json"))
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
+REMOTE_CONNECTIONS_PATH = pathlib.Path(os.environ.get(
+    "OUROBOROS_REMOTE_CONNECTIONS_PATH", DATA_DIR / "state" / "remote_connections.json",
+))
 
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
@@ -121,6 +124,13 @@ SETTINGS_DEFAULTS = {
     # One-minor deprecated no-op: the v6.65 shared terminal-or-cutoff boundary
     # no longer stops on heartbeat staleness, but custom saved values stay loud.
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
+    "OUROBOROS_SSH_CONNECT_TIMEOUT_SEC": 20,
+    "OUROBOROS_SSH_KEEPALIVE_INTERVAL_SEC": 5,
+    "OUROBOROS_SSH_KEEPALIVE_COUNT": 3,
+    "OUROBOROS_SSH_BOOTSTRAP_TIMEOUT_SEC": 120,
+    "OUROBOROS_SSH_ADMISSION_TIMEOUT_SEC": 60,
+    "OUROBOROS_SSH_RECONCILE_TIMEOUT_SEC": 20,
+    "OUROBOROS_SSH_SHUTDOWN_TIMEOUT_SEC": 5,
     "TOTAL_BUDGET": 10.0,
     "OUROBOROS_PER_TASK_COST_USD": 20.0,
     # cloud.ru catalog prices are RUB per 1M while the budget is USD. No implicit
@@ -687,6 +697,21 @@ def get_per_call_timeout_ceiling_sec() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return int(SETTINGS_DEFAULTS["OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"])
+
+
+def get_ssh_timeout_sec(kind: str) -> int:
+    """Operational SSH bounds; protocol/security limits remain code constants."""
+    hard_maxes = {
+        "connect": 300, "keepalive_interval": 60, "keepalive_count": 12,
+        "bootstrap": 900, "admission": 300, "reconcile": 120, "shutdown": 30,
+    }
+    if kind not in hard_maxes:
+        raise ValueError(f"unknown SSH timeout kind: {kind}")
+    key = {
+        "keepalive_interval": "OUROBOROS_SSH_KEEPALIVE_INTERVAL_SEC",
+        "keepalive_count": "OUROBOROS_SSH_KEEPALIVE_COUNT",
+    }.get(kind, f"OUROBOROS_SSH_{kind.upper()}_TIMEOUT_SEC")
+    return _bounded_positive_int_setting(key, default=int(SETTINGS_DEFAULTS[key]), hard_max=hard_maxes[kind])
 
 
 def get_plan_task_swarm_timeout_sec() -> float:

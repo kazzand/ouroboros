@@ -178,7 +178,7 @@ def test_retry_limit_exhausted_marks_failed(tmp_path):
          patch("ouroboros.task_results.load_task_result", return_value=None), \
          patch("ouroboros.task_results.write_task_result", side_effect=fake_write), \
          patch("supervisor.workers.get_event_q", return_value=MagicMock()), \
-         patch("supervisor.message_bus.get_bridge", return_value=None):
+         patch("supervisor.workers.send_with_budget"):
         W.ensure_workers_healthy()
 
     assert len(enqueued) == 0, "Task should NOT be requeued after limit exhausted"

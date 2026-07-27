@@ -846,9 +846,18 @@ def _select_subagent_constraint(write_surface, write_root, protected_paths_grant
     )
 
 
+def _constraint_workspace_root(workspace_root: str, workspace_ref: Any) -> str:
+    """Use the target-native root for a child that inherits an SSH workspace."""
+
+    if isinstance(workspace_ref, dict) and workspace_ref.get("kind") == "ssh":
+        return str(workspace_ref.get("remote_root") or "")
+    return workspace_root
+
+
 def _populate_subagent_event_extras(
     evt: Dict[str, Any], *, current_chat_id: Any, child_drive: Any, workspace_root: str,
-    workspace_mode: str, executor_ref: Any, context: str, parent_task_id: str,
+    workspace_mode: str, workspace_ref: Any, executor_ref: Any, context: str,
+    parent_task_id: str,
 ) -> None:
     """Add the optional fields of a schedule_subagent event in place (extracted from
     _schedule_task to keep it under the method gate; pure field assignment)."""
@@ -861,6 +870,11 @@ def _populate_subagent_event_extras(
         evt["workspace_root"] = workspace_root
     if workspace_mode:
         evt["workspace_mode"] = workspace_mode
+    if workspace_ref:
+        evt["metadata"] = {
+            **(evt.get("metadata") if isinstance(evt.get("metadata"), dict) else {}),
+            "_sealed_workspace_ref": dict(workspace_ref),
+        }
     if executor_ref:
         evt["executor_ref"] = executor_ref
         evt["metadata"] = {**(evt.get("metadata") if isinstance(evt.get("metadata"), dict) else {}), "executor_ref": executor_ref}
@@ -965,11 +979,20 @@ def _inherited_workspace_from_active_repo(
     """Inherit an external active workspace for readonly children when metadata is absent."""
     if workspace_root:
         return workspace_root, workspace_mode
+    from ouroboros.workspace_ref import (
+        RemoteWorkspacePathError,
+        is_remote_workspace,
+    )
+
+    if is_remote_workspace(ctx):
+        return "", workspace_mode or "external"
     try:
         active = active_repo_dir_for(ctx).resolve(strict=False)
         system = system_repo_dir_for(ctx).resolve(strict=False)
         if active != system:
             return str(active), workspace_mode or "external"
+    except RemoteWorkspacePathError:
+        raise
     except Exception:
         pass
     return workspace_root, workspace_mode
@@ -1132,6 +1155,9 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    parent_workspace_ref = workspace_ref_for(ctx)
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
     requested_surface = str(params.get("write_surface") or "").strip().lower()
     # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
@@ -1139,16 +1165,16 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     # constraint selection, mutating detection, and the event all treat it as read-only (P5).
     if requested_surface == "read_only":
         requested_surface = ""
-    # FR2: a flat parent requesting external_workspace with no write_root builds
-    # cooperatively in ONE host-minted shared tree (helper extracted to keep this
-    # method under the size gate).
+    inherits_parent_workspace = requested_surface in {"", "external_workspace"}
+    # FR2: flat children cooperatively use one host-minted shared tree.
     effective_write_root, caller_profile, coop_err = resolve_cooperative_write_root(
         ctx, requested_surface, params.get("write_root", ""), workspace_root, metadata)
     if coop_err:
         return coop_err
     task_constraint = _select_subagent_constraint(
         requested_surface, effective_write_root, params.get("protected_paths_grant", False),
-        params.get("external_tool_grants"), workspace_root,
+        params.get("external_tool_grants"),
+        _constraint_workspace_root(workspace_root, parent_workspace_ref),
         caller_readonly=(caller_profile == "local_readonly_subagent"))
     if isinstance(task_constraint, str):
         return task_constraint
@@ -1166,7 +1192,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         or metadata.get("allowed_resources")
         or {}
     )
-    executor_ref = _resolve_executor_ref(ctx)
+    executor_ref = _resolve_executor_ref(ctx) if inherits_parent_workspace else {}
+    inherited_workspace_ref = (
+        parent_workspace_ref
+        if inherits_parent_workspace
+        else None
+    )
     # Auto lane: mutating children use Heavy; read-only children use Light.
     child_mutating = bool(requested_surface) or normalize_bool(may_mutate)
     lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth, mutating=child_mutating)
@@ -1265,7 +1296,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         _populate_subagent_event_extras(
             evt, current_chat_id=current_chat_id, child_drive=child_drive,
             workspace_root=workspace_root, workspace_mode=workspace_mode,
-            executor_ref=executor_ref, context=context, parent_task_id=parent_task_id,
+            workspace_ref=inherited_workspace_ref, executor_ref=executor_ref,
+            context=context, parent_task_id=parent_task_id,
         )
         try:
             write_task_result(
@@ -1304,6 +1336,9 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                 task_group_id=task_group_id,
                 task_group=task_group,
                 subagent_envelope=envelope,
+                metadata=evt.get("metadata")
+                if isinstance(evt.get("metadata"), dict)
+                else {},
                 result="Subagent request queued. Awaiting supervisor acceptance.",
             )
         except Exception:

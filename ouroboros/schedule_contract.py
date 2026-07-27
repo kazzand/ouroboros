@@ -14,6 +14,8 @@ RESERVED_TEMPLATE_FIELDS = frozenset({
     "child_drive_root", "budget_drive_root", "parent_task_id",
     "root_task_id", "delegation_role", "task_constraint",
     "task_id", "session_id", "actor_id", "headless_child_drive_root",
+    "workspace_ref", "_sealed_workspace_ref", "_project_room_workspace_ref",
+    "executor_ref", "connection_id", "remote_root", "workspace_id",
 })
 
 

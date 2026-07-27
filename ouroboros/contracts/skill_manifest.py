@@ -64,6 +64,7 @@ class SkillManifest:
     env_from_settings: List[str] = field(default_factory=list)
     # Script manifests list script mappings.
     scripts: List[Dict[str, str]] = field(default_factory=list)
+    tool_execution_affinity: Dict[str, str] = field(default_factory=dict)
     # Extension manifests point at a Python entry module.
     entry: str = ""
     permissions: List[str] = field(default_factory=list)
@@ -115,6 +116,19 @@ class SkillManifest:
             warnings.append("type=extension requires non-empty 'entry'")
         if self.is_script() and not self.scripts:
             warnings.append("type=script requires at least one entry in 'scripts'")
+        for item in self.scripts:
+            if "execution_affinity" in item and item["execution_affinity"] not in {
+                "home", "active_workspace"
+            }:
+                warnings.append(
+                    "scripts[].execution_affinity must be home or active_workspace"
+                )
+        for short_name, affinity in self.tool_execution_affinity.items():
+            if not short_name or affinity not in {"home", "active_workspace"}:
+                warnings.append(
+                    "tool_execution_affinity must map non-empty tool names to "
+                    "home or active_workspace"
+                )
         # An instruction skill is pure guidance (SKILL.md) with no executable surface; a
         # declared entry/scripts is a structural type mismatch the manifest reviewer flags.
         if self.type in VALID_SKILL_TYPES and not self.is_extension() and not self.is_script() and (self.entry or self.scripts):
@@ -190,6 +204,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         "timeout_sec",
         "env_from_settings",
         "scripts",
+        "tool_execution_affinity",
         "entry",
         "permissions",
         "subscribe_events",
@@ -216,11 +231,37 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         raise SkillManifestError("'scripts' must be a list when provided")
     for item in scripts_raw:
         if isinstance(item, dict):
-            scripts.append({str(k): str(v) for k, v in item.items()})
+            normalized_item = {str(k): str(v) for k, v in item.items()}
+            if "execution_affinity" in normalized_item:
+                affinity = normalized_item["execution_affinity"].strip().lower()
+                if affinity not in {"home", "active_workspace"}:
+                    raise SkillManifestError(
+                        "scripts[].execution_affinity must be home or active_workspace"
+                    )
+                normalized_item["execution_affinity"] = affinity
+            scripts.append(normalized_item)
         elif isinstance(item, str):
             scripts.append({"name": item})
         else:
             raise SkillManifestError("each 'scripts' item must be a mapping or string")
+
+    affinity_raw = data.get("tool_execution_affinity", {})
+    if affinity_raw in (None, ""):
+        affinity_raw = {}
+    if not isinstance(affinity_raw, dict):
+        raise SkillManifestError("'tool_execution_affinity' must be a mapping")
+    tool_execution_affinity = {
+        str(key).strip(): str(value).strip().lower()
+        for key, value in affinity_raw.items()
+    }
+    if any(
+        not key or value not in {"home", "active_workspace"}
+        for key, value in tool_execution_affinity.items()
+    ):
+        raise SkillManifestError(
+            "'tool_execution_affinity' must map non-empty tool names to "
+            "home or active_workspace"
+        )
 
     ui_tab = data.get("ui_tab")
     if ui_tab is not None and not isinstance(ui_tab, dict):
@@ -319,6 +360,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         timeout_sec=timeout_sec,
         env_from_settings=_string_list(data.get("env_from_settings")),
         scripts=scripts,
+        tool_execution_affinity=tool_execution_affinity,
         entry=str(data.get("entry") or "").strip(),
         permissions=_string_list(data.get("permissions")),
         subscribe_events=_string_list(data.get("subscribe_events")),

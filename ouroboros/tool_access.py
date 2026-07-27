@@ -20,6 +20,7 @@ from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_
 from ouroboros.contracts.skill_payload_policy import resolve_skill_payload_target
 from ouroboros.shell_parse import is_absolute_path_text
 from ouroboros.utils import safe_relpath
+from ouroboros.workspace_native import path_is_relative_to
 
 
 def _user_files_root() -> pathlib.Path:
@@ -320,6 +321,14 @@ def is_external_workspace(ctx: Any) -> bool:
     return str(getattr(ctx, "workspace_mode", "") or "").strip().lower() == "external"
 
 
+def _has_home_native_external_workspace(ctx: Any) -> bool:
+    """Whether external-workspace Home path carve-outs are meaningful."""
+
+    from ouroboros.workspace_ref import is_remote_workspace
+
+    return is_external_workspace(ctx) and not is_remote_workspace(ctx)
+
+
 def active_tool_profile(ctx: Any) -> ToolProfile:
     constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     mode = str(getattr(constraint, "mode", "") or "").strip()
@@ -591,14 +600,6 @@ def normalize_root(root: str | None, *, default: ResourceRoot = "active_workspac
     return candidate  # type: ignore[return-value]
 
 
-def path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
-    try:
-        pathlib.Path(path).resolve(strict=False).relative_to(pathlib.Path(root).resolve(strict=False))
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 def normalize_root_relative(root: pathlib.Path, path: str) -> str:
     """Map a model-supplied path to a root-relative string when it redundantly
     encodes the root, so structural/read tools accept the paths an agent
@@ -777,7 +778,7 @@ def user_files_path_block_reason(
     # sibling checkouts). The runtime-overlap and credential guards BELOW still
     # run on the full path, so the Ouroboros repo/data drive and secret-like
     # files stay protected even when home confinement is lifted.
-    if outside_home and not is_external_workspace(ctx):
+    if outside_home and not _has_home_native_external_workspace(ctx):
         return f"path is outside user home {home}"
 
     # The Ouroboros runtime/control surface is the system repo PLUS every data
@@ -906,7 +907,7 @@ def resolve_user_file_path(
         # (/tmp, /build, sibling checkouts) — for them the generic
         # user_files_path_block_reason below stays the authority, mirroring its
         # own is_external_workspace carve-out.
-        if not allow_outside_home and not is_external_workspace(ctx):
+        if not allow_outside_home and not _has_home_native_external_workspace(ctx):
             home_resolved = home.resolve(strict=False)
             # Case-insensitive-platform parity with the user_files_path_block_reason
             # authority: a differently-cased safe home path must not be rejected
@@ -980,8 +981,15 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
                 raise ValueError(f"could not create {label} cwd {candidate}: {exc}") from exc
         return candidate
 
+    from ouroboros.workspace_ref import RemoteWorkspacePathError, is_remote_workspace
+
     profile = active_tool_profile(ctx)
-    candidates: list[tuple[ResourceRoot, pathlib.Path]] = [("active_workspace", resource_root_path(ctx, "active_workspace"))]
+    remote_workspace = is_remote_workspace(ctx)
+    candidates: list[tuple[ResourceRoot, pathlib.Path]] = []
+    if not remote_workspace:
+        candidates.append(
+            ("active_workspace", resource_root_path(ctx, "active_workspace"))
+        )
     _room = project_room_lens_dir(ctx)
     if _room is not None:
         # Room lens (v6.61.3): in a folder-room chat the DEFAULT cwd (and relative
@@ -1017,6 +1025,10 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
         raise ValueError(f"profile={profile} cannot {operation} any process cwd root")
 
     text = str(cwd or "").strip()
+    if remote_workspace and text in {"", ".", "./", "active_workspace"}:
+        raise RemoteWorkspacePathError(
+            "SSH active workspace cwd must execute through its remote backend"
+        )
     if not text or text in {".", "./"}:
         return ensure_process_cwd(allowed[0][0], allowed[0][1]), allowed[0][0], allowed
     for label, root in allowed:
@@ -1052,7 +1064,7 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
     # exact path — never the filesystem root — so the workspace write-guard
     # allowlist (which reuses this returned root list) is not widened beyond the
     # chosen working directory.
-    if is_external_workspace(ctx) and decide_tool_access(
+    if _has_home_native_external_workspace(ctx) and decide_tool_access(
         profile=profile, root="user_files", operation=operation
     ).allow:
         for candidate in candidates:
@@ -1097,11 +1109,15 @@ def resource_root_path(
     skill_name: str = "",
 ) -> pathlib.Path:
     if root == "active_workspace":
+        from ouroboros.workspace_ref import RemoteWorkspacePathError
+
         active = getattr(ctx, "active_repo_dir", None)
         candidate = None
         if callable(active):
             try:
                 candidate = active()
+            except RemoteWorkspacePathError:
+                raise
             except Exception:
                 candidate = None
         if candidate is None or candidate.__class__.__module__.startswith("unittest.mock"):

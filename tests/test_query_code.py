@@ -97,6 +97,117 @@ def test_query_code_structural_unavailable_marker(tmp_path, monkeypatch):
     assert "structural_unavailable:go" in out
 
 
+def test_query_code_local_and_remote_native_are_text_equivalent_for_all_ops(
+    tmp_path,
+):
+    from ouroboros.workspace_native import execute_native_operation
+
+    repo = _repo(tmp_path)
+    ctx = ToolContext(repo_dir=repo, drive_root=tmp_path / "data")
+    cases = [
+        ("relevant_files", {"query": "worker run helper"}),
+        ("symbols", {"query": ""}),
+        ("definition", {"query": "Worker"}),
+        ("references", {"query": "helper", "path": "pkg/helper.py"}),
+        ("callers", {"query": "helper", "path": "pkg/helper.py"}),
+        ("callees", {"query": "run", "path": "pkg/main.py"}),
+        ("impact", {"query": "pkg/helper.py"}),
+        (
+            "structural",
+            {"query": "FunctionDef", "lang": "python", "path": "pkg"},
+        ),
+        ("digest", {}),
+    ]
+    for op, options in cases:
+        local = _query_code(ctx, op=op, **options)
+        remote = execute_native_operation(
+            repo,
+            "query_code",
+            {"op": op, **options},
+        ).envelope.text
+        assert remote == local, op
+
+
+def test_query_code_local_and_remote_native_match_pagination_empty_and_errors(
+    tmp_path,
+):
+    from ouroboros.workspace_native import execute_native_operation
+
+    repo = _repo(tmp_path)
+    ctx = ToolContext(repo_dir=repo, drive_root=tmp_path / "data")
+    cases = [
+        ("symbols", {"query": "", "limit": 1, "offset": 1}),
+        ("definition", {"query": "MissingSymbol"}),
+        ("references", {"query": ""}),
+        ("invalid-operation", {"query": "anything"}),
+    ]
+    for op, options in cases:
+        local = _query_code(ctx, op=op, **options)
+        remote = execute_native_operation(
+            repo,
+            "query_code",
+            {"op": op, **options},
+        ).envelope.text
+        assert remote == local, op
+
+
+def test_remote_query_structural_unreadable_is_typed_partial(tmp_path, monkeypatch):
+    from ouroboros.workspace_native import execute_native_operation
+
+    repo = _repo(tmp_path)
+    original = pathlib.Path.read_text
+
+    def race_read(path, *args, **kwargs):
+        if path.name == "helper.py":
+            raise PermissionError("permission changed during query")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", race_read)
+    envelope = execute_native_operation(
+        repo,
+        "query_code",
+        {
+            "op": "structural",
+            "query": "FunctionDef",
+            "lang": "python",
+            "path": "pkg",
+        },
+    ).envelope
+
+    assert envelope.diagnostic is not None
+    assert envelope.diagnostic.code == "query_partial"
+    assert envelope.diagnostic.completion == "unknown"
+    assert "QUERY_PARTIAL" in envelope.text
+    assert "unreadable:pkg/helper.py" in envelope.text
+
+
+def test_remote_query_inventory_read_race_never_returns_authoritative_empty(
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros.workspace_native import execute_native_operation
+
+    repo = _repo(tmp_path)
+    original = pathlib.Path.read_bytes
+
+    def race_read(path, *args, **kwargs):
+        if path.name == "helper.py":
+            raise PermissionError("permission changed during inventory")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", race_read)
+    envelope = execute_native_operation(
+        repo,
+        "query_code",
+        {"op": "definition", "query": "helper"},
+    ).envelope
+
+    assert envelope.diagnostic is not None
+    assert envelope.diagnostic.code == "query_partial"
+    assert envelope.trace["completion"] == "partial"
+    assert "no-result answer is not authoritative" in envelope.text
+
+
 def test_query_code_structural_schema_enum_is_polyglot():
     from ouroboros.tools.query_code import get_tools
 

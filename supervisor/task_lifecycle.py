@@ -8,16 +8,25 @@ these helpers without creating an import cycle.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.utils import utc_now_iso
-
 
 _PROJECT_DELETE_WORKERS_LOCK = threading.Lock()
 _PROJECT_DELETE_WORKERS: set[tuple[str, str]] = set()
 BUDGET_ROOT_FENCES: Dict[str, Dict[str, Any]] = {}
+REMOTE_ADMISSIONS: Dict[str, Dict[str, Any]] = {}
+_ADMISSION_COMPLETION_FIELDS = frozenset({"metadata", "attachments"})
+_ADMISSION_METADATA_FIELDS = frozenset({
+    "_sealed_workspace_ref",
+    "executor_ref",
+    "_remote_admission_evidence",
+    "_remote_attachment_manifest",
+})
 
 
 def apply_budget_root_admission_fence(task: Dict[str, Any], root_task_id: str) -> bool:
@@ -91,6 +100,759 @@ def _queue_module():
     from supervisor import queue
 
     return queue
+
+
+def parse_iso_to_ts(iso_ts: str) -> Optional[float]:
+    """Parse an ISO timestamp for queue snapshot age checks."""
+
+    from datetime import datetime, timezone
+
+    text = str(iso_ts or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def apply_task_admission_fences_locked(
+    task: Dict[str, Any],
+    *,
+    restoring_snapshot: bool = False,
+) -> bool:
+    """Apply the one queue-owned admission policy to runnable and requested work."""
+
+    q = _queue_module()
+    project_id = str(task.get("project_id") or "").strip()
+    if project_id:
+        try:
+            from ouroboros.projects_registry import get_reserved_project
+
+            project = get_reserved_project(q.DRIVE_ROOT, project_id)
+            lifecycle = str((project or {}).get("lifecycle") or "active")
+            if project is not None and lifecycle != "active":
+                task.update(
+                    _admission_blocked="project_routing_fence",
+                    _project_lifecycle=lifecycle,
+                    _project_id=project_id,
+                )
+                return True
+        except Exception:
+            q.log.warning("Project admission check failed for %s", project_id, exc_info=True)
+            task.update(
+                _admission_blocked="project_routing_fence_lookup_failed",
+                _project_id=project_id,
+            )
+            return True
+    root_id = str(task.get("root_task_id") or "").strip()
+    if root_id and not restoring_snapshot and apply_budget_root_admission_fence(task, root_id):
+        return True
+    fence = q.ACCEPTANCE_FENCES.get(root_id) if root_id else None
+    if isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "sealed"}:
+        task.update(
+            _admission_blocked="task_acceptance_fence",
+            _acceptance_fence_token=str(fence.get("token") or ""),
+            _acceptance_fence_status=str(fence.get("status") or "active"),
+        )
+        return True
+    return False
+
+
+def _task_result_fields(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in task.items()
+        if key not in {"id", "task_id", "status", "updated_at", "ts"}
+    }
+
+
+def _durable_copy(value: Any) -> Any:
+    """Deep-copy through the same JSON boundary used by queue persistence."""
+
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"requested admission state must be JSON-serializable: {exc}") from exc
+
+
+def _merge_admission_completion(
+    task: Dict[str, Any],
+    projection: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge only broker-attested execution facts, never routing authority."""
+
+    if not projection:
+        return _durable_copy(task)
+    if not isinstance(projection, dict):
+        raise ValueError("admission completion projection must be an object")
+    unknown = set(projection) - _ADMISSION_COMPLETION_FIELDS
+    if unknown:
+        raise ValueError(f"admission completion cannot replace task authority: {sorted(unknown)}")
+    result = _durable_copy(task)
+    if "attachments" in projection:
+        if not isinstance(projection["attachments"], list):
+            raise ValueError("admission completion attachments must be a list")
+        attachments = _durable_copy(projection["attachments"])
+        result["attachments"] = attachments
+        result["attachment_images"] = [
+            item
+            for item in attachments
+            if isinstance(item, dict) and item.get("is_image")
+        ]
+        from ouroboros.artifacts import render_task_attachment_lines
+
+        rendered = render_task_attachment_lines(attachments)
+        text = str(result.get("text") or "")
+        begin = text.rfind("[ATTACHMENTS]")
+        end = text.find("[END_ATTACHMENTS]", begin) if begin >= 0 else -1
+        if begin >= 0 and end >= begin:
+            result["text"] = (
+                text[:begin]
+                + f"[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
+                + text[end + len("[END_ATTACHMENTS]") :]
+            )
+    if "metadata" in projection:
+        metadata = projection["metadata"]
+        if not isinstance(metadata, dict):
+            raise ValueError("admission completion metadata must be an object")
+        unknown_metadata = set(metadata) - _ADMISSION_METADATA_FIELDS
+        if unknown_metadata:
+            raise ValueError(
+                "admission completion metadata contains non-execution authority: "
+                f"{sorted(unknown_metadata)}"
+            )
+        current = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        result["metadata"] = {**current, **_durable_copy(metadata)}
+    return result
+
+
+def register_requested_admission(
+    task: Dict[str, Any],
+    *,
+    cancel: Optional[Callable[[], Any]] = None,
+    recovered: bool = False,
+    admission_id: str = "",
+    _persist_snapshot: bool = True,
+) -> Dict[str, Any]:
+    """Register one asynchronous SSH admission before it can become runnable."""
+
+    q = _queue_module()
+    try:
+        candidate = _durable_copy(task)
+    except ValueError as exc:
+        return {"ok": False, "status": "error", "error": str(exc)}
+    task_id = str(candidate.get("id") or candidate.get("task_id") or "").strip()
+    if not task_id:
+        return {"ok": False, "status": "error", "error": "missing_task_id"}
+    candidate["id"] = task_id
+    q.attach_task_contract(candidate)
+    admission_id = str(admission_id or uuid.uuid4().hex).strip()
+    if (
+        not admission_id
+        or len(admission_id) > 128
+        or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for char in admission_id)
+    ):
+        return {"ok": False, "status": "error", "error": "invalid_admission_id"}
+    with q._queue_lock:
+        existing = REMOTE_ADMISSIONS.get(task_id)
+        if isinstance(existing, dict):
+            if cancel is not None and existing.get("_cancel") is None:
+                existing["_cancel"] = cancel
+                existing["state"] = "connecting"
+            return {
+                "ok": True,
+                "status": str(existing.get("state") or "requested"),
+                "task_id": task_id,
+                "admission_id": str(existing.get("admission_id") or ""),
+                "duplicate": True,
+            }
+        if any(str(item.get("id") or "") == task_id for item in q.PENDING) or task_id in q.RUNNING:
+            return {
+                "ok": False,
+                "status": "conflict",
+                "task_id": task_id,
+                "error": "task_already_runnable",
+            }
+        try:
+            from ouroboros.task_results import (
+                _TRULY_TERMINAL_STATUSES,
+                STATUS_CANCEL_REQUESTED,
+                load_task_result,
+            )
+
+            prior = load_task_result(
+                pathlib.Path(candidate.get("budget_drive_root") or q.DRIVE_ROOT),
+                task_id,
+            ) or {}
+            prior_status = str(prior.get("status") or "")
+            if prior_status in _TRULY_TERMINAL_STATUSES or prior_status == STATUS_CANCEL_REQUESTED:
+                return {
+                    "ok": False,
+                    "status": "conflict",
+                    "task_id": task_id,
+                    "error": "task_id_is_terminal",
+                }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "task_id": task_id,
+                "error": f"task_status_unavailable: {type(exc).__name__}: {exc}",
+            }
+        if apply_task_admission_fences_locked(
+            candidate,
+            restoring_snapshot=recovered,
+        ):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "task_id": task_id,
+                "reason_code": str(candidate.get("_admission_blocked") or "admission_blocked"),
+                "task": candidate,
+            }
+        REMOTE_ADMISSIONS[task_id] = {
+            "task": candidate,
+            "admission_id": admission_id,
+            "state": "recovery_required" if recovered else ("connecting" if cancel else "requested"),
+            "requested_at": utc_now_iso(),
+            "_cancel": cancel,
+        }
+    with q._queue_lock:
+        try:
+            from ouroboros.task_results import STATUS_REQUESTED, write_task_result
+
+            written = write_task_result(
+                pathlib.Path(candidate.get("budget_drive_root") or q.DRIVE_ROOT),
+                task_id,
+                STATUS_REQUESTED,
+                **_task_result_fields(candidate),
+                remote_admission={
+                    "admission_id": admission_id,
+                    "state": "recovery_required" if recovered else "requested",
+                },
+                result=(
+                    "Remote workspace admission requires recovery after restart."
+                    if recovered
+                    else "Remote workspace admission requested."
+                ),
+            )
+            if str(written.get("status") or "") != STATUS_REQUESTED:
+                REMOTE_ADMISSIONS.pop(task_id, None)
+                return {
+                    "ok": False,
+                    "status": "stale",
+                    "task_id": task_id,
+                    "error": "task_status_rejected_requested_transition",
+                }
+            if _persist_snapshot:
+                q.persist_queue_snapshot(reason="remote_admission_requested", required=True)
+        except Exception as exc:
+            current = REMOTE_ADMISSIONS.get(task_id)
+            if isinstance(current, dict) and current.get("admission_id") == admission_id:
+                REMOTE_ADMISSIONS.pop(task_id, None)
+            try:
+                from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+                write_task_result(
+                    pathlib.Path(candidate.get("budget_drive_root") or q.DRIVE_ROOT),
+                    task_id,
+                    STATUS_FAILED,
+                    reason_code="remote_admission_persistence_failed",
+                    result=f"Remote admission could not be persisted: {type(exc).__name__}: {exc}",
+                )
+            except Exception as exc:
+                q.log.exception("Failed to terminalize unpersisted admission %s", task_id)
+            return {
+                "ok": False,
+                "status": "error",
+                "task_id": task_id,
+                "error": "remote_admission_persistence_failed",
+            }
+    return {
+        "ok": True,
+        "status": str(REMOTE_ADMISSIONS.get(task_id, {}).get("state") or "requested"),
+        "task_id": task_id,
+        "admission_id": admission_id,
+    }
+
+
+def list_requested_admissions(
+    *,
+    recovery_required_only: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return a serialization-safe snapshot for broker recovery and diagnostics."""
+
+    q = _queue_module()
+    with q._queue_lock:
+        rows = []
+        for task_id, row in REMOTE_ADMISSIONS.items():
+            if not isinstance(row, dict) or not isinstance(row.get("task"), dict):
+                continue
+            state = str(row.get("state") or "requested")
+            if recovery_required_only and state != "recovery_required":
+                continue
+            rows.append(
+                {
+                    "task_id": task_id,
+                    "admission_id": str(row.get("admission_id") or ""),
+                    "state": state,
+                    "requested_at": str(row.get("requested_at") or ""),
+                    "task": _durable_copy(row["task"]),
+                }
+            )
+        return rows
+
+
+def requested_admission_snapshot() -> List[Dict[str, Any]]:
+    """Return only the durable portion stored in the queue snapshot."""
+
+    return [
+        {
+            "id": row["task_id"],
+            "admission_id": row["admission_id"],
+            "state": row["state"],
+            "requested_at": row["requested_at"],
+            "task": row["task"],
+        }
+        for row in list_requested_admissions()
+    ]
+
+
+def restore_requested_admissions(raw_rows: Any) -> tuple[int, List[str]]:
+    """Restore only durable requested state; the broker must rebind each future."""
+
+    if not isinstance(raw_rows, list):
+        return 0, ["<requested_admissions>"]
+    q = _queue_module()
+    restored = 0
+    malformed: List[str] = []
+    for raw in raw_rows:
+        task = raw.get("task") if isinstance(raw, dict) else None
+        task_id = (
+            str((task or {}).get("id") or (task or {}).get("task_id") or raw.get("id") or "").strip()
+            if isinstance(raw, dict)
+            else ""
+        )
+        if not isinstance(task, dict) or not task_id:
+            malformed.append(task_id or "<unknown>")
+            continue
+        try:
+            from ouroboros.task_results import (
+                _TRULY_TERMINAL_STATUSES,
+                STATUS_CANCEL_REQUESTED,
+                load_task_result,
+            )
+
+            existing = load_task_result(
+                pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+                task_id,
+            ) or {}
+            status = str(existing.get("status") or "")
+            if status in _TRULY_TERMINAL_STATUSES or status == STATUS_CANCEL_REQUESTED:
+                continue
+        except Exception:
+            q.log.warning(
+                "Requested-admission restore status lookup failed for %s",
+                task_id,
+                exc_info=True,
+            )
+            malformed.append(task_id)
+            continue
+        recovered_admission_id = (
+            str(raw.get("admission_id") or "").strip()
+            if isinstance(raw, dict)
+            else ""
+        )
+        if not recovered_admission_id:
+            malformed.append(task_id)
+            continue
+        result = register_requested_admission(
+            task,
+            recovered=True,
+            admission_id=recovered_admission_id,
+            _persist_snapshot=False,
+        )
+        if result.get("ok") and not result.get("duplicate"):
+            restored += 1
+        elif result.get("error") == "task_already_runnable":
+            continue
+        elif not result.get("ok"):
+            malformed.append(task_id)
+            try:
+                from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+
+                write_task_result(
+                    pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+                    task_id,
+                    STATUS_CANCELLED,
+                    _explicit_cancellation=True,
+                    **_task_result_fields(task),
+                    reason_code=str(result.get("reason_code") or "restart_admission_blocked"),
+                    result="Remote admission was not restored because its lifecycle fence is closed.",
+                )
+            except Exception:
+                q.log.warning(
+                    "Failed to terminalize blocked recovered admission %s",
+                    task_id,
+                    exc_info=True,
+                )
+    if malformed:
+        q.append_jsonl(
+            pathlib.Path(q.DRIVE_ROOT) / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "queue_restore_invalid_requested_admissions",
+                "action": "fail_closed_drop_invalid_rows",
+                "invalid_task_ids": malformed,
+            },
+        )
+    return restored, malformed
+
+
+def restore_requested_admissions_from_results() -> int:
+    """Recover marked remote admissions when the queue snapshot is absent/corrupt."""
+
+    q = _queue_module()
+    try:
+        from ouroboros.task_results import (
+            STATUS_REQUESTED,
+            list_task_results,
+        )
+
+        rows = []
+        for result in list_task_results(q.DRIVE_ROOT, statuses=[STATUS_REQUESTED]):
+            marker = result.get("remote_admission")
+            if not isinstance(marker, dict) or not str(marker.get("admission_id") or ""):
+                continue
+            task = {
+                key: value
+                for key, value in result.items()
+                if key not in {
+                    "remote_admission", "result", "status", "task_id",
+                    "ts", "updated_at", "reason_code",
+                }
+            }
+            task["id"] = str(result.get("task_id") or "")
+            rows.append(
+                {
+                    "id": task["id"],
+                    "admission_id": str(marker["admission_id"]),
+                    "state": "recovery_required",
+                    "requested_at": str(result.get("ts") or ""),
+                    "task": task,
+                }
+            )
+        restored, _malformed = restore_requested_admissions(rows)
+        return restored
+    except Exception:
+        q.log.exception("Requested-admission task-result fallback failed")
+        return 0
+
+
+def recover_requested_after_snapshot_error(reason: str) -> int:
+    q = _queue_module()
+    restored = restore_requested_admissions_from_results()
+    if restored:
+        q.persist_queue_snapshot(reason=reason)
+    return restored
+
+
+def requested_admission_ids() -> set[str]:
+    q = _queue_module()
+    with q._queue_lock:
+        return set(REMOTE_ADMISSIONS)
+
+
+def terminalize_pending_after_invalid_acceptance_fences(
+    snapshot_pending: List[Dict[str, Any]],
+) -> List[str]:
+    """Cancel pending rows except IDs recovered as non-runnable admissions."""
+
+    q = _queue_module()
+    recovered = requested_admission_ids()
+    affected: List[str] = []
+    try:
+        from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
+
+        for task in snapshot_pending:
+            task_id = str(task.get("id") or "")
+            if not task_id or task_id in recovered:
+                continue
+            affected.append(task_id)
+            existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+            write_task_result(
+                q.DRIVE_ROOT,
+                task_id,
+                STATUS_CANCELLED,
+                **q._cancel_result_fields(
+                    task,
+                    existing=existing,
+                    result="Task was not restored because its acceptance-fence snapshot was invalid.",
+                ),
+            )
+    except Exception:
+        q.log.warning(
+            "Failed to terminalize tasks from invalid acceptance-fence snapshot",
+            exc_info=True,
+        )
+    return affected
+
+
+def _rollback_admission_transition(
+    q: Any,
+    task_id: str,
+    row: Dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    """Restore requested authority after a pre-commit completion failure."""
+
+    q.PENDING[:] = [
+        item for item in q.PENDING
+        if str(item.get("id") or "") != task_id
+    ]
+    task = dict(row.get("task") or {})
+    drive_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    try:
+        from ouroboros.task_results import (
+            STATUS_REQUESTED,
+            load_task_result,
+            write_task_result,
+        )
+
+        try:
+            written = write_task_result(
+                drive_root,
+                task_id,
+                STATUS_REQUESTED,
+                **_task_result_fields(task),
+                remote_admission={
+                    "admission_id": str(row.get("admission_id") or ""),
+                    "state": str(row.get("state") or "requested"),
+                },
+                reason_code="",
+                result=f"Remote admission remains requested after transition rollback: {reason}",
+            )
+        except Exception:
+            written = load_task_result(drive_root, task_id) or {}
+        if str(written.get("status") or "") != STATUS_REQUESTED:
+            q.persist_queue_snapshot(reason="remote_admission_terminal_cleanup")
+            return
+        REMOTE_ADMISSIONS[task_id] = row
+        q.persist_queue_snapshot(reason="remote_admission_transition_rollback", required=True)
+    except Exception:
+        q.log.exception("Remote admission rollback persistence failed for %s", task_id)
+
+
+def complete_requested_admission(
+    task_id: str,
+    *,
+    admission_id: str,
+    admitted_task: Optional[Dict[str, Any]] = None,
+    error: str = "",
+    reason_code: str = "remote_admission_failed",
+) -> Dict[str, Any]:
+    """Atomically terminalize or move one admitted task into PENDING."""
+
+    q = _queue_module()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {"ok": False, "status": "error", "error": "missing_task_id"}
+    admission_id = str(admission_id or "").strip()
+    if not admission_id:
+        return {"ok": False, "status": "error", "error": "missing_admission_id"}
+    with q._queue_lock:
+        row = REMOTE_ADMISSIONS.get(task_id)
+        if not isinstance(row, dict):
+            if any(str(item.get("id") or "") == task_id for item in q.PENDING):
+                return {"ok": False, "status": "stale", "task_id": task_id}
+            return {"ok": False, "status": "stale", "task_id": task_id}
+        if str(row.get("admission_id") or "") != admission_id:
+            return {"ok": False, "status": "stale", "task_id": task_id}
+        if (
+            any(str(item.get("id") or "") == task_id for item in q.PENDING)
+            or task_id in q.RUNNING
+        ):
+            return {"ok": False, "status": "stale", "task_id": task_id}
+        try:
+            task = _merge_admission_completion(dict(row.get("task") or {}), admitted_task)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "task_id": task_id,
+                "error": str(exc),
+            }
+        task["id"] = task_id
+        blocked = ""
+        if not error:
+            queued = q.enqueue_task(task)
+            blocked = str(queued.get("_admission_blocked") or "")
+            if not blocked:
+                task = queued
+        drive_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+        if error or blocked:
+            REMOTE_ADMISSIONS.pop(task_id, None)
+            failure = str(error or f"Remote admission blocked: {blocked}")
+            try:
+                from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+                written = write_task_result(
+                    drive_root,
+                    task_id,
+                    STATUS_FAILED,
+                    **_task_result_fields(task),
+                    reason_code=reason_code if error else blocked,
+                    result=failure,
+                )
+                if str(written.get("status") or "") != STATUS_FAILED:
+                    q.persist_queue_snapshot(reason="remote_admission_terminal_cleanup")
+                    return {"ok": False, "status": "stale", "task_id": task_id}
+            except Exception as exc:
+                _rollback_admission_transition(
+                    q,
+                    task_id,
+                    row,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "task_id": task_id,
+                    "reason_code": "remote_admission_persistence_failed",
+                }
+            try:
+                q.persist_queue_snapshot(reason="remote_admission_failed", required=True)
+            except Exception:
+                q.log.exception("Failed to persist terminal remote admission %s", task_id)
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "task_id": task_id,
+                    "reason_code": "remote_admission_persistence_failed",
+                    "snapshot_persistence_degraded": True,
+                }
+            return {
+                "ok": False,
+                "status": "failed",
+                "task_id": task_id,
+                "reason_code": reason_code if error else blocked,
+            }
+        REMOTE_ADMISSIONS.pop(task_id, None)
+        try:
+            from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+
+            written = write_task_result(
+                drive_root,
+                task_id,
+                STATUS_SCHEDULED,
+                **_task_result_fields(task),
+                result="Remote workspace admitted and queued.",
+            )
+            if str(written.get("status") or "") != STATUS_SCHEDULED:
+                raise RuntimeError("scheduled task-result transition was rejected")
+            q.persist_queue_snapshot(reason="remote_admission_scheduled", required=True)
+        except Exception as exc:
+            _rollback_admission_transition(
+                q,
+                task_id,
+                row,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+            return {
+                "ok": False,
+                "status": "error",
+                "task_id": task_id,
+                "reason_code": "remote_admission_persistence_failed",
+            }
+    return {"ok": True, "status": "scheduled", "task_id": task_id}
+
+
+def _cancel_requested_admission(task_id: str) -> bool:
+    q = _queue_module()
+    with q._queue_lock:
+        row = REMOTE_ADMISSIONS.get(task_id)
+        if not isinstance(row, dict):
+            return False
+        task = _durable_copy(row.get("task") or {})
+        try:
+            from ouroboros.task_results import (
+                STATUS_CANCEL_REQUESTED,
+                STATUS_CANCELLED,
+                write_task_result,
+            )
+
+            latched = write_task_result(
+                pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+                task_id,
+                STATUS_CANCEL_REQUESTED,
+                _explicit_cancellation=True,
+                **_task_result_fields(task),
+                remote_admission={
+                    "admission_id": str(row.get("admission_id") or ""),
+                    "state": "cancel_requested",
+                },
+                result="Remote workspace admission cancellation requested.",
+            )
+            if str(latched.get("status") or "") not in {
+                STATUS_CANCEL_REQUESTED,
+                STATUS_CANCELLED,
+            }:
+                return False
+            REMOTE_ADMISSIONS.pop(task_id, None)
+            try:
+                q.persist_queue_snapshot(reason="cancel_requested_admission", required=True)
+            except Exception:
+                q.log.exception(
+                    "Requested-admission snapshot removal failed for %s; "
+                    "durable cancel latch remains authoritative",
+                    task_id,
+                )
+        except Exception:
+            q.log.exception("Failed to latch requested-admission cancellation for %s", task_id)
+            return False
+    cancel = row.get("_cancel")
+    if callable(cancel):
+        threading.Thread(
+            target=_run_admission_cancel_callback,
+            args=(q, task_id, cancel),
+            name=f"remote-admission-cancel-{task_id[:32]}",
+            daemon=True,
+        ).start()
+    try:
+        from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
+
+        write_task_result(
+            pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+            task_id,
+            STATUS_CANCELLED,
+            _explicit_cancellation=True,
+            **_task_result_fields(task),
+            **q._cancel_result_fields(
+                task,
+                existing=load_task_result(
+                    pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+                    task_id,
+                ) or {},
+                result="Remote workspace admission cancelled before scheduling.",
+            ),
+        )
+    except Exception:
+        q.log.warning("Failed to persist requested-admission cancellation for %s", task_id, exc_info=True)
+    return True
+
+
+def _run_admission_cancel_callback(
+    q: Any,
+    task_id: str,
+    cancel: Callable[[], Any],
+) -> None:
+    try:
+        cancel()
+    except Exception:
+        q.log.warning("Requested-admission cancellation failed for %s", task_id, exc_info=True)
 
 
 def record_scheduled_admission(
@@ -234,6 +996,21 @@ def _live_descendants_locked(
 ) -> List[Dict[str, str]]:
     """Return a compact descendant snapshot while the queue lock is held."""
     rows: List[Dict[str, str]] = []
+    for task_id, admission in REMOTE_ADMISSIONS.items():
+        task = admission.get("task") if isinstance(admission, dict) else None
+        if (
+            task_id
+            and task_id != exclude_task_id
+            and isinstance(task, dict)
+            and q._is_descendant_of(task, root_task_id)
+        ):
+            rows.append(
+                {
+                    "task_id": task_id,
+                    "status": "requested",
+                    "source": "supervisor_queue",
+                }
+            )
     for task in q.PENDING:
         task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
         if task_id and task_id != exclude_task_id and q._is_descendant_of(task, root_task_id):
@@ -260,6 +1037,20 @@ def clear_acceptance_fence_for_root(root_task_id: str) -> bool:
         return q.ACCEPTANCE_FENCES.pop(root_task_id, None) is not None
 
 
+def finish_remote_task_lease(task: Dict[str, Any], task_id: str) -> None:
+    """Best-effort remote cleanup shared by supervisor terminal paths."""
+
+    q = _queue_module()
+    try:
+        from ouroboros.remote_workspace import finish_remote_task
+
+        finish_remote_task(task, task_id)
+    except Exception:
+        q.log.warning(
+            "Failed to cancel remote task lease for %s", task_id, exc_info=True
+        )
+
+
 def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
     """Cancel a task and, when requested, its atomically captured live subtree."""
     q = _queue_module()
@@ -267,13 +1058,18 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
     if not task_id:
         return False
     if not cascade:
-        return q._cancel_task_by_id_single(task_id)
+        return _cancel_requested_admission(task_id) or q._cancel_task_by_id_single(task_id)
     with q._queue_lock:
         live: Dict[str, Dict[str, Any]] = {
+            str(admission_id): dict(row["task"])
+            for admission_id, row in REMOTE_ADMISSIONS.items()
+            if isinstance(row, dict) and isinstance(row.get("task"), dict)
+        }
+        live.update({
             str(task["id"]): task
             for task in q.PENDING
             if isinstance(task, dict) and str(task.get("id") or "")
-        }
+        })
         live.update({
             str(running_id): meta["task"]
             for running_id, meta in q.RUNNING.items()
@@ -317,7 +1113,11 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
     )
     cancelled = False
     for live_id in cancel_order:
-        cancelled = q._cancel_task_by_id_single(live_id) or cancelled
+        cancelled = (
+            _cancel_requested_admission(live_id)
+            or q._cancel_task_by_id_single(live_id)
+            or cancelled
+        )
     return cancelled
 
 
@@ -446,12 +1246,17 @@ def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
 
 
 def _live_project_task_ids(drive_root: object, project_id: str) -> list[str]:
-    """Snapshot queued/running tasks associated with one fenced Project."""
+    """Snapshot requested/queued/running tasks associated with one fenced Project."""
     from ouroboros.projects_registry import project_task_bindings
 
     q = _queue_module()
     with q._queue_lock:
-        rows = [dict(task) for task in q.PENDING if isinstance(task, dict)]
+        rows = [
+            dict(row["task"])
+            for row in REMOTE_ADMISSIONS.values()
+            if isinstance(row, dict) and isinstance(row.get("task"), dict)
+        ]
+        rows.extend(dict(task) for task in q.PENDING if isinstance(task, dict))
         rows.extend(
             dict(meta.get("task"))
             for meta in q.RUNNING.values()

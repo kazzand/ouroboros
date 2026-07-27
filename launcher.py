@@ -441,6 +441,12 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
+    # The managed repo is self-editable, while release assets live in the
+    # immutable application bundle.  Seal the asset location at the launcher
+    # boundary so a stale/inherited environment cannot redirect execd bootstrap.
+    env["OUROBOROS_EXECD_BUNDLE_DIR"] = str(
+        (_bundle_dir() / "assets" / "execd").resolve(strict=False)
+    )
 
     server_py = REPO_DIR / "server.py"
     log.info("Starting agent: %s %s (port=%d)", EMBEDDED_PYTHON, server_py, port)

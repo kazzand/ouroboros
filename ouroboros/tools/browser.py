@@ -22,7 +22,7 @@ except ImportError:
     _HAS_STEALTH = False
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.server_auth import is_loopback_host
+from ouroboros.server_auth import is_loopback_host, is_owner_connections_path
 from ouroboros.config import AGENT_SERVER_PORT
 
 log = logging.getLogger(__name__)
@@ -203,6 +203,48 @@ def _hostname_resolves_to_blocked_ip(host: str) -> bool:
         if _is_blocked_subagent_ip(ip):
             return True
     return False
+
+
+def _is_remote_workspace_browser_blocked_url(url: str, ctx: Any) -> bool:
+    """Keep bridged remote content away from unrelated Home/private origins."""
+
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(ctx)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        return _is_metadata_blocked_browser_url(url)
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return parsed.scheme not in {"data", "blob"}
+    host = (parsed.hostname or "").strip().rstrip(".").casefold()
+    if not host:
+        return True
+    if is_loopback_host(host) or host == "localhost":
+        allowed = {
+            urlparse(str(origin)).netloc.casefold()
+            for origin in [
+                *dict(
+                    getattr(ctx.browser_state, "_remote_forward_origins", {}) or {}
+                ).values(),
+                *dict(
+                    getattr(ctx.browser_state, "_remote_static_origins", {}) or {}
+                ).values(),
+            ]
+        }
+        return parsed.netloc.casefold() not in allowed
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if _NONSTANDARD_NUMERIC_IPV4_RE.match(host):
+            return True
+        return _hostname_resolves_to_blocked_ip(host)
+    return bool(
+        ip.is_private
+        or ip.is_link_local
+        or ip.is_loopback
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
 
 
 def _has_platform_browser(local_browsers_dir: pathlib.Path, engine: str = "chromium") -> bool:
@@ -560,6 +602,12 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
     # click+Save path (POST /api/settings) for them, not just evaluate-JS. Applies to
     # every browser session (root + subagents).
     bs_context.route("**/api/settings", _block_owner_settings_post)
+    # Playwright evaluates matching handlers in reverse registration order and
+    # route.fallback() continues to the next earlier handler. Register this
+    # catch-all after the precise owner guards but before the terminal SSRF
+    # catch-all: direct and percent-encoded Connections paths reach it, while a
+    # non-match falls through to every earlier owner guard.
+    bs_context.route("**/*", _block_owner_connections_request)
     if readonly_subagent:
         bs_context.route(
             "**/*",
@@ -576,7 +624,7 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
         bs_context.route(
             "**/*",
             lambda route: route.abort()
-            if _is_metadata_blocked_browser_url(route.request.url)
+            if _is_remote_workspace_browser_blocked_url(route.request.url, ctx)
             else _route_fallback(route),
         )
     return bs.page
@@ -613,6 +661,35 @@ def cleanup_browser(ctx: ToolContext) -> None:
     setattr(bs, "_browser_context", None)
     setattr(bs, "_browser_engine", "")
     setattr(bs, "_browser_device", "")
+    forward_ids = list(getattr(bs, "_remote_forward_ids", []) or [])
+    setattr(bs, "_remote_forward_ids", [])
+    setattr(bs, "_remote_forward_origins", {})
+    bridges = list(
+        dict(getattr(bs, "_remote_file_bridges", {}) or {}).values()
+    )
+    setattr(bs, "_remote_file_bridges", {})
+    setattr(bs, "_remote_static_origins", {})
+    for bridge in bridges:
+        try:
+            bridge.close()
+        except Exception:
+            log.debug("Failed to close remote file bridge", exc_info=True)
+    if forward_ids:
+        try:
+            from ouroboros.remote_workspace import get_remote_workspace_service
+
+            service = get_remote_workspace_service()
+            for forward_id in forward_ids:
+                try:
+                    service.close_browser_forward(str(forward_id))
+                except Exception:
+                    log.debug(
+                        "Failed to close remote browser forward %s",
+                        forward_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            log.debug("Remote browser forward service is unavailable", exc_info=True)
 
 
 def _is_infrastructure_error(obj: Any) -> bool:
@@ -716,6 +793,27 @@ def _blocks_owner_skill_attest_js(value: str) -> bool:
     return "/api/owner/skills/" in text and "attest-review" in text
 
 
+def _blocks_owner_connections_js(value: str) -> bool:
+    """Block direct, encoded and double-encoded owner Connections fetches."""
+
+    import urllib.parse
+
+    low = str(value or "").lower()
+    decoded = urllib.parse.unquote(urllib.parse.unquote(low)).lower()
+    marker = "/api/owner/connections"
+    for text in (low, decoded):
+        start = 0
+        while True:
+            index = text.find(marker, start)
+            if index < 0:
+                break
+            tail = text[index + len(marker) : index + len(marker) + 1]
+            if not tail or tail in "/?#'\"` )]}\\\n\r\t":
+                return True
+            start = index + len(marker)
+    return False
+
+
 def _route_fallback(route: Any) -> None:
     """Pass a non-matching request DOWN the guard chain (review round 8).
 
@@ -732,6 +830,19 @@ def _route_fallback(route: Any) -> None:
         fallback()
         return
     route.continue_()
+
+
+def _block_owner_connections_request(route: Any) -> None:
+    try:
+        blocked = is_owner_connections_path(
+            urlparse(str(route.request.url or "")).path
+        )
+    except Exception:
+        blocked = False
+    if blocked:
+        route.abort()
+        return
+    _route_fallback(route)
 
 
 def _is_context_mode_owner_post(request: Any) -> bool:
@@ -1001,17 +1112,101 @@ def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
         return text[:30000] + ("... [truncated]" if len(text) > 30000 else "")
 
 
+def _remote_browser_url(ctx: ToolContext, url: str) -> str:
+    """Translate only an admitted remote loopback origin through its broker."""
+
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(ctx)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        return str(url)
+    parsed = urlparse(str(url))
+    if parsed.scheme == "file":
+        bridges = dict(getattr(ctx.browser_state, "_remote_file_bridges", {}) or {})
+        key = parsed._replace(query="", fragment="").geturl()
+        bridge = bridges.get(key)
+        if bridge is None:
+            from ouroboros.remote_file_bridge import RemoteFileBridge
+
+            bridge = RemoteFileBridge.open(ctx, key)
+            bridges[key] = bridge
+            setattr(ctx.browser_state, "_remote_file_bridges", bridges)
+            origins = dict(
+                getattr(ctx.browser_state, "_remote_static_origins", {}) or {}
+            )
+            origins[key] = bridge.origin
+            setattr(ctx.browser_state, "_remote_static_origins", origins)
+        return urlparse(bridge.url)._replace(
+            query=parsed.query,
+            fragment=parsed.fragment,
+        ).geturl()
+    if parsed.scheme not in {"http", "https"}:
+        return str(url)
+    if (parsed.hostname or "").casefold() not in {"localhost", "127.0.0.1", "::1"}:
+        return str(url)
+    if parsed.username or parsed.password:
+        raise ValueError("remote loopback browser URLs may not contain userinfo")
+    remote_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    remote_origin = f"{parsed.scheme}://loopback:{remote_port}"
+    bs = ctx.browser_state
+    cached = dict(getattr(bs, "_remote_forward_origins", {}) or {})
+    local_origin = cached.get(remote_origin)
+    if not local_origin:
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        record = get_remote_workspace_service().open_browser_forward(
+            workspace_ref,
+            remote_port=remote_port,
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+        )
+        if not isinstance(record, dict):
+            raise RuntimeError("remote browser forward returned an invalid record")
+        try:
+            local_port = int(record.get("local_port") or 0)
+        except (TypeError, ValueError):
+            local_port = 0
+        local_origin = f"{parsed.scheme}://127.0.0.1:{local_port}"
+        forward_id = str(record.get("forward_id") or "")
+        task_token = str(record.get("task_token") or "")
+        if (
+            not 1 <= local_port <= 65535
+            or not forward_id
+            or not task_token
+        ):
+            raise RuntimeError("remote browser forward omitted its isolated origin")
+        cached[remote_origin] = local_origin
+        setattr(bs, "_remote_forward_origins", cached)
+        forward_ids = list(getattr(bs, "_remote_forward_ids", []) or [])
+        forward_ids.append(forward_id)
+        setattr(bs, "_remote_forward_ids", forward_ids)
+    local = urlparse(local_origin)
+    return parsed._replace(netloc=local.netloc).geturl()
+
+
 def _browse_page(ctx: ToolContext, url: str, output: str = "text",
                  wait_for: str = "", timeout: int = 30000,
                  viewport: str = "", engine: str = "chromium", device: str = "") -> str:
     readonly_subagent = _readonly_subagent(ctx)
-    if readonly_subagent and _is_subagent_blocked_browser_url(str(url or ""), ctx):
-        return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
+    if readonly_subagent:
+        remote_workspace_file = False
+        if urlparse(str(url or "")).scheme == "file":
+            from ouroboros.workspace_ref import workspace_ref_for
+
+            workspace_ref = workspace_ref_for(ctx)
+            remote_workspace_file = bool(
+                workspace_ref is not None and workspace_ref["kind"] == "ssh"
+            )
+        if (
+            not remote_workspace_file
+            and _is_subagent_blocked_browser_url(str(url or ""), ctx)
+        ):
+            return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
     try:
+        navigation_url = _remote_browser_url(ctx, url)
         page = _ensure_browser(ctx, engine=engine, device=device)
         if viewport:
             _apply_viewport(page, viewport)
-        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+        page.goto(navigation_url, timeout=timeout, wait_until="domcontentloaded")
         if wait_for:
             page.wait_for_selector(wait_for, timeout=timeout)
         if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
@@ -1024,7 +1219,8 @@ def _browse_page(ctx: ToolContext, url: str, output: str = "text",
             page = _ensure_browser(ctx, engine=engine, device=device)
             if viewport:
                 _apply_viewport(page, viewport)
-            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            navigation_url = _remote_browser_url(ctx, url)
+            page.goto(navigation_url, timeout=timeout, wait_until="domcontentloaded")
             if wait_for:
                 page.wait_for_selector(wait_for, timeout=timeout)
             if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
@@ -1093,6 +1289,13 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
         elif normalized_action == "evaluate":
             if not value:
                 return "Error: value (JS code) required for evaluate"
+            if _blocks_owner_connections_js(value):
+                return (
+                    "⚠️ OWNER_CONNECTIONS_SELF_CALL_BLOCKED: browser JavaScript "
+                    "looks like an attempt to access /api/owner/connections. "
+                    "Connection trust, bootstrap and lifecycle are owner-controlled; "
+                    "ask the owner to use Settings → Connections or the controlling-terminal CLI."
+                )
             if _blocks_context_mode_self_lowering_js(value):
                 return (
                     "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: browser JavaScript "

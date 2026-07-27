@@ -254,6 +254,7 @@
  * @property {boolean=} init_git
  * @property {string=} git_url
  * @property {boolean=} with_workspace
+ * @property {ProjectWorkspaceRef=} workspace_ref
  */
 
 /**
@@ -262,6 +263,10 @@
  * @property {string=} name
  * @property {number=} chat_id
  * @property {string=} working_dir
+ * @property {ProjectWorkspaceRef=} workspace_ref
+ * @property {string=} workspace_identity_key
+ * @property {string=} origin
+ * @property {string=} created_at
  * @property {string=} provenance   // attached | cloned | genesis | none (historical fact)
  * @property {string=} clone_url
  * @property {string=} trusted_at
@@ -382,13 +387,103 @@
 
 /**
  * @typedef {Object} ExecutorRef
- * @property {"local"|"docker_exec"} type
+ * @property {"local"|"docker_exec"|"ssh_exec"} type
  * @property {string=} id
  * @property {"host"|"none"=} network
  * @property {string=} workspace_host_path
  * @property {string=} workspace_backend_path
  * @property {string=} container_name Required when type is "docker_exec".
+ * @property {string=} workspace_id Required when type is "ssh_exec".
  * @property {Object[]=} path_mappings
+ */
+
+/**
+ * @typedef {Object} ProjectWorkspaceRef
+ * @property {"local"|"ssh"} kind
+ * @property {string=} local_root
+ * @property {string=} connection_id
+ * @property {string=} remote_root
+ * @property {string=} workspace_id
+ */
+
+/**
+ * @typedef {Object} ConnectionEntry
+ * @property {string} id
+ * @property {string} name
+ * @property {string} ssh_alias
+ * @property {string=} expected_host_id
+ * @property {Object[]=} host_id_history
+ * @property {"active"|"retired"=} lifecycle
+ * @property {?string=} retired_at
+ * @property {string=} created_at
+ * @property {string=} updated_at
+ * @property {"connecting"|"ready"|"degraded"|"disconnected"|"unknown"=} status
+ * @property {string=} phase
+ * @property {string=} platform
+ * @property {string=} architecture
+ * @property {string=} build
+ * @property {boolean=} bootstrap_compatible
+ * @property {boolean=} health_fresh
+ * @property {string=} error_code
+ * @property {string=} action
+ * @property {Object=} diagnostic
+ * @property {Object[]=} log_refs
+ */
+
+/**
+ * @typedef {Object} ConnectionAddRequest
+ * @property {string} name
+ * @property {string} ssh_alias
+ */
+
+/**
+ * @typedef {Object} ConnectionListResponse
+ * @property {ConnectionEntry[]=} connections
+ * @property {string=} error
+ * @property {string=} error_code
+ * @property {string=} action
+ */
+
+/**
+ * @typedef {Object} ConnectionActionResponse
+ * @property {boolean=} ok
+ * @property {ConnectionEntry=} connection
+ * @property {string=} connection_id
+ * @property {string=} status
+ * @property {string=} phase
+ * @property {string=} completion
+ * @property {string=} error
+ * @property {string=} error_code
+ * @property {string=} action
+ * @property {Object=} diagnostic
+ * @property {Object[]=} log_refs
+ */
+
+/**
+ * @typedef {Object} ConnectionDirsResponse
+ * @property {string=} connection_id
+ * @property {string=} path
+ * @property {string=} parent
+ * @property {FsDirsEntry[]=} dirs
+ * @property {boolean=} truncated
+ * @property {string=} error
+ * @property {string=} error_code
+ * @property {string=} action
+ */
+
+/**
+ * @typedef {Object} ConnectionStateOutbound
+ * @property {"connection_state"} type
+ * @property {string} connection_id
+ * @property {string=} task_id
+ * @property {string=} project_id
+ * @property {"connecting"|"ready"|"degraded"|"disconnected"|"unknown"=} status
+ * @property {string=} phase
+ * @property {string=} completion
+ * @property {string=} error_code
+ * @property {string=} action
+ * @property {Object=} diagnostic
+ * @property {Object[]=} log_refs
  */
 
 /**

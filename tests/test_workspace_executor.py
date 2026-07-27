@@ -11,7 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.shell_parse import is_absolute_path_text, shell_argv_with_path_tokens
-from ouroboros.tools.registry import ToolContext, ToolRegistry
+from ouroboros.tools.registry import (
+    ToolContext,
+    ToolEntry,
+    ToolRegistry,
+    canonical_execution_args,
+)
 from ouroboros.workspace_executor import execute, map_backend_path, normalize_executor_ref
 
 
@@ -53,6 +58,178 @@ def _init_repo(path: Path) -> None:
     (path / "README.md").write_text("x\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def test_canonical_execution_args_is_pure_and_applies_native_args_once():
+    entry = ToolEntry(
+        name="vcs_status",
+        schema={
+            "name": "vcs_status",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                },
+            },
+        },
+        handler=lambda _ctx, **_kwargs: "unused",
+    )
+    raw = {
+        "root": "active_workspace",
+        "path": "/raw/workspace/src",
+        "max_entries": 2,
+    }
+    native_facts = {
+        "execution_args": {
+            "root": "active_workspace",
+            "path": "src",
+            "max_entries": 2,
+        }
+    }
+
+    canonical = canonical_execution_args(entry, raw, native_facts)
+
+    assert canonical == {"path": "src", "max_results": 2}
+    assert raw == {
+        "root": "active_workspace",
+        "path": "/raw/workspace/src",
+        "max_entries": 2,
+    }
+    assert native_facts["execution_args"] == {
+        "root": "active_workspace",
+        "path": "src",
+        "max_entries": 2,
+    }
+
+
+def test_non_path_authority_precedes_ambiguous_target_classification(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.tools.registry as registry_module
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(
+        ToolContext(
+            repo_dir=repo,
+            drive_root=data,
+            task_contract={"disabled_tools": ["read_file"]},
+        )
+    )
+
+    def forbidden_classification(*_args, **_kwargs):
+        raise AssertionError("forbidden call reached target classification")
+
+    monkeypatch.setattr(
+        registry_module,
+        "_normalize_dispatch_path_args",
+        forbidden_classification,
+    )
+
+    result = registry.execute(
+        "read_file",
+        {
+            "root": "user_files",
+            "path": str(repo / "secret.txt"),
+        },
+    )
+
+    assert result == (
+        "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools "
+        "withholds 'read_file' for this task."
+    )
+
+
+def test_staged_dispatch_preserves_public_argument_error_strings(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *_a, **_k: (True, ""))
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    entry = ToolEntry(
+        name="unit_dispatch_probe",
+        schema={
+            "name": "unit_dispatch_probe",
+            "description": "private staged-dispatch probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+            },
+        },
+        handler=lambda _ctx, value="": value,
+    )
+    registry.register(entry)
+
+    assert registry.execute("unit_dispatch_probe", {"extra": True}) == (
+        "⚠️ TOOL_ARG_ERROR (unit_dispatch_probe): invalid arguments for "
+        "unit_dispatch_probe. Accepted parameters: value."
+    )
+
+    def raises_type_error(_ctx, value=""):
+        raise TypeError(f"handler rejected {value}")
+
+    registry.override_handler("unit_dispatch_probe", raises_type_error)
+    assert registry.execute("unit_dispatch_probe", {"value": "x"}) == (
+        "⚠️ TOOL_ERROR (unit_dispatch_probe): handler rejected x"
+    )
+
+
+def test_tool_schemas_are_identical_for_local_and_docker_workspace_backends(
+    tmp_path,
+):
+    system_repo = tmp_path / "system"
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    system_repo.mkdir()
+    workspace.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
+
+    def schemas_for(executor_ref):
+        registry.set_context(
+            ToolContext(
+                repo_dir=system_repo,
+                drive_root=data,
+                workspace_root=workspace,
+                workspace_mode="external",
+                executor_ref=executor_ref,
+            )
+        )
+        return json.dumps(
+            registry.schemas(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    local = schemas_for(
+        {
+            "type": "local",
+            "id": "local-golden",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        }
+    )
+    docker = schemas_for(
+        {
+            "type": "docker_exec",
+            "id": "docker-golden",
+            "container_name": "golden-container",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        }
+    )
+
+    assert local == docker
 
 
 def test_normalize_executor_ref_rejects_malformed_backend_paths(tmp_path):
@@ -129,6 +306,95 @@ def test_run_command_local_executor_routes_through_backend(tmp_path, monkeypatch
     assert "executor-ok" in result
     assert "EXECUTOR_TRACE" in result
     assert '"executor_id": "local-test"' in result
+
+
+def test_local_executor_does_not_inherit_owner_network_password(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OUROBOROS_NETWORK_PASSWORD", "owner-only-sentinel")
+    ctx = ToolContext(
+        repo_dir=tmp_path / "system",
+        drive_root=tmp_path / "data",
+        workspace_root=workspace,
+        workspace_mode="external",
+        executor_ref={
+            "type": "local",
+            "id": "local-env",
+            "network": "host",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+
+    result = execute(
+        ctx,
+        [
+            sys.executable,
+            "-c",
+            "import os; print('present' if 'OUROBOROS_NETWORK_PASSWORD' in os.environ else 'missing')",
+        ],
+        workspace,
+        30,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "missing"
+    assert "owner-only-sentinel" not in result.stdout + result.stderr
+
+
+def test_remote_service_ref_preserves_bounded_semantics_without_process_ids(tmp_path):
+    from ouroboros.workspace_executor import (
+        record_remote_service_ref,
+        remote_service_ref,
+    )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path / "data",
+        task_id="remote-service-task",
+        executor_ref={
+            "type": "ssh_exec",
+            "id": "connection-a",
+            "workspace_id": "workspace-a",
+        },
+    )
+    record_remote_service_ref(
+        ctx,
+        "dev",
+        {
+            "kind": "ssh_exec",
+            "service_id": "service-a",
+            "name": "dev",
+            "keep_alive": True,
+            "ready": True,
+            "outputs": ["dist"],
+            "cwd": "/srv/project",
+            "declared_outputs_before": {"dist": {"exists": False}},
+            "pgid": 12345,
+            "pid": 12346,
+        },
+    )
+
+    restored = remote_service_ref(ctx, "dev")
+
+    assert restored == {
+        "kind": "ssh_exec",
+        "service_id": "service-a",
+        "name": "dev",
+        "keep_alive": True,
+        "ready": True,
+        "outputs": ["dist"],
+        "cwd": "/srv/project",
+        "declared_outputs_before": {"dist": {"exists": False}},
+    }
+    stored = json.loads(
+        next(
+            (tmp_path / "data" / "state" / "workspace_executor_services").rglob(
+                "*.json"
+            )
+        ).read_text(encoding="utf-8")
+    )
+    assert "pid" not in json.dumps(stored).lower()
+    assert "pgid" not in json.dumps(stored).lower()
 
 
 def test_run_command_executor_trace_redacts_secret_like_args(tmp_path, monkeypatch):
@@ -1619,6 +1885,56 @@ def test_api_task_rejects_reserved_executor_metadata_aliases(tmp_path, monkeypat
 
     assert response.status_code == 400
     assert "metadata.executor_ref/workspace_executor is reserved" in body["error"]
+
+
+@pytest.mark.parametrize(
+    ("location", "field"),
+    [
+        ("body", "workspace_ref"),
+        ("body", "connection_id"),
+        ("body", "remote_root"),
+        ("body", "workspace_id"),
+        ("metadata", "workspace_ref"),
+        ("metadata", "_sealed_workspace_ref"),
+        ("metadata", "_project_room_workspace_ref"),
+        ("metadata", "connection_id"),
+    ],
+)
+def test_api_task_rejects_remote_placement_outside_project(
+    tmp_path,
+    monkeypatch,
+    location,
+    field,
+):
+    from ouroboros.gateway import tasks
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    payload = {"description": "x"}
+    if location == "body":
+        payload[field] = {"kind": "ssh"} if field == "workspace_ref" else "value"
+    else:
+        payload["metadata"] = {
+            field: {"kind": "ssh"} if field.endswith("workspace_ref") else "value"
+        }
+
+    async def fake_request_json_or(_request, _default):
+        return payload
+
+    monkeypatch.setattr(tasks, "request_json_or", fake_request_json_or)
+    monkeypatch.setattr(tasks, "request_drive_root", lambda _request: data)
+    monkeypatch.setattr(tasks, "request_repo_dir", lambda _request: repo)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(supervisor_ready_event=None))
+    )
+
+    response = asyncio.run(tasks.api_tasks_create(request))
+    body = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 400
+    assert "inherited from project_id" in body["error"]
 
 
 def test_api_task_rejects_reserved_executor_metadata_ref(tmp_path, monkeypatch):

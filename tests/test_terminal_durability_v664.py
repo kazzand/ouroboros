@@ -138,11 +138,59 @@ def test_headless_reaper_still_emits_task_done(tmp_path, monkeypatch):
     assert terminal[0]["chat_id"] == 0
 
 
+def test_reaper_finishes_remote_lease_after_confirmed_worker_death(
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros.remote_workspace import set_remote_workspace_service
+    from supervisor.task_reaper import reap_timed_out_task
+
+    _patch_reaper(tmp_path, monkeypatch)
+    remote_ref = {
+        "kind": "ssh",
+        "connection_id": "connection-1",
+        "remote_root": "/srv/project",
+        "workspace_id": "workspace-1",
+    }
+    finished: list[tuple[dict, str]] = []
+
+    class Service:
+        def finish_task(self, workspace_ref, *, task_id):
+            finished.append((dict(workspace_ref), task_id))
+            return True
+
+    set_remote_workspace_service(Service())
+    try:
+        reap_timed_out_task({
+            "worker_id": 4,
+            "proc": None,
+            "task_id": "remote-reaped",
+            "task": {
+                "id": "remote-reaped",
+                "type": "task",
+                "chat_id": 0,
+                "metadata": {"_sealed_workspace_ref": remote_ref},
+            },
+            "task_type": "task",
+            "terminal_reason": "idle_timeout",
+            "attempt": 1,
+            "owner_chat_id": 0,
+            "will_retry": False,
+        })
+    finally:
+        set_remote_workspace_service(None)
+
+    assert finished == [(remote_ref, "remote-reaped")]
+
+
 def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
     tmp_path, monkeypatch,
 ):
-    from ouroboros.task_results import resolve_task_lineage
-    from ouroboros.task_results import STATUS_SCHEDULED, load_task_result
+    from ouroboros.task_results import (
+        STATUS_SCHEDULED,
+        load_task_result,
+        resolve_task_lineage,
+    )
     from supervisor.task_reaper import reap_timed_out_task
 
     _events, enqueued = _patch_reaper(tmp_path, monkeypatch)

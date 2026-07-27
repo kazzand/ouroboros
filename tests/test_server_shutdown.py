@@ -1,6 +1,123 @@
 from types import SimpleNamespace
 
 
+def test_remote_broker_is_started_before_supervisor_and_closed_first():
+    import inspect
+    import server
+
+    source = inspect.getsource(server.lifespan)
+    broker_start = source.index("_initialize_remote_workspace_service")
+    supervisor_start = source.index("_start_supervisor_if_needed")
+    broker_close = source.index("remote_workspace_service.close")
+    local_cleanup = source.index("kill_all_tracked_subprocesses")
+
+    assert broker_start < supervisor_start
+    assert broker_close < local_cleanup
+
+
+def test_remote_broker_initialization_uses_generation_and_registry_manifest(
+    monkeypatch, tmp_path
+):
+    import sys
+    import server
+
+    calls = []
+
+    class FakeRegistry:
+        def __init__(self, *, repo_dir, drive_root):
+            calls.append(("registry", repo_dir, drive_root))
+
+        def workspace_capability_manifest(self, *, repo_root):
+            calls.append(("manifest", repo_root))
+            return {"manifest_sha256": "manifest"}
+
+    class FakeBroker:
+        def __init__(self, **kwargs):
+            calls.append(("broker", kwargs))
+
+        def start(self):
+            calls.append(("start",))
+
+        def recover(self):
+            calls.append(("recover",))
+            return []
+
+    set_values = []
+    monkeypatch.setitem(
+        sys.modules,
+        "ouroboros.remote_workspace",
+        SimpleNamespace(
+            RemoteSessionBroker=FakeBroker,
+            set_remote_workspace_service=set_values.append,
+        ),
+    )
+    monkeypatch.setattr(
+        "ouroboros.process_custody.current_custody_session_id",
+        lambda: "generation-1",
+    )
+    monkeypatch.setattr("ouroboros.tools.registry.ToolRegistry", FakeRegistry)
+    execd_bundle_dir = tmp_path / "immutable-bundle" / "assets" / "execd"
+    monkeypatch.setenv("OUROBOROS_EXECD_BUNDLE_DIR", str(execd_bundle_dir))
+
+    service = server._initialize_remote_workspace_service(tmp_path)
+
+    assert isinstance(service, FakeBroker)
+    assert calls[0] == ("registry", server.REPO_DIR, tmp_path)
+    assert calls[1] == ("manifest", server.REPO_DIR)
+    assert calls[2][0] == "broker"
+    assert calls[2][1]["drive_root"] == tmp_path
+    assert calls[2][1]["server_generation"] == "generation-1"
+    assert calls[2][1]["capability_manifest"] == {
+        "manifest_sha256": "manifest"
+    }
+    assert calls[2][1]["bundle_dir"] == execd_bundle_dir
+    assert calls[3:] == [("start",), ("recover",)]
+    assert set_values == [service]
+
+
+def test_remote_broker_source_mode_keeps_default_bundle_lookup(monkeypatch, tmp_path):
+    import sys
+    import server
+
+    captured = {}
+
+    class FakeRegistry:
+        def __init__(self, **_kwargs):
+            pass
+
+        def workspace_capability_manifest(self, **_kwargs):
+            return {"manifest_sha256": "manifest"}
+
+    class FakeBroker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start(self):
+            pass
+
+        def recover(self):
+            return []
+
+    monkeypatch.delenv("OUROBOROS_EXECD_BUNDLE_DIR", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "ouroboros.remote_workspace",
+        SimpleNamespace(
+            RemoteSessionBroker=FakeBroker,
+            set_remote_workspace_service=lambda _service: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "ouroboros.process_custody.current_custody_session_id",
+        lambda: "generation-1",
+    )
+    monkeypatch.setattr("ouroboros.tools.registry.ToolRegistry", FakeRegistry)
+
+    server._initialize_remote_workspace_service(tmp_path)
+
+    assert captured["bundle_dir"] is None
+
+
 def test_lifespan_shutdown_kills_executor_foreground_before_services():
     import inspect
     import server
@@ -151,11 +268,14 @@ def test_emergency_cleanup_during_restart_marks_tasks_cancelled(monkeypatch):
 
 
 def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_path):
+    import sys
+
     from ouroboros import server_control
 
     foreground_calls = []
     service_calls = []
     worker_calls = []
+    panic_order = []
 
     class ExitCalled(RuntimeError):
         pass
@@ -163,7 +283,19 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda: None)
     monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground", lambda *a, **k: foreground_calls.append((a, k)))
     monkeypatch.setattr("ouroboros.tools.services.kill_all_services", lambda *a, **k: service_calls.append((a, k)))
-    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(stop_server=lambda: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "ouroboros.remote_workspace",
+        SimpleNamespace(
+            get_remote_workspace_service=lambda: SimpleNamespace(
+                panic_close_all=lambda: panic_order.append("remote")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "ouroboros.local_model.get_manager",
+        lambda: SimpleNamespace(stop_server=lambda: panic_order.append("local")),
+    )
     monkeypatch.setattr("supervisor.state.load_state", lambda: {})
     monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
     monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
@@ -186,3 +318,4 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     assert foreground_calls == [((tmp_path,), {"wait": False})]
     assert service_calls == [((tmp_path,), {"wait": False})]
     assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert panic_order == ["remote", "local"]

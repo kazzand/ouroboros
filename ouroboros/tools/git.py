@@ -48,6 +48,7 @@ from ouroboros.contracts.skill_payload_policy import (
 )
 _CONTENT_OMITTED_PREFIX = "<<CONTENT_OMITTED"
 log = logging.getLogger(__name__)
+_release_git_lock = unlink_lockfile
 
 
 def _current_runtime_mode() -> str:
@@ -408,7 +409,13 @@ def _stage_candidate_for_review(
             return [], None, error
         add_cmd = ["git", "add"] + safe_paths
     else:
-        _ensure_gitignore(ctx.repo_dir)
+        gitignore = pathlib.Path(ctx.repo_dir) / ".gitignore"
+        if not gitignore.exists():
+            write_text(
+                gitignore,
+                "__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.dll\n"
+                "*.dist-info/\nbase_library.zip\n.DS_Store\n",
+            )
         add_cmd = ["git", "add", "-A"]
     try:
         run_cmd(add_cmd, cwd=ctx.repo_dir)
@@ -916,11 +923,6 @@ _BINARY_EXTENSIONS = frozenset({
     ".pyc", ".pyo", ".whl", ".egg",
 })
 
-def _ensure_gitignore(repo_dir) -> None:
-    gi = pathlib.Path(repo_dir) / ".gitignore"
-    if not gi.exists():
-        write_text(gi, "__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.dll\n"
-                       "*.dist-info/\nbase_library.zip\n.DS_Store\n")  # atomic (G)
 def _unstage_binaries(repo_dir) -> List[str]:
     try:
         staged = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=repo_dir)
@@ -957,9 +959,6 @@ def _acquire_git_lock(ctx: ToolContext, timeout_sec: int = 120) -> pathlib.Path:
         return lock_path
     raise TimeoutError(f"Git lock not acquired within {timeout_sec}s: {lock_path}")
 
-
-def _release_git_lock(lock_path: pathlib.Path) -> None:
-    unlink_lockfile(lock_path)
 
 MAX_TEST_OUTPUT = 8000
 _consecutive_test_failures: int = 0
@@ -1141,6 +1140,7 @@ def _check_shrink_guard(ctx: ToolContext, file_path: str, new_content: str, forc
 
 def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 files: Optional[List[Dict[str, str]]] = None,
+                mode: str = "overwrite",
                 force: bool = False,
                 display_root: str = "active_workspace") -> str:
     """Write file(s) to the repo working directory without committing."""
@@ -1175,6 +1175,47 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 f"⚠️ WRITE_ERROR: content for '{e['path']}' looks like a compaction marker. "
                 "Re-read the file and provide the actual content."
             )
+
+    if display_root == "active_workspace" and ctx.is_workspace_mode():
+        from ouroboros.workspace_native import execute_native_operation
+
+        if mode != "append":
+            for e in write_list:
+                shrink_warning = _check_shrink_guard(
+                    ctx,
+                    e["path"],
+                    e["content"],
+                    force=force,
+                )
+                if shrink_warning:
+                    return shrink_warning
+        repo_root = active_repo_dir_for(ctx).resolve(strict=False)
+        native_files = [
+            {
+                "path": normalize_repo_path(e["path"]),
+                "content": e["content"],
+            }
+            for e in write_list
+        ]
+        native = execute_native_operation(
+            repo_root,
+            "write_file",
+            {"files": native_files, "mode": mode, "force": force},
+        ).envelope
+        trace_paths = native.trace.get("paths")
+        written_paths = (
+            [str(item) for item in trace_paths if isinstance(item, str) and item]
+            if isinstance(trace_paths, list)
+            else []
+        )
+        if written_paths:
+            _invalidate_advisory(
+                ctx,
+                changed_paths=written_paths,
+                mutation_root=active_repo_dir_for(ctx),
+                source_tool="write_file",
+            )
+        return native.text
 
     written = []
     written_paths: List[str] = []
@@ -1336,6 +1377,30 @@ def _str_replace_editor(
         _shrink_block = _check_data_shrink_guard(target, new_content)
         if _shrink_block:
             return _shrink_block
+    if (
+        data_skill_target is None
+        and display_root == "active_workspace"
+        and ctx.is_workspace_mode()
+    ):
+        from ouroboros.workspace_native import execute_native_operation
+
+        native = execute_native_operation(
+            active_repo_dir_for(ctx),
+            "edit_text",
+            {
+                "path": normalize_repo_path(path),
+                "old_str": old_str,
+                "new_str": new_str,
+            },
+        ).envelope
+        if native.diagnostic is None and not native.text.startswith("⚠️"):
+            _invalidate_advisory(
+                ctx,
+                changed_paths=[path],
+                mutation_root=invalidation_root,
+                source_tool="edit_text",
+            )
+        return native.text
     try:
         write_text(target, new_content)
     except Exception as e:
@@ -1833,7 +1898,9 @@ def _git_diff(
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
 
-def _ff_pull(repo_dir: pathlib.Path) -> str:
+def _ff_pull(repo_dir: pathlib.Path | ToolContext) -> str:
+    if isinstance(repo_dir, ToolContext):
+        repo_dir = pathlib.Path(repo_dir.repo_dir)
     try:
         branch = run_cmd(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir,
@@ -1883,10 +1950,6 @@ def _ff_pull(repo_dir: pathlib.Path) -> str:
     for line in (new_commits or "(none)").splitlines():
         lines.append(f"  {line}")
     return "\n".join(lines)
-
-
-def _pull_from_remote(ctx: ToolContext) -> str:
-    return _ff_pull(pathlib.Path(ctx.repo_dir))
 
 
 def _restore_to_head(ctx: ToolContext, confirm: bool = False,
@@ -2103,7 +2166,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "vcs_pull_ff",
             "description": "Fetch from origin and fast-forward merge. Safe: never rewrites history.",
             "parameters": {"type": "object", "properties": {}, "required": []},
-        }, _pull_from_remote, is_code_tool=True, mutates_worktree=True),
+        }, _ff_pull, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_restore", {
             "name": "vcs_restore",
             "description": "Discard uncommitted changes, restoring to last committed state (HEAD).",

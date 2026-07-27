@@ -197,6 +197,65 @@ def _report_binding_failure(task_id: str, project_id: str, exc: Exception, *, pa
         log.debug("project_binding_failed event write failed", exc_info=True)
 
 
+def _prepare_remote_promoted_task(
+    task: dict,
+    workspace_ref: dict,
+    *,
+    project_id: str,
+    task_id: str,
+) -> None:
+    task["workspace_mode"] = "external"
+    task["memory_mode"] = "forked"
+    metadata = task.setdefault("metadata", {})
+    metadata["_sealed_workspace_ref"] = dict(workspace_ref)
+    metadata["executor_ref"] = {
+        "type": "ssh_exec",
+        "id": workspace_ref["connection_id"],
+        "network": "host",
+        "workspace_id": workspace_ref["workspace_id"],
+    }
+    try:
+        from ouroboros.headless import prepare_task_drive
+
+        child_drive = prepare_task_drive(
+            DRIVE_ROOT, task_id, "forked", project_id=project_id
+        )
+        if child_drive is not None:
+            task["drive_root"] = str(child_drive)
+            task["budget_drive_root"] = str(DRIVE_ROOT)
+    except Exception:
+        log.warning(
+            "promote: remote child drive fork failed for %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _admit_remote_promoted_task(task: dict, workspace_ref: dict) -> dict:
+    from ouroboros.gateway.connections import get_connection
+    from ouroboros.gateway.tasks import submit_remote_task_admission
+
+    try:
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        service = get_remote_workspace_service()
+    except (ImportError, RuntimeError):
+        service = None
+    with _queue_lock:
+        connection = get_connection(workspace_ref["connection_id"])
+        if (
+            connection is None
+            or connection.get("lifecycle", "active") != "active"
+            or service is None
+        ):
+            return {"ok": False, "error": "remote_connection_unavailable"}
+        return submit_remote_task_admission(
+            task,
+            connection=connection,
+            service=service,
+        )
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
 
@@ -236,6 +295,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "title": title,
         "source": "promote_chat_to_task",
     }
+    remote_workspace_ref = None
     # Ingress-captured origin identity rides the task record (post-hoc UI convert
     # reads it from the persisted result — never re-derived from content).
     if isinstance(evt.get("source_ref"), dict) and evt.get("source_ref"):
@@ -276,6 +336,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             project = create_project(
                 DRIVE_ROOT, pid, name=project_display_name, origin="promote_chat_to_task",
             )
+            from ouroboros.workspace_ref import normalize_workspace_ref
+
+            candidate_ref = normalize_workspace_ref((project or {}).get("workspace_ref"))
+            if candidate_ref is not None and candidate_ref["kind"] == "ssh":
+                remote_workspace_ref = candidate_ref
             touch_project(DRIVE_ROOT, pid)
             # Bind the task to its project (durable task->project map). Without this
             # the task is project-scoped only in its own metadata; the frontend (via
@@ -344,13 +409,19 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # resolve to the self_modification profile over the system repo.
     from ouroboros.workspace_admission import bounded_workspace_preflight, compose_workspace_block, resolve_room_workspace
 
-    resolved_ws, ws_error = resolve_room_workspace(
-        drive_root=DRIVE_ROOT,
-        system_repo_dir=REPO_DIR,
-        project_id=pid,
-        explicit_workspace=str(evt.get("workspace_root") or "").strip(),
-        workspace_sentinel=str(evt.get("workspace") or ""),
-    )
+    resolved_ws, ws_error = None, ""
+    if remote_workspace_ref is not None:
+        _prepare_remote_promoted_task(
+            task, remote_workspace_ref, project_id=pid, task_id=tid
+        )
+    else:
+        resolved_ws, ws_error = resolve_room_workspace(
+            drive_root=DRIVE_ROOT,
+            system_repo_dir=REPO_DIR,
+            project_id=pid,
+            explicit_workspace=str(evt.get("workspace_root") or "").strip(),
+            workspace_sentinel=str(evt.get("workspace") or ""),
+        )
     if ws_error:
         _fail_promoted_task_loudly(ctx, task, ws_error)
         return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
@@ -417,7 +488,29 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         except Exception:
             log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
     attach_task_contract(task)
-    admitted = ctx.enqueue_task(task)
+    if remote_workspace_ref is not None:
+        admitted = _admit_remote_promoted_task(task, remote_workspace_ref)
+        if isinstance(admitted, dict) and admitted.get("error") == "remote_connection_unavailable":
+            _fail_promoted_task_loudly(
+                ctx, task, "the project's remote connection is unavailable",
+            )
+            return {
+                "status": "needs_manual_target",
+                "reason": "remote_connection_unavailable",
+                "task_id": tid,
+            }
+    else:
+        admitted = ctx.enqueue_task(task)
+    if isinstance(admitted, dict) and admitted.get("ok") is False:
+        return {
+            "status": "needs_manual_target",
+            "reason": str(
+                admitted.get("reason_code")
+                or admitted.get("error")
+                or "remote_admission_rejected"
+            ),
+            "task_id": tid,
+        }
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
         return {
             "status": "needs_manual_target",
@@ -430,7 +523,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # the human title up front exactly like a proactively-named direct-chat card, and a
     # later turn-into-project reuses it. Same-status (SCHEDULED) write — merges, never
     # regresses; fail-soft.
-    if title:
+    if title and remote_workspace_ref is None:
         try:
             from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
@@ -438,7 +531,10 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             _broadcast_task_named({"type": "task_named", "task_id": tid, "suggested_name": title})
         except Exception:
             log.debug("promote: suggested_name persist/broadcast failed for %s", tid, exc_info=True)
-    return {"status": "scheduled", "task_id": tid}
+    return {
+        "status": "requested" if remote_workspace_ref is not None else "scheduled",
+        "task_id": tid,
+    }
 
 
 def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
@@ -643,6 +739,27 @@ def _run_chat_task(
             pid = str(task_metadata.get("project_id") or "").strip()
             if pid:
                 task["project_id"] = pid
+                try:
+                    from ouroboros.projects_registry import get_project
+                    from ouroboros.workspace_ref import normalize_workspace_ref
+
+                    project = get_project(DRIVE_ROOT, pid)
+                    room_ref = normalize_workspace_ref(
+                        (project or {}).get("workspace_ref")
+                    )
+                    if room_ref is not None and room_ref["kind"] == "ssh":
+                        # Private room lens: read/list/search tools may opt into
+                        # this view, but it is not a sealed task placement and
+                        # therefore cannot authorize remote mutation.
+                        task["metadata"]["_project_room_workspace_ref"] = dict(
+                            room_ref
+                        )
+                except Exception:
+                    log.debug(
+                        "direct project room workspace lookup failed for %s",
+                        pid,
+                        exc_info=True,
+                    )
                 # A real project-thread conversation task is bound to its project so
                 # the frontend (all_task_bindings) recognises it and never offers a
                 # stray "turn into project" button (P2). Ephemeral same-route turns
@@ -874,8 +991,30 @@ def _current_custody_session_id() -> str:
         return ""
 
 
+def _remote_worker_proxy_factory() -> Any:
+    try:
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        broker = get_remote_workspace_service()
+        factory = getattr(broker, "create_worker_pipe_proxy", None)
+        return factory if callable(factory) else None
+    except Exception:
+        return None
+
+
+def _new_worker_remote_proxy(factory: Any = None) -> Any:
+    """Create one pickle-safe broker endpoint, or None for local-only installs."""
+
+    factory = factory or _remote_worker_proxy_factory()
+    return factory() if callable(factory) else None
+
+
+def _effective_worker_start_method(remote_proxy_factory: Any = None) -> str:
+    return "spawn" if callable(remote_proxy_factory) else _WORKER_START_METHOD
+
+
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
-                custody_session_id: str = "") -> None:
+                custody_session_id: str = "", remote_proxy: Any = None) -> None:
     import os as _os
     # Mark this process as a worker BEFORE importing the agent/LLM stack so the
     # central network-transport policy disables system proxy resolution
@@ -883,6 +1022,12 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    try:
+        from ouroboros.remote_workspace import set_remote_workspace_service
+
+        set_remote_workspace_service(remote_proxy)
+    except Exception:
+        pass
     # Adopt the server's custody session id. Under the 'spawn' start method this
     # process re-imported process_custody and minted a fresh _SESSION_ID; without
     # adopting the server's id, every service/process this worker records looks
@@ -974,6 +1119,11 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
         agent = make_agent(repo_dir=repo_dir, drive_root=drive_root, event_queue=out_q)
     except Exception as _e:
         _log_worker_crash(wid, _drive, "make_agent", _e, _tb.format_exc())
+        if remote_proxy is not None:
+            try:
+                remote_proxy.close()
+            except Exception:
+                pass
         return
     while True:
         try:
@@ -997,6 +1147,11 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                 out_q.put(e2)
         except Exception as _e:
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
+    if remote_proxy is not None:
+        try:
+            remote_proxy.close()
+        except Exception:
+            pass
 
 
 def _write_failure_result(
@@ -1321,8 +1476,13 @@ def spawn_workers(n: int = 0) -> None:
     # Reap any workers left orphaned by a prior/abrupt server exit before we
     # spawn fresh ones, so process groups do not accumulate across restarts.
     reap_orphaned_workers()
+    # A live remote broker owns threads and OpenSSH pipe/session fds. Never fork
+    # that parent state into a worker: use a clean spawned interpreter and pass
+    # only the dedicated pickle-safe pipe endpoint.
+    remote_proxy_factory = _remote_worker_proxy_factory()
+    worker_start_method = _effective_worker_start_method(remote_proxy_factory)
     # Fresh context ensures workers use current code.
-    _CTX = mp.get_context(_WORKER_START_METHOD)
+    _CTX = mp.get_context(worker_start_method)
     _EVENT_Q = _CTX.Queue()
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
     try:
@@ -1336,18 +1496,23 @@ def spawn_workers(n: int = 0) -> None:
         {
             "ts": utc_now_iso(),
             "type": "worker_spawn_start",
-            "start_method": _WORKER_START_METHOD,
+            "start_method": worker_start_method,
             "count": count,
         },
     )
     WORKERS.clear()
     for i in range(count):
         in_q = _CTX.Queue()
+        remote_proxy = _new_worker_remote_proxy(remote_proxy_factory)
         proc = _CTX.Process(target=worker_main,
                            args=(i, in_q, _EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT),
-                                 _current_custody_session_id()))
+                                 _current_custody_session_id(), remote_proxy))
         proc.daemon = True
-        proc.start()
+        try:
+            proc.start()
+        finally:
+            if remote_proxy is not None:
+                remote_proxy.close_parent_copy()
         WORKERS[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
     global _LAST_SPAWN_TIME
     _LAST_SPAWN_TIME = time.time()
@@ -1448,13 +1613,23 @@ def _kill_survivors() -> None:
 
 
 def respawn_worker(wid: int) -> None:
+    remote_proxy_factory = _remote_worker_proxy_factory()
     ctx = _get_ctx()
+    if remote_proxy_factory and ctx.get_start_method() != "spawn":
+        raise RuntimeError(
+            "remote broker workers require a spawn context; respawn the full worker pool"
+        )
     in_q = ctx.Queue()
+    remote_proxy = _new_worker_remote_proxy(remote_proxy_factory)
     proc = ctx.Process(target=worker_main,
                        args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT),
-                             _current_custody_session_id()))
+                             _current_custody_session_id(), remote_proxy))
     proc.daemon = True
-    proc.start()
+    try:
+        proc.start()
+    finally:
+        if remote_proxy is not None:
+            remote_proxy.close_parent_copy()
     # Swap under _queue_lock (an RLock — safe even when the caller already holds
     # it) so a concurrent assign_tasks cannot enqueue into the slot mid-swap.
     with _queue_lock:

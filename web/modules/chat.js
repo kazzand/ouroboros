@@ -13,6 +13,14 @@ import {
     summarizeChatLiveEvent,
     taskOutcomeSeverity,
 } from './log_events.js';
+import {
+    mergeRemoteTaskState,
+    remoteDetailText,
+    remoteStateDetails,
+    remoteStateLabel,
+    remoteStateSummary,
+    remoteTaskActions,
+} from './remote_task_state.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -525,6 +533,7 @@ export function createChatInstance({
     let historyPaintGeneration = 0;
     let welcomeShown = false;
     const liveCardRecords = new Map();
+    const remoteTaskStates = new Map();
     // Reusable slots (bg-consciousness, active) destroy+recreate their card on every
     // new cycle and auto-collapse on each cycle finish. Remember the owner's explicit
     // expand per slot so cycle churn restores it instead of snapping the card shut.
@@ -1001,6 +1010,157 @@ export function createChatInstance({
         taskState.forceCard = true;
         revealBufferedCardIfNeeded(taskState, { rawTs });
         return taskState;
+    }
+
+    function updateRemoteCardActions(record, remoteState) {
+        if (!record || record.isSubagent) return;
+        let container = record.root.querySelector('[data-remote-task-actions]');
+        if (!container) {
+            container = document.createElement('div');
+            container.className = 'chat-live-actions chat-live-remote-actions';
+            container.dataset.remoteTaskActions = '1';
+            record.timelineEl?.insertAdjacentElement('beforebegin', container);
+        }
+        container.replaceChildren();
+        const actions = remoteTaskActions(remoteState);
+        const addButton = (label, className, action) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = className;
+            button.textContent = label;
+            button.addEventListener('click', async (event) => {
+                event.stopPropagation();
+                button.disabled = true;
+                try {
+                    if (action === 'cancel') {
+                        if (!window.confirm('Cancel this task?')) return;
+                        await apiClient.taskCancel(remoteState.taskId);
+                        remoteTaskStates.set(remoteState.taskId, {
+                            ...remoteState,
+                            taskStatus: 'cancel_requested',
+                            completion: 'cancel_requested',
+                        });
+                        showToast('Cancellation requested.', 'success');
+                        updateRemoteCardActions(record, remoteTaskStates.get(remoteState.taskId));
+                    } else {
+                        handleRemoteConnectionState({
+                            connection_id: remoteState.connectionId,
+                            task_id: remoteState.taskId,
+                            project_id: remoteState.projectId,
+                            status: 'connecting',
+                            phase: 'connect',
+                            completion: 'testing',
+                        }, { bypassScopeCheck: true });
+                        const result = await apiClient.connectionReconnect(remoteState.connectionId);
+                        handleRemoteConnectionState({
+                            ...result,
+                            connection_id: remoteState.connectionId,
+                            task_id: remoteState.taskId,
+                            project_id: remoteState.projectId,
+                        }, { bypassScopeCheck: true });
+                        showToast(
+                            actions.terminal
+                                ? 'Connection is ready. Start a new task to retry the completed attempt.'
+                                : 'Connection reconnected and reconciled.',
+                            'success',
+                        );
+                    }
+                } catch (error) {
+                    const payload = error?.body || {};
+                    if (action === 'reconnect') {
+                        handleRemoteConnectionState({
+                            ...payload,
+                            connection_id: remoteState.connectionId,
+                            task_id: remoteState.taskId,
+                            project_id: remoteState.projectId,
+                            status: 'degraded',
+                        }, { bypassScopeCheck: true });
+                    }
+                    showToast(
+                        `${payload.error || error?.message || error}${payload.action ? ` · Next: ${payload.action}` : ''}`,
+                        'error',
+                    );
+                } finally {
+                    button.disabled = false;
+                }
+            });
+            container.appendChild(button);
+        };
+        if (actions.canReconnect) {
+            addButton('Reconnect', 'btn btn-xs btn-default', 'reconnect');
+        }
+        if (actions.canCancel) {
+            addButton('Cancel', 'btn btn-xs btn-danger', 'cancel');
+        }
+        container.hidden = container.childElementCount === 0;
+    }
+
+    function handleRemoteConnectionState(event, { bypassScopeCheck = false } = {}) {
+        const explicitTaskId = String(event?.task_id || '').trim();
+        const eventProjectId = String(event?.project_id || '').trim();
+        if (!bypassScopeCheck && explicitTaskId) {
+            if (eventProjectId) {
+                if (!projectId || eventProjectId !== projectId) return;
+            } else if (
+                !remoteTaskStates.has(explicitTaskId)
+                && !liveCardRecords.has(explicitTaskId)
+            ) {
+                return;
+            }
+        }
+        if (!explicitTaskId) {
+            const connectionId = String(event?.connection_id || '');
+            for (const [taskId, current] of remoteTaskStates) {
+                if (current.connectionId !== connectionId) continue;
+                handleRemoteConnectionState(
+                    { ...event, task_id: taskId, project_id: current.projectId },
+                    { bypassScopeCheck: true },
+                );
+            }
+            return;
+        }
+        const previous = remoteTaskStates.get(explicitTaskId);
+        const state = mergeRemoteTaskState(previous, event, {
+            task_id: explicitTaskId,
+            project_id: eventProjectId || previous?.projectId || projectId,
+            status: previous?.taskStatus || event?.completion || '',
+        });
+        remoteTaskStates.set(explicitTaskId, state);
+        forceTaskCard(explicitTaskId, event?.ts || new Date().toISOString());
+        const details = remoteStateDetails(state);
+        const terminalReadyNote = (
+            remoteTaskActions(state).terminal && state.status === 'ready'
+        )
+            ? 'Connection is ready. This completed task was not replayed; start a new task to retry it.'
+            : '';
+        queueTaskLiveUpdate({
+            phase: ['degraded', 'disconnected'].includes(state.status)
+                ? 'error'
+                : (state.status === 'unknown' ? 'warn' : 'working'),
+            headline: `Remote connection: ${remoteStateLabel(state.status)}`,
+            body: [remoteStateSummary(state), terminalReadyNote].filter(Boolean).join('\n'),
+            fullBody: details.map((item) => (
+                `[${item.label}]\n${remoteDetailText(item.value)}`
+            )).join('\n\n'),
+            visible: true,
+            promote: true,
+            meta: [
+                `SSH ${state.connectionId}`,
+                state.phase ? `phase=${state.phase}` : '',
+                state.completion ? `completion=${state.completion}` : '',
+            ].filter(Boolean),
+            dedupeKey: `remote-connection:${explicitTaskId}`,
+        }, explicitTaskId, normalizeLogTs(event?.ts || new Date().toISOString()),
+        `remote-connection:${explicitTaskId}`, event?.ts || '');
+        const record = liveCardRecords.get(explicitTaskId);
+        if (record) {
+            record.root.dataset.remoteState = state.status;
+            setLiveCardTypingVisible(
+                record,
+                ['connecting', 'ready'].includes(state.status) && !remoteTaskActions(state).terminal,
+            );
+            updateRemoteCardActions(record, state);
+        }
     }
 
     function markAssistantReply(taskId = '') {
@@ -1667,6 +1827,7 @@ export function createChatInstance({
             || syntheticKey.startsWith('subagent-lifecycle:')
             || syntheticKey.startsWith('subagent-progress:')
             || syntheticKey.startsWith('subagent-result:')
+            || syntheticKey.startsWith('remote-connection:')
             || syntheticKey.startsWith('task_done|');
         if (!isLegacyParentSubagentKey) {
             record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);
@@ -1882,6 +2043,19 @@ export function createChatInstance({
             `task_done|${taskId}`,
             { suppressDomInsert, rawTs },
         );
+        const remoteState = remoteTaskStates.get(taskId);
+        if (remoteState) {
+            const taskStatus = String(
+                msg?.status || (failedResult ? 'failed' : 'completed'),
+            ).toLowerCase();
+            const terminalRemoteState = {
+                ...remoteState,
+                taskStatus,
+                completion: taskStatus,
+            };
+            remoteTaskStates.set(taskId, terminalRemoteState);
+            updateRemoteCardActions(liveCardRecords.get(taskId), terminalRemoteState);
+        }
         finishLiveCard(taskId, severity === 'warn' ? 'warn' : (failedResult ? 'error' : 'done'));
         scheduleTaskUiCleanup(taskState);
     }
@@ -3281,6 +3455,10 @@ export function createChatInstance({
     // no-ops unless THIS thread already holds that card.
     ws.on('task_named', (msg) => {
         applySuggestedName(msg?.task_id || '', msg?.suggested_name || '');
+    });
+
+    ws.on('connection_state', (event) => {
+        handleRemoteConnectionState(event);
     });
 
     ws.on('outbound_sent', (evt) => {

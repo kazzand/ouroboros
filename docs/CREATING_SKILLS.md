@@ -82,6 +82,9 @@ entry: plugin.py                    # type=extension only — relative to skill 
 scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
     description: Fetch and render
+    execution_affinity: home        # optional: home | active_workspace
+tool_execution_affinity:           # type=extension only; registered short names
+  inspect_project: active_workspace
 permissions: [net, tool, route, widget, read_settings]   # see "Permissions"
 env_from_settings: [OPENROUTER_API_KEY]                  # core keys require an owner grant
 when_to_use: User asks for the weather forecast.
@@ -127,6 +130,18 @@ execute), and required for `script` / `extension`. Allowed values are
 `deno`, `ruby`, `go`. The actual binary is resolved through
 `shutil.which` at exec time, so the operator's host must ship the
 runtime; otherwise `skill_exec` fails closed with a clear error.
+
+Executable skill invocations stay on Home unless the reviewed manifest opts one
+bounded invocation into `active_workspace`. Script skills declare
+`scripts[].execution_affinity`; extension skills map the exact registered short
+tool name under `tool_execution_affinity`. The only values are `home` and
+`active_workspace`. Missing means `home`; an invalid value or a mapping for a
+tool the extension does not register blocks loading. The opt-in changes only
+where that invocation's native work runs. Registration, routes, WebSockets,
+widgets, settings, subscriptions, reviews, grants, state and companion
+supervision remain Home-owned. Remote invocation receives no Home settings or
+model-provider credentials, and it still requires the ordinary fresh executable
+review and content-bound grants.
 
 ## Lifecycle: install → review → enable → execute
 

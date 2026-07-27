@@ -78,6 +78,104 @@ def collect_workspace_preflight(workspace_root: pathlib.Path) -> Dict[str, Any]:
     }
 
 
+def collect_remote_workspace_preflight(subject: Any) -> Dict[str, Any]:
+    """Collect the same prompt-safe facts on the target through execd."""
+
+    from ouroboros.workspace_executor import execute_remote_system_operation
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(subject)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        raise ValueError("remote preflight requires a sealed SSH workspace")
+    remote_root = str(workspace_ref["remote_root"])
+    curated = sorted(set(_CURATED_TOOLS + _MACOS_PACKAGE_TOOLS + _LINUX_PACKAGE_TOOLS + _WINDOWS_PACKAGE_TOOLS + ("cargo", "rustc", "make")))
+    probe_script = (
+        "for name in "
+        + " ".join(shlex.quote(name) for name in curated)
+        + '; do path=$(command -v "$name" 2>/dev/null || true); '
+        + 'printf "%s\\t%s\\n" "$name" "$path"; done'
+    )
+    probe = execute_remote_system_operation(
+        subject,
+        "verify_remote_check",
+        {"cmd": ["sh", "-c", probe_script], "cwd": remote_root, "timeout_sec": 20},
+    )
+    tools: Dict[str, Dict[str, Any]] = {}
+    stdout = getattr(getattr(probe, "process", None), "stdout", "")
+    for line in str(stdout or "").splitlines():
+        name, _sep, path = line.partition("\t")
+        if name:
+            tools[name] = {"available": bool(path), "path": path}
+
+    def _fixed_git(*argv: str) -> str:
+        envelope = execute_remote_system_operation(
+            subject,
+            "verify_remote_check",
+            {
+                "cmd": ["git", *argv],
+                "cwd": remote_root,
+                "timeout_sec": 10,
+            },
+        )
+        process = getattr(envelope, "process", None)
+        return str(getattr(process, "stdout", "") or "").strip()
+
+    head = _fixed_git("rev-parse", "HEAD")
+    branch = _fixed_git("rev-parse", "--abbrev-ref", "HEAD")
+    status_text = _fixed_git("status", "--porcelain=v1", "--untracked-files=all")
+    status_entries = [line for line in status_text.splitlines() if line.strip()]
+    manifests: List[Dict[str, Any]] = []
+    for name in _MANIFEST_NAMES:
+        try:
+            envelope = execute_remote_system_operation(
+                subject,
+                "read_file",
+                {"path": name, "start_line": 1, "max_lines": 4000},
+            )
+        except Exception:
+            continue
+        text = str(getattr(envelope, "text", "") or "")
+        marker = "\n"
+        content = text.split(marker, 1)[1] if marker in text else ""
+        if not content and "NOT_FOUND" in text:
+            continue
+        entry: Dict[str, Any] = {
+            "path": name,
+            "type": _manifest_type(name),
+            "scripts": [],
+        }
+        if name == "package.json":
+            try:
+                package = json.loads(content)
+                scripts = package.get("scripts") if isinstance(package, dict) else {}
+                if isinstance(scripts, dict):
+                    entry["scripts"] = sorted(str(key) for key in scripts)[:50]
+                    entry["script_commands"] = {
+                        str(key): str(value)
+                        for key, value in scripts.items()
+                        if isinstance(value, str)
+                    }
+            except Exception:
+                pass
+        manifests.append(entry)
+    return {
+        "schema_version": 1,
+        "created_at": utc_now_iso(),
+        "workspace_root": remote_root,
+        "git": {
+            "head": head,
+            "branch": branch,
+            "dirty": bool(status_entries),
+            "status_count": len(status_entries),
+            "status_porcelain": status_entries[:200],
+            "status_truncated": len(status_entries) > 200,
+        },
+        "manifests": manifests,
+        "tools": tools,
+        "path_bootstrap": {"added_dirs": [], "authority": "remote_target"},
+    }
+
+
 def summarize_workspace_preflight(preflight: Dict[str, Any]) -> Dict[str, Any]:
     """Return the task-metadata/prompt-safe preflight summary."""
 
@@ -293,6 +391,7 @@ def _git_stdout(root: pathlib.Path, cmd: List[str], *, timeout: int) -> str:
 
 
 __all__ = [
+    "collect_remote_workspace_preflight",
     "collect_workspace_preflight",
     "render_workspace_preflight_summary",
     "summarize_workspace_preflight",

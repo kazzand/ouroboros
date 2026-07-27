@@ -50,6 +50,8 @@ _POPEN_ALLOWLIST = {
     "ouroboros/gateways/claude_code.py",  # waited readonly child (timeout-bound)
     "ouroboros/extension_process_runner.py",  # waited extension child
     "ouroboros/workspace_executor.py",    # custody write-through added at spawn
+    "ouroboros/workspace_native.py",      # execd-side groups; remote custodian owns them
+    "ouroboros/execd.py",                 # remote-only generation custodian process
     "ouroboros/local_model.py",           # custody record added at spawn
     "ouroboros/extension_companion.py",   # custody write-through added at spawn
     "ouroboros/tools/services.py",        # routed through spawn_supervised
@@ -103,6 +105,83 @@ def test_spawn_supervised_records_ledger_entry(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["false", "exception"])
+def test_required_custody_kills_new_child_when_registration_fails(
+    tmp_path, monkeypatch, failure
+):
+    class FakeProcess:
+        pid = 4242
+
+    proc = FakeProcess()
+    killed = []
+    monkeypatch.setattr(process_custody.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(
+        process_custody,
+        "_kill_uncustodied_child",
+        lambda child: killed.append(child),
+    )
+
+    if failure == "false":
+        monkeypatch.setattr(process_custody, "record_process", lambda *a, **k: None)
+    else:
+        def _raise(*_args, **_kwargs):
+            raise OSError("ledger unavailable")
+
+        monkeypatch.setattr(process_custody, "record_process", _raise)
+
+    with pytest.raises((RuntimeError, OSError)):
+        spawn_supervised(
+            ["ssh", "example"],
+            drive_root=tmp_path,
+            purpose="remote-ssh",
+            scope="session",
+            required_custody=True,
+        )
+
+    assert killed == [proc]
+
+
+def test_legacy_custody_failure_remains_fail_soft(tmp_path, monkeypatch):
+    class FakeProcess:
+        pid = 4243
+
+    proc = FakeProcess()
+    monkeypatch.setattr(process_custody.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(process_custody, "record_process", lambda *a, **k: None)
+    monkeypatch.setattr(
+        process_custody,
+        "_kill_uncustodied_child",
+        lambda _child: pytest.fail("legacy spawn must stay fail-soft"),
+    )
+
+    assert spawn_supervised(
+        ["helper"],
+        drive_root=tmp_path,
+        purpose="legacy-helper",
+        scope="session",
+    ) is proc
+
+
+def test_required_custody_refuses_shared_process_group_before_spawn(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        process_custody.subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("must reject before spawning"),
+    )
+
+    with pytest.raises(ValueError, match="isolated process group"):
+        spawn_supervised(
+            ["ssh", "example"],
+            drive_root=tmp_path,
+            purpose="remote-ssh",
+            scope="session",
+            new_process_group=False,
+            required_custody=True,
+        )
 
 
 @_POSIX_ONLY

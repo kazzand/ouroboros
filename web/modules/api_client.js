@@ -91,14 +91,32 @@ export const apiClient = {
     }),
     skillGrants: (skill, items) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, { items }),
     chatHistory: (limit = 1000) => fetchJson(`/api/chat/history?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
+    taskCancel: (taskId) => jsonPost(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {}),
     projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
-    projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),
+    projectUpdate: (projectId, update) => jsonPost(
+        `/api/projects/${encodeURIComponent(projectId)}/update`,
+        typeof update === 'string' ? { name: update } : update,
+    ),
     /** @returns {Promise<import('./api_types.js').ProjectDeleteResponse>} */
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./api_types.js').ConnectionListResponse>} */
+    connections: () => fetchJson('/api/owner/connections', { cache: 'no-store' }),
+    connectionAdd: (payload) => jsonPost('/api/owner/connections', payload),
+    connectionTest: (connectionId) => jsonPost(`/api/owner/connections/${encodeURIComponent(connectionId)}/test`, {}),
+    connectionBootstrap: (connectionId) => jsonPost(`/api/owner/connections/${encodeURIComponent(connectionId)}/bootstrap`, {}),
+    connectionReconnect: (connectionId) => jsonPost(`/api/owner/connections/${encodeURIComponent(connectionId)}/reconnect`, {}),
+    connectionRetrust: (connectionId, payload) => jsonPost(`/api/owner/connections/${encodeURIComponent(connectionId)}/retrust`, payload),
+    connectionRetire: (connectionId) => fetchJson(`/api/owner/connections/${encodeURIComponent(connectionId)}`, { method: 'DELETE' }),
+    ownerLogin: (password) => jsonPost('/auth/login', { password, next: '/' }),
+    /** @returns {Promise<import('./api_types.js').ConnectionDirsResponse>} */
+    connectionDirs: (connectionId, path = '') => fetchJson(
+        `/api/owner/connections/${encodeURIComponent(connectionId)}/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`,
+        { cache: 'no-store' },
+    ),
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
     updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),

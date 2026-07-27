@@ -37,6 +37,8 @@ site/public/assets/
 python-standalone/
 node-standalone/
 ripgrep-standalone/
+# Verified CI-built remote executor payload: bundled by PyInstaller, never git.
+/assets/execd/
 
 # OS
 .DS_Store

@@ -259,6 +259,24 @@ class ProjectsChangedOutbound(TypedDict):
     chat_id: NotRequired[int]
 
 
+class ConnectionStateOutbound(TypedDict, total=False):
+    """Bounded live connection/admission projection; durable secrets are absent."""
+
+    type: Required[Literal["connection_state"]]
+    connection_id: Required[str]
+    task_id: NotRequired[str]
+    project_id: NotRequired[str]
+    status: NotRequired[
+        Literal["connecting", "ready", "degraded", "disconnected", "unknown"]
+    ]
+    phase: NotRequired[str]
+    completion: NotRequired[str]
+    error_code: NotRequired[str]
+    action: NotRequired[str]
+    diagnostic: NotRequired[Dict[str, Any]]
+    log_refs: NotRequired[List[Dict[str, Any]]]
+
+
 class MessageAnnotationOutbound(TypedDict):
     """Bubble-free presentation update for one canonical owner message."""
 
@@ -287,6 +305,7 @@ class ProjectCreateRequest(TypedDict, total=False):
     init_git: bool
     git_url: str
     with_workspace: bool
+    workspace_ref: "ProjectWorkspaceRef"
 
 
 class ProjectEntry(TypedDict, total=False):
@@ -298,6 +317,8 @@ class ProjectEntry(TypedDict, total=False):
     name: str
     chat_id: int
     working_dir: str
+    workspace_ref: "ProjectWorkspaceRef"
+    workspace_identity_key: str
     provenance: str
     clone_url: str
     trusted_at: str
@@ -620,14 +641,86 @@ class ChatHistoryResponse(TypedDict, total=False):
 
 
 class ExecutorRef(TypedDict, total=False):
-    type: Required[Literal["local", "docker_exec"]]
+    type: Required[Literal["local", "docker_exec", "ssh_exec"]]
     id: NotRequired[str]
     network: NotRequired[Literal["host", "none"]]
     workspace_host_path: NotRequired[str]
     workspace_backend_path: NotRequired[str]
     # Required at runtime when type == "docker_exec".
     container_name: NotRequired[str]
+    # Required for ssh_exec; Home path mappings are forbidden for that arm.
+    workspace_id: NotRequired[str]
     path_mappings: NotRequired[list[Dict[str, str]]]
+
+
+class ProjectWorkspaceRef(TypedDict, total=False):
+    kind: Required[Literal["local", "ssh"]]
+    local_root: NotRequired[str]
+    connection_id: NotRequired[str]
+    remote_root: NotRequired[str]
+    workspace_id: NotRequired[str]
+
+
+class ConnectionEntry(TypedDict, total=False):
+    id: Required[str]
+    name: Required[str]
+    ssh_alias: Required[str]
+    expected_host_id: NotRequired[str]
+    host_id_history: NotRequired[List[Dict[str, Any]]]
+    lifecycle: NotRequired[Literal["active", "retired"]]
+    retired_at: NotRequired[Optional[str]]
+    created_at: NotRequired[str]
+    updated_at: NotRequired[str]
+    status: NotRequired[
+        Literal["connecting", "ready", "degraded", "disconnected", "unknown"]
+    ]
+    phase: NotRequired[str]
+    platform: NotRequired[str]
+    architecture: NotRequired[str]
+    build: NotRequired[str]
+    bootstrap_compatible: NotRequired[bool]
+    health_fresh: NotRequired[bool]
+    error_code: NotRequired[str]
+    action: NotRequired[str]
+    diagnostic: NotRequired[Dict[str, Any]]
+    log_refs: NotRequired[List[Dict[str, Any]]]
+
+
+class ConnectionAddRequest(TypedDict):
+    name: str
+    ssh_alias: str
+
+
+class ConnectionListResponse(TypedDict, total=False):
+    connections: List[ConnectionEntry]
+    error: str
+    error_code: str
+    action: str
+
+
+class ConnectionActionResponse(TypedDict, total=False):
+    ok: bool
+    connection: ConnectionEntry
+    connection_id: str
+    status: str
+    phase: str
+    completion: str
+    error: str
+    error_code: str
+    action: str
+    diagnostic: Dict[str, Any]
+    log_refs: List[Dict[str, Any]]
+
+
+class ConnectionDirsResponse(TypedDict, total=False):
+    connection_id: str
+    path: str
+    parent: str
+    dirs: List[FsDirsEntry]
+    truncated: bool
+    error: str
+    error_code: str
+    action: str
 
 
 class _TaskCreateRequestRequired(TypedDict):
@@ -717,6 +810,14 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/owner/safety-mode",
     "POST /api/owner/capability-ack",
     "POST /api/owner/skills/{skill}/attest-review",
+    "GET /api/owner/connections",
+    "POST /api/owner/connections",
+    "POST /api/owner/connections/{connection_id}/test",
+    "POST /api/owner/connections/{connection_id}/bootstrap",
+    "POST /api/owner/connections/{connection_id}/reconnect",
+    "POST /api/owner/connections/{connection_id}/retrust",
+    "GET /api/owner/connections/{connection_id}/dirs",
+    "DELETE /api/owner/connections/{connection_id}",
     "GET /api/model-catalog",
     "POST /api/tasks",
     "GET /api/tasks",
@@ -811,6 +912,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "message_annotation",
     "projects_changed",
     "task_named",
+    "connection_state",
 )
 
 
@@ -829,6 +931,7 @@ __all__ = [
     "HeartbeatOutbound",
     "ExtensionLifecycleOutbound",
     "ProjectsChangedOutbound",
+    "ConnectionStateOutbound",
     "MessageAnnotationOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
@@ -868,6 +971,12 @@ __all__ = [
     "FileBrowserListResponse",
     "ChatHistoryResponse",
     "ExecutorRef",
+    "ProjectWorkspaceRef",
+    "ConnectionEntry",
+    "ConnectionAddRequest",
+    "ConnectionListResponse",
+    "ConnectionActionResponse",
+    "ConnectionDirsResponse",
     "TaskCreateRequest",
     "TaskCreateResponse",
     "TaskListResponse",

@@ -1407,6 +1407,36 @@ def _resume_interrupted_project_deletions() -> None:
         log.debug("Project deletion recovery failed", exc_info=True)
 
 
+def _recover_remote_task_admissions() -> None:
+    """Resume only queue-owned remote admissions after broker recovery."""
+
+    try:
+        from ouroboros.gateway.tasks import recover_remote_task_admissions
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        recover_remote_task_admissions(get_remote_workspace_service())
+    except Exception:
+        log.warning("Remote task admission recovery failed", exc_info=True)
+
+
+def _reap_orphaned_startup_processes() -> None:
+    try:
+        from ouroboros.process_custody import reap_orphaned_processes
+
+        reaped = reap_orphaned_processes(
+            DATA_DIR,
+            live_owner_skills=_installed_skill_names(),
+        )
+        if reaped:
+            log.info(
+                "Process custody reaper killed %d orphaned process(es): %s",
+                len(reaped),
+                reaped,
+            )
+    except Exception:
+        log.debug("Process custody startup reap failed", exc_info=True)
+
+
 def _run_supervisor(settings: dict) -> None:
     """Initialize and run the supervisor loop. Called in a background thread."""
     global _supervisor_error, _supervisor_thread, _consciousness
@@ -1490,6 +1520,7 @@ def _run_supervisor(settings: dict) -> None:
         spawn_workers(max_workers)
         restored_pending = restore_pending_from_snapshot()
         persist_queue_snapshot(reason="startup")
+        _recover_remote_task_admissions()
         _resume_interrupted_project_deletions()
         try:
             from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
@@ -1515,14 +1546,7 @@ def _run_supervisor(settings: dict) -> None:
                 })
         except Exception:
             log.debug("Headless task drive prune failed", exc_info=True)
-        try:
-            from ouroboros.process_custody import reap_orphaned_processes
-
-            reaped = reap_orphaned_processes(DATA_DIR, live_owner_skills=_installed_skill_names())
-            if reaped:
-                log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
-        except Exception:
-            log.debug("Process custody startup reap failed", exc_info=True)
+        _reap_orphaned_startup_processes()
 
         try:
             from ouroboros import subagent_worktrees
@@ -1918,6 +1942,90 @@ def _run_startup_task_recovery(
         log.warning("Root post-task synthesis recovery at startup failed", exc_info=True)
 
 
+def _initialize_remote_workspace_service(
+    drive_root: pathlib.Path,
+):
+    """Create the one server-generation broker before workers recover tasks."""
+
+    try:
+        from ouroboros.process_custody import current_custody_session_id
+        from ouroboros.remote_workspace import (
+            RemoteSessionBroker,
+            set_remote_workspace_service,
+        )
+        from ouroboros.tools.registry import ToolRegistry
+
+        registry = ToolRegistry(repo_dir=REPO_DIR, drive_root=drive_root)
+        capability_manifest = registry.workspace_capability_manifest(
+            repo_root=REPO_DIR,
+        )
+        configured_bundle_dir = str(
+            os.environ.get("OUROBOROS_EXECD_BUNDLE_DIR", "") or ""
+        ).strip()
+        service = RemoteSessionBroker(
+            drive_root=drive_root,
+            server_generation=current_custody_session_id(),
+            capability_manifest=capability_manifest,
+            bundle_dir=(
+                pathlib.Path(configured_bundle_dir)
+                if configured_bundle_dir
+                else None
+            ),
+        )
+        service.start()
+        service.recover()
+        set_remote_workspace_service(service)
+        return service
+    except Exception:
+        log.warning("Remote workspace broker startup failed", exc_info=True)
+        try:
+            from ouroboros.remote_workspace import set_remote_workspace_service
+
+            set_remote_workspace_service(None)
+        except Exception:
+            pass
+        return None
+
+
+def _prepare_lifespan_runtime(
+    drive_root: pathlib.Path,
+    *,
+    skip_real_data_during_pytest: bool,
+) -> None:
+    """Seed native skills and reconcile Projects before public APIs start."""
+
+    try:
+        if skip_real_data_during_pytest:
+            log.info("Skipping native skills bootstrap against real DATA_DIR during pytest")
+        else:
+            from ouroboros.launcher_bootstrap import ensure_data_skills_seeded
+
+            ensure_data_skills_seeded()
+    except Exception:
+        log.warning("Native skills bootstrap failed", exc_info=True)
+
+    try:
+        if not skip_real_data_during_pytest:
+            from ouroboros.projects_registry import reconcile_projects
+
+            reconcile_projects(drive_root)
+    except Exception:
+        log.warning("Project registry boot reconcile failed", exc_info=True)
+
+
+def _configure_mcp_startup(settings: dict) -> None:
+    try:
+        from ouroboros.mcp_client import (
+            reconfigure_from_settings,
+            refresh_all_background,
+        )
+
+        reconfigure_from_settings(settings)
+        refresh_all_background(reason="startup")
+    except Exception:
+        log.warning("MCP startup reconfigure failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
     global _event_loop
@@ -1947,28 +2055,19 @@ async def lifespan(app):
         and lifespan_drive_root == default_real_data_dir
         and not os.environ.get("OUROBOROS_DATA_DIR")
     )
+    remote_workspace_service = (
+        None
+        if pytest_default_real_data_dir
+        else _initialize_remote_workspace_service(lifespan_drive_root)
+    )
+    app.state.remote_workspace_service = remote_workspace_service
 
-    # Source-mode must seed native skills too, matching packaged launcher layout.
-    try:
-        if pytest_default_real_data_dir:
-            log.info("Skipping native skills bootstrap against real DATA_DIR during pytest")
-        else:
-            from ouroboros.launcher_bootstrap import ensure_data_skills_seeded
-            ensure_data_skills_seeded()
-    except Exception:
-        log.warning("Native skills bootstrap failed", exc_info=True)
-
-    # Boot-reconcile the project registry BEFORE /api/state and context-building
-    # can rely on registered_project_chat_ids (the multi-project isolation SSOT):
-    # register any pre-existing data/projects/<id>/ store whose row is missing, so
-    # an inherited project's raw chat is partitioned from turn one (not only after
-    # the 300s periodic tick). Idempotent and never prunes.
-    try:
-        if not pytest_default_real_data_dir:
-            from ouroboros.projects_registry import reconcile_projects
-            reconcile_projects(lifespan_drive_root)
-    except Exception:
-        log.warning("Project registry boot reconcile failed", exc_info=True)
+    # Source mode seeds native skills too. Reconcile Projects before /api/state
+    # can consume the registered-project isolation SSOT.
+    _prepare_lifespan_runtime(
+        lifespan_drive_root,
+        skip_real_data_during_pytest=pytest_default_real_data_dir,
+    )
 
     if has_startup_ready_provider(settings):
         _start_supervisor_if_needed(settings)
@@ -2110,15 +2209,7 @@ async def lifespan(app):
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
 
-    try:
-        from ouroboros.mcp_client import (
-            reconfigure_from_settings as _mcp_reconfigure_startup,
-            refresh_all_background as _mcp_refresh_background_startup,
-        )
-        _mcp_reconfigure_startup(settings)
-        _mcp_refresh_background_startup(reason="startup")
-    except Exception:
-        log.warning("MCP startup reconfigure failed", exc_info=True)
+    _configure_mcp_startup(settings)
 
     try:
         from ouroboros.config import get_skills_repo_path
@@ -2142,6 +2233,18 @@ async def lifespan(app):
     try:
         yield
     finally:
+        app.state.remote_workspace_service = None
+        try:
+            from ouroboros.remote_workspace import set_remote_workspace_service
+
+            set_remote_workspace_service(None)
+        except Exception:
+            pass
+        if remote_workspace_service is not None:
+            try:
+                remote_workspace_service.close(timeout_sec=5)
+            except Exception:
+                log.warning("Remote workspace broker shutdown failed", exc_info=True)
         if extension_reconcile_task is not None:
             extension_reconcile_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -2233,6 +2336,7 @@ app.app.state.bind_host = _BIND_HOST  # type: ignore[attr-defined]
 app.app.state.port_file = PORT_FILE  # type: ignore[attr-defined]
 app.app.state.default_port = DEFAULT_PORT  # type: ignore[attr-defined]
 app.app.state.start_supervisor_if_needed = _start_supervisor_if_needed  # type: ignore[attr-defined]
+app.app.state.remote_workspace_service = None  # type: ignore[attr-defined]
 
 
 _ACTUAL_BOUND_PORT: Optional[int] = None
@@ -2245,6 +2349,12 @@ def _actual_bound_port() -> int:
 
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
+    try:
+        from ouroboros.remote_workspace import RemoteSessionBroker
+
+        RemoteSessionBroker.panic_close_all()
+    except Exception:
+        pass
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
         kill_all_tracked_subprocesses()

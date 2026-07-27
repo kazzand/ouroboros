@@ -2,6 +2,500 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import importlib.util
+import json
+import pathlib
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
+
+ExecutionAffinity = Literal["home", "root", "cwd", "workspace", "service", "hybrid"]
+ExecutionPlacement = Literal["home", "active_workspace", "service_record", "hybrid"]
+DynamicExecutionAffinity = Literal["home", "active_workspace"]
+
+
+@dataclass(frozen=True)
+class PlacementDecision:
+    affinity: ExecutionAffinity
+    placement: ExecutionPlacement
+    reason: str
+
+
+ROOT_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({
+    "read_file", "list_files", "write_file", "edit_text", "search_code", "query_code",
+})
+CWD_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({"run_command", "run_script"})
+WORKSPACE_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({"vcs_status", "vcs_diff"})
+SERVICE_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({
+    "start_service", "service_status", "service_logs", "stop_service",
+})
+HYBRID_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({
+    "verify_and_record",
+    "claude_code_edit",
+    "schedule_subagent",
+    "integrate_subagent_patch",
+    "compare_subagent_patches",
+    "browse_page",
+    "browser_action",
+    "analyze_screenshot",
+    "vlm_query",
+    "view_image",
+    "ocr_pdf",
+    "extract_video_frames",
+})
+HOME_AFFINITY_TOOL_NAMES: frozenset[str] = frozenset({
+    "chat_history",
+    "recent_tasks",
+    "plan_task",
+    "task_acceptance_review",
+    "wait_task",
+    "wait_tasks",
+    "get_task_result",
+    "peek_task",
+    "cancel_task",
+    "discard_child_result",
+    "override_delegation_constraint",
+    "knowledge_read",
+    "knowledge_list",
+    "knowledge_write",
+    "journal_read",
+    "journal_write",
+    "workpad_read",
+    "workpad_write",
+    "tree_note",
+    "tree_read",
+    "web_search",
+    "youtube_transcript",
+    "list_available_tools",
+    "enable_tools",
+})
+
+WORKSPACE_TOOL_EXECUTION_AFFINITY: dict[str, ExecutionAffinity] = {
+    **{name: "root" for name in ROOT_AFFINITY_TOOL_NAMES},
+    **{name: "cwd" for name in CWD_AFFINITY_TOOL_NAMES},
+    **{name: "workspace" for name in WORKSPACE_AFFINITY_TOOL_NAMES},
+    **{name: "service" for name in SERVICE_AFFINITY_TOOL_NAMES},
+    **{name: "hybrid" for name in HYBRID_AFFINITY_TOOL_NAMES},
+    **{name: "home" for name in HOME_AFFINITY_TOOL_NAMES},
+}
+
+WORKSPACE_CAPABILITY_MANIFEST_SCHEMA_VERSION = 1
+
+FORBIDDEN_REMOTE_IMPORT_PREFIXES: dict[str, tuple[str, ...]] = {
+    "registry": ("ouroboros.tools.registry",),
+    "provider_or_model": (
+        "ouroboros.llm",
+        "ouroboros.local_model",
+        "ouroboros.model_",
+        "ouroboros.pricing",
+        "ouroboros.provider_models",
+        "ouroboros.tools.search",
+    ),
+    "review_or_planning": (
+        "ouroboros.deep_self_review",
+        "ouroboros.parallel_review",
+        "ouroboros.plan_review",
+        "ouroboros.review",
+        "ouroboros.review_evidence",
+        "ouroboros.review_state",
+        "ouroboros.scope_review",
+        "ouroboros.tools.claude_advisory_review",
+        "ouroboros.tools.review",
+        "ouroboros.triad_review",
+    ),
+    "server_or_gateway": (
+        "server",
+        "supervisor",
+        "ouroboros.gateway",
+        "ouroboros.server",
+        "ouroboros.supervisor",
+    ),
+    "settings_or_owner_state": (
+        "ouroboros.config",
+        "ouroboros.owner",
+        "ouroboros.settings_setup_contract",
+    ),
+    "home_task_or_artifact_state": (
+        "ouroboros.artifacts",
+        "ouroboros.mutation_attribution",
+        "ouroboros.outcomes",
+        "ouroboros.project_facts",
+        "ouroboros.protected_artifacts",
+        "ouroboros.task_pacing",
+        "ouroboros.task_results",
+        "ouroboros.task_status",
+    ),
+}
+
+
+def build_workspace_capability_manifest(
+    public_schemas: Iterable[Mapping[str, Any]],
+    *,
+    repo_root: pathlib.Path,
+    operation_modules: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical Home/execd capability contract from registry schemas.
+
+    The caller supplies the registry's unfiltered built-in schemas. This module
+    owns which of those tools belong to the workspace surface; execd owns only
+    the explicit native operation allowlist in ``workspace_native``.
+    """
+
+    from ouroboros.workspace_native import REMOTE_NATIVE_OPERATION_MODULE
+
+    native_map = (
+        REMOTE_NATIVE_OPERATION_MODULE
+        if operation_modules is None
+        else operation_modules
+    )
+    schemas_by_name: dict[str, dict[str, Any]] = {}
+    for raw in public_schemas:
+        schema = _canonical_json_copy(raw, label="public tool schema")
+        function = schema.get("function")
+        name = str(function.get("name") or "").strip() if isinstance(function, dict) else ""
+        if schema.get("type") != "function" or not name:
+            raise ValueError("public tool schema must be a named function envelope")
+        if name in schemas_by_name:
+            raise ValueError(f"duplicate public tool schema: {name}")
+        schemas_by_name[name] = schema
+
+    expected_names = frozenset(WORKSPACE_TOOL_EXECUTION_AFFINITY)
+    missing = sorted(expected_names - schemas_by_name.keys())
+    if missing:
+        raise ValueError(f"workspace capability manifest is missing public schemas: {missing}")
+    public_tools = [
+        schemas_by_name[name]
+        for name in sorted(expected_names)
+    ]
+    public_schema_sha256 = hashlib.sha256(_canonical_json_bytes(public_tools)).hexdigest()
+    import_audit = assert_remote_native_import_closure(
+        pathlib.Path(repo_root),
+        operation_modules=native_map,
+    )
+    native_operations = [
+        {"name": name, "module": str(native_map[name])}
+        for name in sorted(native_map)
+    ]
+    payload: dict[str, Any] = {
+        "schema_version": WORKSPACE_CAPABILITY_MANIFEST_SCHEMA_VERSION,
+        "public_tools": public_tools,
+        "public_schema_sha256": public_schema_sha256,
+        "native_operations": native_operations,
+        "native_kernel_modules": list(import_audit["roots"]),
+        "native_import_modules": list(import_audit["modules"]),
+        "native_import_edges": dict(import_audit["edges"]),
+    }
+    payload["manifest_sha256"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    return payload
+
+
+def remote_native_import_closure(
+    repo_root: pathlib.Path,
+    *,
+    operation_modules: Mapping[str, str] | None = None,
+    extra_roots: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Return the deterministic module-import-time closure for execd kernels.
+
+    Function-local imports are deliberately outside this module-import boundary:
+    each native operation gets a clean-subprocess invocation smoke when its
+    implementation lands. This static gate prevents the already-proven class of
+    accidental Home dependencies from entering merely by importing execd.
+    """
+
+    from ouroboros.workspace_native import (
+        REMOTE_NATIVE_OPERATION_MODULE,
+        validate_remote_native_operation_map,
+    )
+
+    native_map = (
+        REMOTE_NATIVE_OPERATION_MODULE
+        if operation_modules is None
+        else operation_modules
+    )
+    validate_remote_native_operation_map(native_map)
+    root = pathlib.Path(repo_root).resolve(strict=False)
+    seeds = frozenset(
+        {
+            *native_map.values(),
+            "ouroboros.shell_parse",
+            *(str(root) for root in extra_roots),
+        }
+    )
+    initial_modules = {
+        module
+        for seed in seeds
+        for module in (seed, *_parent_packages(seed))
+    }
+    pending = sorted(initial_modules, reverse=True)
+    visited: set[str] = set()
+    missing: set[str] = set()
+    edges: dict[str, tuple[str, ...]] = {}
+    while pending:
+        module = pending.pop()
+        if module in visited:
+            continue
+        visited.add(module)
+        module_path = _local_module_path(root, module)
+        if module_path is None:
+            missing.add(module)
+            continue
+        imports = tuple(sorted(_module_scope_local_imports(root, module, module_path)))
+        edges[module] = imports
+        for imported in reversed(imports):
+            for dependency in (imported, *_parent_packages(imported)):
+                if dependency not in visited:
+                    pending.append(dependency)
+
+    forbidden: dict[str, list[str]] = {}
+    for category, prefixes in FORBIDDEN_REMOTE_IMPORT_PREFIXES.items():
+        matches = sorted(
+            module
+            for module in visited
+            if any(_module_matches_prefix(module, prefix) for prefix in prefixes)
+        )
+        if matches:
+            forbidden[category] = matches
+    return {
+        "roots": sorted(seeds),
+        "modules": sorted(visited),
+        "edges": {module: list(edges[module]) for module in sorted(edges)},
+        "missing_modules": sorted(missing),
+        "forbidden": forbidden,
+    }
+
+
+def assert_remote_native_import_closure(
+    repo_root: pathlib.Path,
+    *,
+    operation_modules: Mapping[str, str] | None = None,
+    extra_roots: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Return a clean closure, otherwise fail before an execd artifact is built."""
+
+    audit = remote_native_import_closure(
+        repo_root,
+        operation_modules=operation_modules,
+        extra_roots=extra_roots,
+    )
+    if audit["missing_modules"]:
+        raise ValueError(
+            "remote native import closure has missing modules: "
+            f"{audit['missing_modules']}"
+        )
+    if audit["forbidden"]:
+        raise ValueError(
+            "remote native import closure reaches forbidden Home dependencies: "
+            f"{audit['forbidden']}"
+        )
+    return audit
+
+
+def _module_matches_prefix(module: str, prefix: str) -> bool:
+    return module == prefix or module.startswith(prefix + ".")
+
+
+def _parent_packages(module: str) -> tuple[str, ...]:
+    parts = module.split(".")
+    return tuple(".".join(parts[:index]) for index in range(1, len(parts)))
+
+
+def _local_module_path(repo_root: pathlib.Path, module: str) -> pathlib.Path | None:
+    relative = pathlib.Path(*module.split("."))
+    module_file = repo_root / relative.with_suffix(".py")
+    if module_file.is_file():
+        return module_file
+    package_file = repo_root / relative / "__init__.py"
+    if package_file.is_file():
+        return package_file
+    return None
+
+
+def _module_scope_local_imports(
+    repo_root: pathlib.Path,
+    module: str,
+    module_path: pathlib.Path,
+) -> set[str]:
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    import_nodes: list[ast.Import | ast.ImportFrom] = []
+    pending = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_nodes.append(node)
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+    package = module if module_path.name == "__init__.py" else module.rpartition(".")[0]
+    imports: set[str] = set()
+    for node in import_nodes:
+        candidates: list[str] = []
+        if isinstance(node, ast.Import):
+            candidates.extend(alias.name for alias in node.names)
+        elif node.level:
+            relative = "." * node.level + str(node.module or "")
+            try:
+                base = importlib.util.resolve_name(relative, package)
+            except (ImportError, ValueError):
+                continue
+            candidates.append(base)
+            candidates.extend(f"{base}.{alias.name}" for alias in node.names)
+        elif node.module:
+            candidates.append(node.module)
+            candidates.extend(f"{node.module}.{alias.name}" for alias in node.names)
+        for candidate in candidates:
+            if _local_module_path(repo_root, candidate) is not None:
+                imports.add(candidate)
+    return imports
+
+
+def assert_workspace_capability_compatible(
+    home_manifest: Mapping[str, Any],
+    backend_manifest: Mapping[str, Any],
+) -> None:
+    """Fail admission on a missing native operation or public-schema drift."""
+
+    home = _validated_workspace_capability_manifest(home_manifest, label="Home")
+    backend = _validated_workspace_capability_manifest(
+        backend_manifest,
+        label="workspace backend",
+    )
+    if home["native_operations"] != backend["native_operations"]:
+        raise ValueError("workspace backend native capability allowlist differs from Home")
+    if home["public_schema_sha256"] != backend["public_schema_sha256"]:
+        raise ValueError("workspace backend public tool schema digest differs from Home")
+    if home["public_tools"] != backend["public_tools"]:
+        raise ValueError("workspace backend public tool schemas differ from Home")
+    for field in (
+        "native_kernel_modules",
+        "native_import_modules",
+        "native_import_edges",
+    ):
+        if home.get(field) != backend.get(field):
+            raise ValueError(
+                f"workspace backend {field} differs from the Home import closure"
+            )
+
+
+def _validated_workspace_capability_manifest(
+    raw: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    manifest = _canonical_json_copy(raw, label=f"{label} capability manifest")
+    if manifest.get("schema_version") != WORKSPACE_CAPABILITY_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"{label} capability manifest has an unsupported schema version")
+    claimed_manifest_hash = str(manifest.pop("manifest_sha256", "") or "")
+    actual_manifest_hash = hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest()
+    if claimed_manifest_hash != actual_manifest_hash:
+        raise ValueError(f"{label} capability manifest hash is invalid")
+    public_tools = manifest.get("public_tools")
+    if not isinstance(public_tools, list):
+        raise ValueError(f"{label} capability manifest public_tools must be a list")
+    actual_schema_hash = hashlib.sha256(_canonical_json_bytes(public_tools)).hexdigest()
+    if manifest.get("public_schema_sha256") != actual_schema_hash:
+        raise ValueError(f"{label} capability manifest public schema hash is invalid")
+    native_operations = manifest.get("native_operations")
+    if not isinstance(native_operations, list):
+        raise ValueError(f"{label} capability manifest native_operations must be a list")
+    from ouroboros.workspace_native import validate_remote_native_operation_map
+
+    operation_map: dict[str, str] = {}
+    for item in native_operations:
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} native operation rows must be objects")
+        name = str(item.get("name") or "")
+        module = str(item.get("module") or "")
+        if not name or name in operation_map:
+            raise ValueError(f"{label} native operation names must be non-empty and unique")
+        operation_map[name] = module
+    validate_remote_native_operation_map(operation_map)
+    manifest["manifest_sha256"] = claimed_manifest_hash
+    return manifest
+
+
+def _canonical_json_copy(value: Any, *, label: str) -> dict[str, Any]:
+    try:
+        copied = json.loads(_canonical_json_bytes(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not canonical JSON: {exc}") from exc
+    if not isinstance(copied, dict):
+        raise ValueError(f"{label} must be an object")
+    return copied
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def builtin_execution_affinity(tool_name: str) -> ExecutionAffinity:
+    """Return the explicit built-in placement class; unknown names fail closed."""
+
+    name = str(tool_name or "").strip()
+    try:
+        return WORKSPACE_TOOL_EXECUTION_AFFINITY[name]
+    except KeyError:
+        raise ValueError(f"built-in tool has no execution-affinity declaration: {name!r}") from None
+
+
+def normalize_dynamic_execution_affinity(
+    value: Any,
+    *,
+    present: bool,
+) -> DynamicExecutionAffinity:
+    """A missing extension/script declaration stays Home; invalid values fail."""
+
+    if not present:
+        return "home"
+    text = str(value or "").strip().lower()
+    if text not in {"home", "active_workspace"}:
+        raise ValueError("execution_affinity must be 'home' or 'active_workspace'")
+    return text  # type: ignore[return-value]
+
+
+def lexical_execution_placement(
+    tool_name: str,
+    args: dict[str, Any],
+) -> PlacementDecision:
+    """Pure first classification; native containment is resolved later."""
+
+    affinity = builtin_execution_affinity(tool_name)
+    if affinity == "home":
+        return PlacementDecision(affinity, "home", "Home-owned faculty")
+    if affinity == "root":
+        root = str(args.get("root") or "active_workspace").strip()
+        placement: ExecutionPlacement = (
+            "active_workspace" if root == "active_workspace" else "home"
+        )
+        return PlacementDecision(affinity, placement, f"resource root={root}")
+    if affinity == "workspace":
+        return PlacementDecision(affinity, "active_workspace", "workspace VCS state")
+    if affinity == "service":
+        if tool_name == "start_service":
+            return PlacementDecision(affinity, "active_workspace", "new service cwd")
+        return PlacementDecision(affinity, "service_record", "existing service placement")
+    if affinity == "cwd":
+        return PlacementDecision(
+            affinity,
+            "active_workspace",
+            "cwd requires native classification",
+        )
+    return PlacementDecision(
+        affinity,
+        "hybrid",
+        "Home authority plus native workspace half",
+    )
+
+
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "write_file", "edit_text",
     "search_code", "query_code", "plan_task",

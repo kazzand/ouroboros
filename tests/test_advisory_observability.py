@@ -46,13 +46,20 @@ def test_resolve_claude_code_model(monkeypatch, case_id, env_value, expected):
 
 
 def test_shell_edit_uses_resolve_claude_code_model_helper():
-    """claude_code_edit path must use resolve_claude_code_model(), not raw os.environ.get."""
+    """Both delegated edit backends must share the model-resolution SSOT."""
     import inspect
     sys.path.insert(0, REPO)
     shell_mod = importlib.import_module("ouroboros.tools.shell")
-    source = inspect.getsource(shell_mod._claude_code_edit)
-    assert "resolve_claude_code_model" in source
-    assert 'os.environ.get("CLAUDE_CODE_MODEL"' not in source
+    dispatcher = inspect.getsource(shell_mod._claude_code_edit)
+    assert "_claude_code_edit_local" in dispatcher
+    assert "_claude_code_edit_remote" in dispatcher
+    for implementation in (
+        shell_mod._claude_code_edit_local,
+        shell_mod._claude_code_edit_remote,
+    ):
+        source = inspect.getsource(implementation)
+        assert "resolve_claude_code_model" in source
+        assert 'os.environ.get("CLAUDE_CODE_MODEL"' not in source
 
 
 def test_advisory_uses_resolve_claude_code_model_helper():

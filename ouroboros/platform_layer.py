@@ -25,6 +25,9 @@ _SUBPROCESS_NO_WINDOW = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if IS_WINDOWS else 0
 )
 _PATH_BOOTSTRAPPED = False
+_AGENT_CHILD_ENV_DENYLIST = frozenset({
+    "OUROBOROS_NETWORK_PASSWORD",
+})
 
 
 def local_zoneinfo():
@@ -162,6 +165,22 @@ def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Pat
     else:
         out.pop("PYTHONPATH", None)
     return out
+
+
+def scrub_agent_child_env(env: dict[str, str]) -> dict[str, str]:
+    """Remove owner-control credentials from an agent-controlled child env.
+
+    This is intentionally a narrow denylist, not a generic provider-secret
+    policy: provider subprocesses may legitimately need their credentials,
+    while the Network Password exists only to authenticate owner actions
+    against the Home gateway. Match case-insensitively for Windows parity.
+    """
+
+    return {
+        str(key): str(value)
+        for key, value in dict(env).items()
+        if str(key).upper() not in _AGENT_CHILD_ENV_DENYLIST
+    }
 
 
 def acquire_exclusive_file_lock(
@@ -560,14 +579,44 @@ def terminate_process_group_id(pgid: int) -> None:
         pass
 
 
-def kill_process_group_id(pgid: int) -> None:
-    """Force-kill a Unix process group by id."""
+def kill_process_group_id(pgid: int, *, checked: bool = False) -> bool:
+    """Force-kill a Unix process group by id.
+
+    Best-effort callers keep the historical no-throw behavior. Custody callers
+    can request checked failure propagation and use the boolean to distinguish
+    a delivered signal from a group that was already gone.
+    """
+
     if IS_WINDOWS:
-        return
+        if checked:
+            raise OSError("process-group signalling is unavailable on Windows")
+        return False
     try:
         os.killpg(int(pgid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError, ValueError):
-        pass
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, ValueError):
+        if checked:
+            raise
+        return False
+
+
+def process_group_status(pgid: int) -> str:
+    """Return ``alive``, ``gone``, or ``unknown`` for a process group."""
+
+    if IS_WINDOWS:
+        return "unknown"
+    try:
+        group_id = int(pgid)
+        if group_id <= 0:
+            return "unknown"
+        os.killpg(group_id, 0)
+        return "alive"
+    except ProcessLookupError:
+        return "gone"
+    except (PermissionError, OSError, ValueError):
+        return "unknown"
 
 
 def process_group_id(pid: int) -> int:

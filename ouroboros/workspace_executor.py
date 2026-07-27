@@ -7,13 +7,16 @@ declared backend when present.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
 import pathlib
 import posixpath
 import shlex
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -30,11 +33,18 @@ from ouroboros.platform_layer import (
     pid_is_alive,
     process_command,
     process_group_id,
+    scrub_agent_child_env,
     scrub_repo_from_pythonpath,
     subprocess_new_group_kwargs,
 )
-from ouroboros.tool_access import path_is_relative_to
+from ouroboros.remote_service_leases import normalize_remote_service_metadata
 from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.workspace_diagnostics import ProcessExecutionResult
+from ouroboros.workspace_native import path_is_relative_to
+from ouroboros.workspace_snapshot_native import (
+    MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_FILES,
+)
 
 @dataclass(frozen=True)
 class PathMapping:
@@ -48,14 +58,9 @@ class ExecutorRef:
     network: str
     mappings: tuple[PathMapping, ...]
     container_name: str = ""
+    workspace_id: str = ""
 
-@dataclass
-class ExecutorResult:
-    returncode: int
-    stdout: str = ""
-    stderr: str = ""
-    backend_trace: dict[str, Any] = field(default_factory=dict)
-    args: list[str] = field(default_factory=list)
+ExecutorResult = ProcessExecutionResult
 
 @dataclass
 class _ExecutorService:
@@ -85,6 +90,32 @@ _MAX_SERVICE_LOG_TAIL_CHARS = 80_000
 _PROCESS_STATE_DIR = "workspace_executor_processes"
 _PROCESS_RECORD_OWNER = "ouroboros_workspace_executor"
 _PROCESS_RECORD_SCHEMA_VERSION = 1
+_REMOTE_SERVICE_RECORD_OWNER = "ouroboros_remote_service_ref"
+_REMOTE_SNAPSHOT_MAX_FILES = MAX_SNAPSHOT_FILES
+_REMOTE_SNAPSHOT_MAX_BYTES = MAX_SNAPSHOT_BYTES
+
+
+class RemoteWorkspaceOperationError(RuntimeError):
+    def __init__(self, message: str, *, envelope: Any = None):
+        super().__init__(str(message or "remote workspace operation failed"))
+        self.envelope = envelope
+
+
+@dataclass
+class RemoteWorkspaceSnapshot(
+    contextlib.AbstractContextManager["RemoteWorkspaceSnapshot"]
+):
+    """One verified Home materialization of an immutable remote snapshot."""
+
+    root: pathlib.Path
+    manifest: dict[str, Any]
+    _cleanup_root: pathlib.Path
+
+    def close(self) -> None:
+        shutil.rmtree(self._cleanup_root, ignore_errors=True)
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
 def executor_ref_from_ctx(ctx: Any) -> ExecutorRef | None:
     """Return a normalized executor ref from ToolContext/task metadata."""
@@ -103,19 +134,340 @@ def executor_ref_from_ctx(ctx: Any) -> ExecutorRef | None:
     return normalize_executor_ref(raw)
 
 
+def _remote_service_record_path(ctx: Any, name: str) -> pathlib.Path:
+    drive_root = pathlib.Path(getattr(ctx, "drive_root"))
+    task_id = str(getattr(ctx, "task_id", "") or "task")
+    safe_name = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in str(name or "service")
+    )[:120]
+    return (
+        drive_root
+        / "state"
+        / "workspace_executor_services"
+        / task_id
+        / f"{safe_name or 'service'}.json"
+    )
+
+
+def record_remote_service_ref(
+    ctx: Any,
+    name: str,
+    service_ref: dict[str, Any],
+) -> None:
+    """Persist only an opaque remote service ref; never a remote PID/PGID."""
+
+    executor = executor_ref_from_ctx(ctx)
+    if executor is None or executor.kind != "ssh_exec":
+        raise ValueError("remote service refs require an ssh_exec executor")
+    service_id = str(service_ref.get("service_id") or "")
+    if not service_id:
+        raise ValueError("remote service ref is missing service_id")
+    payload = {
+        "schema_version": 1,
+        "owner": _REMOTE_SERVICE_RECORD_OWNER,
+        "task_id": str(getattr(ctx, "task_id", "") or ""),
+        "name": str(name or "service"),
+        "executor_id": executor.executor_id,
+        "workspace_id": executor.workspace_id,
+        "service_ref": {
+            "kind": "ssh_exec",
+            "service_id": service_id,
+            "name": str(service_ref.get("name") or name or "service"),
+            **normalize_remote_service_metadata(service_ref),
+        },
+        "updated_at": utc_now_iso(),
+    }
+    atomic_write_json(_remote_service_record_path(ctx, name), payload)
+
+
+def remote_service_ref(ctx: Any, name: str) -> dict[str, Any] | None:
+    executor = executor_ref_from_ctx(ctx)
+    if executor is None or executor.kind != "ssh_exec":
+        return None
+    path = _remote_service_record_path(ctx, name)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("owner") != _REMOTE_SERVICE_RECORD_OWNER
+        or str(payload.get("task_id") or "") != str(getattr(ctx, "task_id", "") or "")
+        or str(payload.get("executor_id") or "") != executor.executor_id
+        or str(payload.get("workspace_id") or "") != executor.workspace_id
+    ):
+        return None
+    ref = payload.get("service_ref")
+    if not isinstance(ref, dict) or not str(ref.get("service_id") or ""):
+        return None
+    stable_ref = {
+        "kind": "ssh_exec",
+        "service_id": str(ref["service_id"]),
+        "name": str(ref.get("name") or name or "service"),
+    }
+    return {**stable_ref, **normalize_remote_service_metadata(ref)}
+
+
+def forget_remote_service_ref(ctx: Any, name: str) -> None:
+    try:
+        _remote_service_record_path(ctx, name).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _subject_task_id(subject: Any) -> str:
+    if isinstance(subject, dict):
+        return str(subject.get("id") or subject.get("task_id") or "")
+    return str(getattr(subject, "task_id", "") or "")
+
+
+def execute_remote_system_operation(
+    subject: Any,
+    operation: str,
+    args: dict[str, Any],
+    *,
+    blobs: dict[str, bytes] | None = None,
+):
+    """Execute a fixed host-owned native operation through the same broker.
+
+    This seam is for preflight/snapshot/finalization code, not model-selected
+    tool calls.  It still uses prepare/execute_prepared, exact canonical args,
+    task binding, and typed diagnostics; it never opens a raw SSH side channel.
+    """
+
+    from ouroboros.remote_workspace import get_remote_workspace_service
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(subject)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        raise ValueError("remote system operation requires a sealed SSH workspace")
+    try:
+        service = get_remote_workspace_service()
+    except Exception as exc:
+        raise RemoteWorkspaceOperationError(
+            f"remote workspace broker is unavailable: {exc}"
+        ) from exc
+    task_id = _subject_task_id(subject)
+    request_id = uuid.uuid4().hex
+    operation_id = uuid.uuid4().hex
+    prepared = None
+    try:
+        prepared = service.prepare(
+            workspace_ref,
+            request_id=request_id,
+            operation_id=operation_id,
+            tool=str(operation),
+            args=dict(args),
+            blobs=dict(blobs or {}),
+            task_id=task_id,
+        )
+        diagnostic = getattr(prepared, "diagnostic", None)
+        if diagnostic is not None:
+            raise RemoteWorkspaceOperationError(
+                getattr(diagnostic, "message", "") or "remote preparation failed",
+            )
+        canonical_args = getattr(prepared, "execution_args", None)
+        if not isinstance(canonical_args, dict):
+            raise RemoteWorkspaceOperationError(
+                "remote prepare omitted canonical execution_args"
+            )
+        envelope = service.execute_prepared(
+            workspace_ref,
+            prepared,
+            canonical_args=canonical_args,
+            task_id=task_id,
+        )
+        if getattr(envelope, "diagnostic", None) is not None:
+            raise RemoteWorkspaceOperationError(
+                getattr(envelope, "text", "") or "remote operation failed",
+                envelope=envelope,
+            )
+        return envelope
+    except RemoteWorkspaceOperationError:
+        if prepared is not None:
+            try:
+                service.abort_prepared(
+                    workspace_ref,
+                    prepared,
+                    task_id=task_id,
+                    reason="client_error",
+                )
+            except Exception:
+                pass
+        raise
+    except Exception as exc:
+        if prepared is not None:
+            try:
+                service.abort_prepared(
+                    workspace_ref,
+                    prepared,
+                    task_id=task_id,
+                    reason="client_error",
+                )
+            except Exception:
+                pass
+        raise RemoteWorkspaceOperationError(
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def materialize_remote_workspace_snapshot(
+    subject: Any,
+    *,
+    max_files: int = _REMOTE_SNAPSHOT_MAX_FILES,
+    max_bytes: int = _REMOTE_SNAPSHOT_MAX_BYTES,
+) -> RemoteWorkspaceSnapshot:
+    """Fetch a fingerprint-stable CAS snapshot and verify every byte on Home."""
+
+    from ouroboros.remote_workspace import get_remote_workspace_service
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    envelope = execute_remote_system_operation(
+        subject,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    trace = getattr(envelope, "trace", {})
+    manifest = trace.get("snapshot") if isinstance(trace, dict) else None
+    if not isinstance(manifest, dict):
+        raise RemoteWorkspaceOperationError("remote snapshot omitted its manifest")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise RemoteWorkspaceOperationError("remote snapshot entries are invalid")
+    if not bool(manifest.get("complete")):
+        raise RemoteWorkspaceOperationError(
+            "remote snapshot is partial or unstable; refusing local review/finalization"
+        )
+    if len(entries) > max(1, int(max_files)):
+        raise RemoteWorkspaceOperationError("remote snapshot exceeds the file limit")
+    declared_total = int(manifest.get("total_bytes") or 0)
+    if declared_total > max(1, int(max_bytes)):
+        raise RemoteWorkspaceOperationError("remote snapshot exceeds the byte limit")
+
+    workspace_ref = workspace_ref_for(subject)
+    assert workspace_ref is not None and workspace_ref["kind"] == "ssh"
+    service = get_remote_workspace_service()
+    if service is None:
+        raise RemoteWorkspaceOperationError("remote workspace broker is unavailable")
+    temp_root = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-remote-snapshot-"))
+    materialized = temp_root / "workspace"
+    materialized.mkdir()
+    consumed = 0
+    canonical_entries: list[dict[str, Any]] = []
+    try:
+        for raw in entries:
+            if not isinstance(raw, dict):
+                raise RemoteWorkspaceOperationError("remote snapshot row is invalid")
+            rel = str(raw.get("path") or "").replace("\\", "/")
+            parts = [part for part in rel.split("/") if part not in {"", "."}]
+            if not parts or any(part == ".." for part in parts):
+                raise RemoteWorkspaceOperationError("remote snapshot path is unsafe")
+            target = materialized.joinpath(*parts)
+            resolved_parent = target.parent.resolve(strict=False)
+            if not path_is_relative_to(resolved_parent, materialized):
+                raise RemoteWorkspaceOperationError("remote snapshot path escapes materialization")
+            digest = str(raw.get("sha256") or "")
+            size = int(raw.get("size") or 0)
+            if not digest or size < 0:
+                raise RemoteWorkspaceOperationError("remote snapshot blob declaration is invalid")
+            consumed += size
+            if consumed > max(1, int(max_bytes)):
+                raise RemoteWorkspaceOperationError("remote snapshot exceeds the byte limit")
+            data = service.fetch_blob(
+                workspace_ref,
+                digest,
+                max_bytes=size,
+            )
+            if not isinstance(data, bytes) or len(data) != size:
+                raise RemoteWorkspaceOperationError("remote snapshot blob size mismatch")
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise RemoteWorkspaceOperationError("remote snapshot blob digest mismatch")
+            kind = str(raw.get("kind") or "file")
+            if kind == "symlink":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                link_target = data.decode("utf-8", errors="surrogateescape")
+                if pathlib.Path(link_target).is_absolute() or not path_is_relative_to(
+                    (target.parent / link_target).resolve(strict=False),
+                    materialized,
+                ):
+                    raise RemoteWorkspaceOperationError(
+                        "remote snapshot symlink escapes materialization"
+                    )
+                os.symlink(
+                    link_target,
+                    target,
+                )
+            elif kind == "file":
+                _atomic_materialized_write(target, data)
+                try:
+                    os.chmod(target, int(raw.get("mode") or 0o600) & 0o777)
+                except OSError:
+                    pass
+            else:
+                raise RemoteWorkspaceOperationError("remote snapshot file kind is invalid")
+            canonical_entries.append(
+                {
+                    "path": "/".join(parts),
+                    "kind": kind,
+                    "sha256": digest,
+                    "size": size,
+                    "mode": int(raw.get("mode") or 0) & 0o777,
+                }
+            )
+        canonical_entries.sort(key=lambda row: row["path"])
+        encoded = json.dumps(
+            canonical_entries,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        actual_fingerprint = hashlib.sha256(encoded).hexdigest()
+        if actual_fingerprint != str(manifest.get("content_fingerprint") or ""):
+            raise RemoteWorkspaceOperationError(
+                "remote snapshot content fingerprint mismatch"
+            )
+        return RemoteWorkspaceSnapshot(
+            root=materialized,
+            manifest=dict(manifest),
+            _cleanup_root=temp_root,
+        )
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+
+
+def _atomic_materialized_write(path: pathlib.Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
 def normalize_executor_ref(raw: dict[str, Any]) -> ExecutorRef | None:
     if not raw:
         return None
     kind = str(raw.get("type") or raw.get("kind") or "").strip().lower()
     if not kind:
         raise ValueError("executor_ref.type is required")
-    if kind not in {"local", "docker_exec"}:
+    if kind not in {"local", "docker_exec", "ssh_exec"}:
         raise ValueError(f"unsupported executor_ref.type: {kind}")
     network = str(raw.get("network") or "host").strip().lower()
     if network not in {"host", "none"}:
         raise ValueError("executor_ref.network must be 'host' or 'none'")
     if kind == "local" and network == "none":
         raise ValueError("local executor_ref cannot enforce network=none; use docker_exec")
+    if kind == "ssh_exec" and network != "host":
+        raise ValueError("ssh_exec executor_ref requires network=host")
 
     mappings: list[PathMapping] = []
     workspace_host = str(raw.get("workspace_host_path") or "").strip()
@@ -135,16 +487,38 @@ def normalize_executor_ref(raw: dict[str, Any]) -> ExecutorRef | None:
         if not host or not backend:
             raise ValueError("executor_ref.path_mappings entries require host_path and backend_path")
         mappings.append(PathMapping(pathlib.Path(host).expanduser().resolve(strict=False), _normalize_backend_path(backend)))
-    if not mappings:
+    if kind != "ssh_exec" and not mappings:
         raise ValueError("executor_ref requires at least one host/backend path mapping")
     if kind == "docker_exec" and not str(raw.get("container_name") or raw.get("container") or "").strip():
         raise ValueError("docker_exec executor_ref requires container_name")
+    executor_id = str(raw.get("id") or "").strip()
+    legacy_connection_id = str(raw.get("connection_id") or "").strip()
+    workspace_id = str(raw.get("workspace_id") or "").strip()
+    if kind == "ssh_exec":
+        if executor_id and legacy_connection_id and executor_id != legacy_connection_id:
+            raise ValueError("ssh_exec executor_ref has conflicting connection identities")
+        executor_id = executor_id or legacy_connection_id
+        if not executor_id:
+            raise ValueError("ssh_exec executor_ref requires id")
+        if not workspace_id:
+            raise ValueError("ssh_exec executor_ref requires workspace_id")
+        if (
+            mappings
+            or workspace_host
+            or workspace_backend
+            or "path_mappings" in raw
+            or "mappings" in raw
+        ):
+            raise ValueError("ssh_exec executor_ref must not contain Home path mappings")
+        if str(raw.get("container_name") or raw.get("container") or "").strip():
+            raise ValueError("ssh_exec executor_ref must not contain a container identity")
     return ExecutorRef(
         kind=kind,
-        executor_id=str(raw.get("id") or raw.get("container_name") or uuid.uuid4().hex[:12]),
+        executor_id=executor_id or str(raw.get("container_name") or uuid.uuid4().hex[:12]),
         network=network,
         mappings=tuple(_dedupe_mappings(mappings)),
         container_name=str(raw.get("container_name") or raw.get("container") or "").strip(),
+        workspace_id=workspace_id,
     )
 
 
@@ -209,10 +583,35 @@ def execute(ctx: Any, cmd: list[str], cwd: pathlib.Path, timeout_sec: int) -> Ex
         raise ValueError("no executor_ref configured")
     bootstrap_process_path()
     cwd_path = pathlib.Path(cwd).resolve(strict=False)
-    backend_cwd = map_host_path(executor, cwd_path)
     if executor.kind == "local":
+        backend_cwd = map_host_path(executor, cwd_path)
         return _execute_local(executor, cmd, cwd_path, timeout_sec, drive_root=_drive_root_from_ctx(ctx))
-    return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=_drive_root_from_ctx(ctx))
+    if executor.kind == "docker_exec":
+        backend_cwd = map_host_path(executor, cwd_path)
+        return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=_drive_root_from_ctx(ctx))
+    if executor.kind == "ssh_exec":
+        raise RuntimeError("ssh_exec executor is defined but not enabled until the remote broker is installed")
+    raise ValueError(f"unsupported executor_ref.type: {executor.kind}")
+
+
+def execute_enveloped(
+    request_id: str,
+    ctx: Any,
+    cmd: list[str],
+    cwd: pathlib.Path,
+    timeout_sec: int,
+    *,
+    operation_id: str = "",
+):
+    """Request-scoped local/Docker envelope; SSH uses the same shape later."""
+
+    from ouroboros.workspace_diagnostics import process_execution_envelope
+
+    return process_execution_envelope(
+        request_id,
+        execute(ctx, cmd, cwd, timeout_sec),
+        operation_id=operation_id,
+    )
 
 
 def _system_repo_dir() -> str | None:
@@ -247,7 +646,10 @@ def _execute_local(
         stdin=subprocess.DEVNULL,
         text=True,
         errors="replace",
-        env=scrub_repo_from_pythonpath(dict(os.environ), _system_repo_dir()),
+        env=scrub_repo_from_pythonpath(
+            scrub_agent_child_env(dict(os.environ)),
+            _system_repo_dir(),
+        ),
         **subprocess_new_group_kwargs(),
     )
     record_path = _register_process(
@@ -731,6 +1133,10 @@ def start_service(
         _forget_process(existing.durable_record_path)
         with _STATE_LOCK:
             _SERVICES.pop(key, None)
+    if executor.kind == "ssh_exec":
+        raise RuntimeError("ssh_exec services are defined but not enabled until the remote broker is installed")
+    if executor.kind not in {"local", "docker_exec"}:
+        raise ValueError(f"unsupported executor_ref.type: {executor.kind}")
     backend_cwd = map_host_path(executor, host_cwd)
     record = _ExecutorService(
         service_id=key,
@@ -782,7 +1188,7 @@ def start_service(
             _logging.getLogger(__name__).debug(
                 "workspace service custody record failed", exc_info=True
             )
-    else:
+    elif executor.kind == "docker_exec":
         if executor.network == "none":
             _assert_docker_network_none(executor.container_name)
         log_path = f"/tmp/ouroboros-service-{record.task_id}-{name}.log"
@@ -798,6 +1204,8 @@ def start_service(
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "docker service start failed")
         record.backend_pid = (proc.stdout or "").strip().splitlines()[-1].strip()
         record.backend_log_path = log_path
+    else:
+        raise ValueError(f"unsupported executor_ref.type: {executor.kind}")
     record.durable_record_path = _register_service_process(_drive_root_from_ctx(ctx), record)
     with _STATE_LOCK:
         _SERVICES[key] = record
@@ -837,7 +1245,7 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
                 record.local_proc.wait(timeout=5)
             except Exception:
                 pass
-    else:
+    elif record.executor.kind == "docker_exec":
         try:
             proc = subprocess.run(
                 ["docker", "exec", record.executor.container_name, "sh", "-lc", _docker_service_stop_shell(record.backend_pid)],
@@ -856,6 +1264,10 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
             payload["stop_failed"] = True
             payload["stop_error"] = proc.stderr.strip() or proc.stdout.strip() or "docker service stop failed"
             return payload
+    elif record.executor.kind == "ssh_exec":
+        raise RuntimeError("ssh_exec service stop requires the remote broker")
+    else:
+        raise ValueError(f"unsupported executor_ref.type: {record.executor.kind}")
     with _STATE_LOCK:
         _SERVICES.pop(key, None)
     _forget_process(record.durable_record_path)
@@ -913,7 +1325,7 @@ def kill_all_services(
                     _SERVICES.pop(record.service_id, None)
                 _forget_process(record.durable_record_path)
                 stopped.append(_service_payload(record, state="stopped"))
-            else:
+            elif record.executor.kind == "docker_exec":
                 proc = subprocess.run(
                     ["docker", "exec", record.executor.container_name, "sh", "-lc", _docker_service_stop_shell(record.backend_pid)],
                     stdout=subprocess.PIPE,
@@ -931,6 +1343,13 @@ def kill_all_services(
                     payload["stop_failed"] = True
                     payload["stop_error"] = proc.stderr.strip() or proc.stdout.strip() or "docker service stop failed"
                 stopped.append(payload)
+            elif record.executor.kind == "ssh_exec":
+                payload = _service_payload(record)
+                payload["stop_failed"] = True
+                payload["stop_error"] = "ssh_exec service cleanup requires the remote broker"
+                stopped.append(payload)
+            else:
+                raise ValueError(f"unsupported executor_ref.type: {record.executor.kind}")
         except Exception as exc:
             payload = _service_payload(record)
             payload["stop_failed"] = True
@@ -1083,6 +1502,10 @@ def _service_state(record: _ExecutorService) -> str:
     if record.executor.kind == "local":
         proc = record.local_proc
         return "running" if proc is not None and proc.poll() is None else "exited"
+    if record.executor.kind == "ssh_exec":
+        raise RuntimeError("ssh_exec service status requires the remote broker")
+    if record.executor.kind != "docker_exec":
+        raise ValueError(f"unsupported executor_ref.type: {record.executor.kind}")
     proc = subprocess.run(
         ["docker", "exec", record.executor.container_name, "sh", "-lc", f"kill -0 {shlex.quote(record.backend_pid)} 2>/dev/null && echo running || echo exited"],
         stdout=subprocess.PIPE,
@@ -1102,6 +1525,10 @@ def _read_service_tail(record: _ExecutorService, chars: int) -> str:
         with path.open("rb") as fh:
             fh.seek(max(0, path.stat().st_size - limit))
             return fh.read(limit).decode("utf-8", errors="replace")
+    if record.executor.kind == "ssh_exec":
+        raise RuntimeError("ssh_exec service logs require the remote broker")
+    if record.executor.kind != "docker_exec":
+        raise ValueError(f"unsupported executor_ref.type: {record.executor.kind}")
     proc = subprocess.run(
         ["docker", "exec", record.executor.container_name, "sh", "-lc", f"tail -c {limit} {shlex.quote(record.backend_log_path)} 2>/dev/null || true"],
         stdout=subprocess.PIPE,

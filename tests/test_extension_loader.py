@@ -460,6 +460,65 @@ def test_load_extension_registers_tool(tmp_path):
     assert callable(tool["handler"])
 
 
+def test_extension_tool_execution_affinity_is_host_owned_and_exhaustive(tmp_path):
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('inspect', lambda ctx: 'ok', description='inspect', schema={})\n"
+    )
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "placed_ext",
+        plugin,
+        permissions=["tool"],
+        extra_frontmatter=(
+            "tool_execution_affinity:\n"
+            "  inspect: active_workspace\n"
+        ),
+    )
+
+    err = extension_loader.load_extension(
+        loaded,
+        lambda: {},
+        drive_root=drive_root,
+        _force_in_process=True,
+    )
+
+    assert err is None, err
+    tool = extension_loader.get_tool(
+        extension_loader.extension_surface_name("placed_ext", "inspect")
+    )
+    assert tool is not None
+    assert tool["execution_affinity"] == "active_workspace"
+
+
+def test_extension_unknown_tool_execution_affinity_fails_registration(tmp_path):
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('actual', lambda ctx: 'ok', description='actual', schema={})\n"
+    )
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "bad_placed_ext",
+        plugin,
+        permissions=["tool"],
+        extra_frontmatter=(
+            "tool_execution_affinity:\n"
+            "  missing: active_workspace\n"
+        ),
+    )
+
+    err = extension_loader.load_extension(
+        loaded,
+        lambda: {},
+        drive_root=drive_root,
+        _force_in_process=True,
+    )
+
+    assert err is not None
+    assert "were not registered" in err
+    assert extension_loader.snapshot()["tools"] == []
+
+
 def test_extension_surface_names_are_provider_safe_without_renaming_skill_identity():
     from ouroboros.skill_loader import _sanitize_skill_name
 

@@ -465,6 +465,38 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     return meta
 
 
+def _execution_envelope_metadata(envelope: Any) -> Dict[str, Any]:
+    """Project bounded typed backend facts into durable tool-call metadata."""
+
+    if envelope is None:
+        return {}
+    meta: Dict[str, Any] = {}
+    diagnostic = getattr(envelope, "diagnostic", None)
+    if diagnostic is not None:
+        meta["execution_diagnostic"] = {
+            key: getattr(diagnostic, key)
+            for key in (
+                "domain", "code", "phase", "completion", "retryable", "errno",
+                "request_id", "operation_id",
+            )
+        }
+    process = getattr(envelope, "process", None)
+    if process is not None:
+        meta["execution_process"] = {
+            "returncode": int(getattr(process, "returncode", 0)),
+            "stdout_chars": len(str(getattr(process, "stdout", "") or "")),
+            "stderr_chars": len(str(getattr(process, "stderr", "") or "")),
+        }
+    trace = getattr(envelope, "trace", None)
+    if isinstance(trace, dict):
+        meta["execution_trace"] = {
+            key: trace[key]
+            for key in ("request_id", "operation_id", "completion", "backend")
+            if key in trace
+        }
+    return meta
+
+
 def _execute_single_tool(
     tools: ToolRegistry,
     tc: Dict[str, Any],
@@ -527,6 +559,14 @@ def _execute_single_tool(
 
     args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
 
+    from ouroboros.workspace_diagnostics import (
+        current_execution_envelope,
+        publish_execution_envelope,
+        reset_execution_envelope,
+    )
+
+    envelope_token = publish_execution_envelope(None)
+    envelope = None
     tool_ok = True
     try:
         result = tools.execute(fn_name, args)
@@ -540,9 +580,15 @@ def _execute_single_tool(
             "ts": utc_now_iso(), "type": "tool_error", "task_id": task_id,
             "tool": fn_name, "args": args_for_log, "error": safe_error,
         }, correlation, tool_call_id=tool_call_id))
+    finally:
+        envelope = current_execution_envelope()
+        reset_execution_envelope(envelope_token)
 
-    is_error = _is_tool_execution_failure(tool_ok, result)
+    is_error = _is_tool_execution_failure(tool_ok, result) or bool(
+        envelope is not None and getattr(envelope, "diagnostic", None) is not None
+    )
     result_meta = _extract_result_metadata(fn_name, result, is_error)
+    result_meta.update(_execution_envelope_metadata(envelope))
 
     trace_ref = {}
     try:

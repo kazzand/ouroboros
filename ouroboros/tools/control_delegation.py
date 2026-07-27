@@ -221,12 +221,15 @@ def resolve_cooperative_write_root(
     ctx: Any, requested_surface: str, write_root: str, workspace_root: str, metadata: Dict[str, Any]
 ) -> tuple[str, str, str]:
     """Resolve the effective acting write_root and the caller profile for a scheduled
-    wave. A flat parent (no inherited workspace) requesting external_workspace with no
-    write_root builds cooperatively from scratch, so the host mints ONE shared tree.
+    wave. A flat Home-local parent (no inherited workspace) requesting
+    external_workspace with no write_root builds cooperatively from scratch, so
+    the host mints ONE shared tree. An SSH workspace never demotes into that
+    Home-local fallback.
     Returns ``(effective_write_root, caller_profile, error_or_empty)``. Gated on the
     mutative toggle so a disabled setup falls through to the disabled message rather
     than minting an unused tree."""
     from ouroboros.tool_access import active_tool_profile
+    from ouroboros.workspace_ref import is_remote_workspace
 
     caller_profile = active_tool_profile(ctx)
     effective = write_root
@@ -235,6 +238,7 @@ def resolve_cooperative_write_root(
         and not str(write_root or "").strip()
         and not workspace_root
         and caller_profile != "local_readonly_subagent"
+        and not is_remote_workspace(ctx)
     ):
         from ouroboros.config import get_allow_mutative_subagents
 

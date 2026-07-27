@@ -38,6 +38,7 @@ from ouroboros.task_results import (
     validate_task_id,
 )
 from ouroboros.utils import iter_jsonl_objects, read_json_dict
+from ouroboros.workspace_ref import has_workspace
 
 
 FINAL_STATUSES: frozenset[str] = frozenset({
@@ -269,7 +270,7 @@ def _is_stale_orphan_running_task(drive_root: pathlib.Path, task_id: str, result
 
 def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, Any]:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    if not (str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip()):
+    if not has_workspace(result):
         return result
     task_constraint = result.get("task_constraint") if isinstance(result.get("task_constraint"), dict) else {}
     if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
@@ -310,7 +311,7 @@ def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, An
 
 def _parent_workspace_artifact_lifecycle_fields(result: Dict[str, Any]) -> frozenset[str]:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    if not (str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip()):
+    if not has_workspace(result):
         return frozenset()
     task_constraint = result.get("task_constraint") if isinstance(result.get("task_constraint"), dict) else {}
     if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
@@ -448,8 +449,7 @@ def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _
         parent_status = str(result.get("status") or "").lower()
         child_status = str(child_result.get("status") or "").lower()
         copied_child_status = str(result.get("child_status") or "").lower()
-        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-        result_is_workspace = bool(str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
+        result_is_workspace = has_workspace(result)
         copied_child_terminal = (
             result_is_workspace
             and copied_child_status in FINAL_STATUSES
@@ -479,8 +479,7 @@ def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _
             merged[key] = value
         merged.setdefault("child_drive_root", child_text)
         merged.setdefault("headless_child_drive_root", child_text)
-        metadata = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
-        merged_is_workspace = bool(str(merged.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
+        merged_is_workspace = has_workspace(merged)
         if merged_is_workspace and child_status in FINAL_STATUSES and (parent_status not in {STATUS_FAILED, STATUS_CANCELLED, STATUS_REJECTED_DUPLICATE} or copied_child_terminal):
             merged = _normalize_workspace_artifact_status(merged)
 

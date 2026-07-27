@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 from ouroboros.utils import truncate_review_artifact
+from ouroboros.workspace_ref import RemoteWorkspacePathError
 
 log = logging.getLogger(__name__)
 
@@ -31,10 +32,32 @@ def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bo
     (``include_recent_commit``, derived from a commit_reviewed status=ok signal),
     that commit's patch is also appended so committed work is judged too."""
 
+    try:
+        from ouroboros.workspace_ref import is_remote_workspace
+
+        remote_workspace = is_remote_workspace(ctx)
+    except Exception:
+        remote_workspace = False
+    if remote_workspace:
+        try:
+            return _collect_remote_turn_diff(
+                ctx,
+                limit=limit,
+                include_recent_commit=include_recent_commit,
+            )
+        except RemoteWorkspacePathError:
+            raise
+        except Exception as exc:
+            raise RemoteWorkspacePathError(
+                f"remote review evidence is unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+
     repo = None
     try:
         getter = getattr(ctx, "active_repo_dir", None)
         repo = getter() if callable(getter) else getattr(ctx, "repo_dir", None)
+    except RemoteWorkspacePathError:
+        raise
     except Exception:
         repo = getattr(ctx, "repo_dir", None)
     if not repo:
@@ -82,6 +105,104 @@ def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bo
     from ouroboros.observability import redact_projection
 
     return redact_projection(diff).value
+
+
+def _collect_remote_turn_diff(
+    ctx: Any,
+    *,
+    limit: int,
+    include_recent_commit: bool,
+) -> str:
+    """Fingerprint-bound target evidence; never substitutes the system repo."""
+
+    from ouroboros.observability import redact_projection
+    from ouroboros.utils import truncate_review_artifact
+    from ouroboros.workspace_executor import execute_remote_system_operation
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(ctx)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        raise RemoteWorkspacePathError("remote review evidence lost its sealed workspace")
+    before = execute_remote_system_operation(
+        ctx,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    before_manifest = (
+        before.trace.get("snapshot")
+        if isinstance(before.trace, dict)
+        else {}
+    )
+    if not isinstance(before_manifest, dict) or not before_manifest.get("complete"):
+        raise RemoteWorkspacePathError(
+            "remote review evidence snapshot is partial or unstable"
+        )
+    envelope = execute_remote_system_operation(
+        ctx,
+        "vcs_diff",
+        {"path": "", "max_chars": max(1, int(limit))},
+    )
+    diff = truncate_review_artifact(str(envelope.text or ""), limit=limit)
+    status = execute_remote_system_operation(
+        ctx,
+        "vcs_status",
+        {"path": "", "max_chars": 4000},
+    )
+    status_text = truncate_review_artifact(str(status.text or ""), limit=4000)
+    if status_text and status_text != "(clean)":
+        diff = (
+            f"{diff}\n# Remote working-tree status "
+            "(includes untracked paths; target-native):\n"
+            f"{status_text}\n"
+        )
+    if include_recent_commit:
+        recent = execute_remote_system_operation(
+            ctx,
+            "verify_remote_check",
+            {
+                "cmd": [
+                    "git",
+                    "show",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--stat",
+                    "-p",
+                    "HEAD",
+                ],
+                "cwd": str(workspace_ref["remote_root"]),
+                "timeout_sec": 20,
+            },
+        )
+        process = getattr(recent, "process", None)
+        commit = truncate_review_artifact(
+            str(getattr(process, "stdout", "") or ""),
+            limit=limit,
+        )
+        if commit:
+            diff = f"{diff}\n# Most recent commit (committed this turn):\n{commit}\n"
+    after = execute_remote_system_operation(
+        ctx,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    after_manifest = (
+        after.trace.get("snapshot")
+        if isinstance(after.trace, dict)
+        else {}
+    )
+    if not isinstance(after_manifest, dict) or not after_manifest.get("complete"):
+        raise RemoteWorkspacePathError(
+            "remote review evidence snapshot is partial or unstable"
+        )
+    binding = str(before_manifest.get("fingerprint") or "")
+    if not binding or binding != str(after_manifest.get("fingerprint") or ""):
+        raise RemoteWorkspacePathError(
+            "remote workspace changed while review evidence was collected"
+        )
+    return redact_projection(
+        f"# Remote snapshot fingerprint: {binding}\n{diff}"
+    ).value
 
 
 # ── Process-aware task-acceptance evidence (v6.51.0 idea-2) ───────────────────

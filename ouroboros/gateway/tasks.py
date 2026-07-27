@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import pathlib
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,17 +15,6 @@ from typing import Any, Dict, List, Optional
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
-from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
-from ouroboros.headless import (
-    ARTIFACTS_DIR,
-    ARTIFACT_STATUS_FAILED,
-    ARTIFACT_STATUS_FINALIZING,
-    ARTIFACT_STATUS_PENDING,
-    HEADLESS_TASKS_DIR,
-    prepare_task_drive,
-    task_artifacts_dir,
-    write_workspace_preflight_artifact,
-)
 from ouroboros.contracts.task_contract import (
     attach_task_contract,
     normalize_acceptance_claims,
@@ -32,6 +23,24 @@ from ouroboros.contracts.task_contract import (
     normalize_bool,
     normalize_disabled_tools,
     normalize_resource_policy,
+)
+from ouroboros.gateway._helpers import (
+    coerce_int,
+    json_error,
+    json_exception,
+    request_drive_root,
+    request_json_or,
+    request_repo_dir,
+)
+from ouroboros.headless import (
+    ARTIFACT_STATUS_FAILED,
+    ARTIFACT_STATUS_FINALIZING,
+    ARTIFACT_STATUS_PENDING,
+    ARTIFACTS_DIR,
+    HEADLESS_TASKS_DIR,
+    prepare_task_drive,
+    task_artifacts_dir,
+    write_workspace_preflight_artifact,
 )
 from ouroboros.outcomes import public_task_result
 from ouroboros.task_results import (
@@ -50,12 +59,11 @@ from ouroboros.task_status import (
 )
 from ouroboros.tool_access import path_is_relative_to, paths_overlap_casefold
 from ouroboros.utils import iter_jsonl_objects
+from ouroboros.workspace_executor import normalize_executor_ref
 from ouroboros.workspace_preflight import (
     collect_workspace_preflight,
     summarize_workspace_preflight,
 )
-from ouroboros.workspace_executor import normalize_executor_ref
-
 
 _LOG_SOURCES = (
     ("progress", ("logs", "progress.jsonl")),
@@ -82,8 +90,24 @@ _RESERVED_METADATA_KEYS = frozenset({
     "deadline_at",
     "executor_ref",
     "workspace_executor",
+    "workspace_ref",
+    "_sealed_workspace_ref",
+    "_project_room_workspace_ref",
+    "connection_id",
+    "remote_root",
+    "workspace_id",
     "project_id",
 })
+_REMOTE_PLACEMENT_INPUT_KEYS = frozenset({
+    "workspace_ref",
+    "_sealed_workspace_ref",
+    "_project_room_workspace_ref",
+    "connection_id",
+    "remote_root",
+    "workspace_id",
+})
+_REMOTE_SUBMIT_LOCK = threading.Lock()
+_REMOTE_SUBMISSIONS: set[tuple[str, str]] = set()
 
 
 def _external_subagent_label(body: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
@@ -189,6 +213,520 @@ def _admission_rejection_response(
     )
 
 
+def _has_remote_placement_input(body: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
+    return any(key in body or key in metadata for key in _REMOTE_PLACEMENT_INPUT_KEYS)
+
+
+def _remote_project_workspace(drive_root: object, project_id: str) -> dict | None:
+    if not project_id:
+        return None
+    from ouroboros.projects_registry import get_project
+    from ouroboros.workspace_ref import normalize_workspace_ref
+
+    project = get_project(drive_root, project_id)
+    if not isinstance(project, dict):
+        return None
+    workspace_ref = normalize_workspace_ref(project.get("workspace_ref"))
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        return None
+    return workspace_ref
+
+
+def _remote_admitted_task(result: Any, sealed_ref: dict) -> tuple[dict | None, str, str]:
+    """Project an untrusted broker result onto the narrow lifecycle merge contract."""
+
+    if not isinstance(result, dict):
+        return None, "remote workspace service returned an invalid response", "remote_service_invalid_response"
+    if not result.get("ok"):
+        from ouroboros.workspace_diagnostics import sanitize_execution_text
+
+        return (
+            None,
+            sanitize_execution_text(
+                result.get("error") or "remote workspace admission failed"
+            )[:2000],
+            str(result.get("error_code") or "remote_admission_failed"),
+        )
+    raw_ref = result.get("workspace_ref")
+    if isinstance(raw_ref, dict):
+        try:
+            from ouroboros.workspace_ref import normalize_workspace_ref
+
+            admitted_ref = normalize_workspace_ref(raw_ref)
+        except ValueError as exc:
+            return None, str(exc), "remote_service_invalid_response"
+        if admitted_ref != sealed_ref:
+            return (
+                None,
+                "remote admission returned a different workspace identity",
+                "remote_workspace_identity_changed",
+            )
+    evidence = result.get("admission_evidence")
+    if not isinstance(evidence, dict):
+        evidence = {
+            key: result[key]
+            for key in ("phase", "completion", "platform", "architecture", "build")
+            if key in result
+        }
+    metadata: dict[str, Any] = {
+        "_sealed_workspace_ref": dict(sealed_ref),
+        "executor_ref": {
+            "type": "ssh_exec",
+            "id": sealed_ref["connection_id"],
+            "network": "host",
+            "workspace_id": sealed_ref["workspace_id"],
+        },
+        "_remote_admission_evidence": evidence,
+    }
+    admission_git = evidence.get("git") if isinstance(evidence.get("git"), dict) else {}
+    metadata["workspace_preflight"] = {
+        "schema_version": 1,
+        "workspace_root": str(sealed_ref["remote_root"]),
+        "git": dict(admission_git),
+        "manifests": [],
+        "tools": {"available": [], "missing": []},
+        "authority": "remote_admission",
+    }
+    remote_manifest = result.get("attachment_manifest")
+    if isinstance(remote_manifest, list):
+        metadata["_remote_attachment_manifest"] = remote_manifest
+    completion: dict[str, Any] = {"metadata": metadata}
+    if isinstance(remote_manifest, list):
+        completion["attachments"] = remote_manifest
+    return completion, "", ""
+
+
+def _remote_attachment_upload(task: dict) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+    """Read only canonical Home-staged blobs and re-verify their frozen facts."""
+
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.remote_task_files import (
+        RemoteTaskFileError,
+        attachment_blob_map,
+        canonical_attachment_manifest,
+    )
+
+    raw = task.get("attachments")
+    if not isinstance(raw, list) or not raw:
+        return [], {}
+    manifest = canonical_attachment_manifest(raw)
+    artifact_dir = task_artifact_dir_path(
+        pathlib.Path(str(task.get("drive_root") or "")),
+        str(task.get("id") or ""),
+        create=False,
+    ).resolve(strict=True)
+    blobs: dict[str, bytes] = {}
+    for entry in manifest:
+        source = (artifact_dir / entry["relpath"]).resolve(strict=True)
+        try:
+            source.relative_to(artifact_dir)
+        except ValueError as exc:
+            raise RemoteTaskFileError(
+                "attachment_home_stage_escape",
+                "Canonical Home attachment escaped its task artifact store.",
+            ) from exc
+        payload = source.read_bytes()
+        blobs.setdefault(entry["sha256"], payload)
+    return attachment_blob_map(manifest, blobs)
+
+
+def _stage_api_task_attachments(
+    drive_root: object,
+    task_id: str,
+    raw_attachments: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Stage the Home authority set without growing the task route."""
+
+    from ouroboros.artifacts import stage_task_attachments
+
+    omissions: list[dict[str, Any]] = []
+    manifest = stage_task_attachments(
+        drive_root,
+        task_id,
+        _normalize_attachments(raw_attachments),
+        diagnostics=omissions,
+    )
+    images = [item for item in manifest if item.get("is_image")]
+    return manifest, images, omissions
+
+
+def submit_remote_task_admission(
+    task: dict,
+    *,
+    connection: dict,
+    service: Any,
+) -> dict:
+    """Persist REQUESTED, then perform the cancellable broker call off-loop."""
+
+    from supervisor.task_lifecycle import register_requested_admission
+    from supervisor.workers import get_event_q
+
+    task_id = str(task.get("id") or "")
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    sealed_ref = dict(metadata.get("_sealed_workspace_ref") or {})
+    admission_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+
+    def cancel() -> None:
+        cancel_event.set()
+        broker_cancel = getattr(service, "cancel_admission", None)
+        if callable(broker_cancel):
+            try:
+                broker_cancel(task_id)
+            except Exception:
+                pass
+
+    with _REMOTE_SUBMIT_LOCK:
+        registered = register_requested_admission(
+            task,
+            cancel=cancel,
+            admission_id=admission_id,
+        )
+        if not registered.get("ok"):
+            return registered
+        admission_id = str(registered.get("admission_id") or admission_id)
+        submission_key = (task_id, admission_id)
+        if submission_key in _REMOTE_SUBMISSIONS:
+            return {**registered, "duplicate": True}
+        _REMOTE_SUBMISSIONS.add(submission_key)
+
+    def run() -> None:
+        live_fields: dict[str, Any] = {}
+        try:
+            fn = getattr(service, "admit_workspace", None)
+            if not callable(fn):
+                raise RuntimeError("remote workspace service is unavailable")
+            attachment_manifest, attachment_blobs = _remote_attachment_upload(task)
+            admission_kwargs = {
+                "remote_root": sealed_ref["remote_root"],
+                "project_id": str(task.get("project_id") or ""),
+                "workspace_id": sealed_ref["workspace_id"],
+                "task_id": task_id,
+                "cancel_event": cancel_event,
+            }
+            if attachment_manifest:
+                admission_kwargs.update(
+                    attachment_manifest=attachment_manifest,
+                    attachment_blobs=attachment_blobs,
+                )
+            result = fn(connection, **admission_kwargs)
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            from ouroboros.gateway.connections import _public_live_fields
+
+            live_fields = _public_live_fields(result)
+            admitted_task, error, reason_code = _remote_admitted_task(
+                result, sealed_ref
+            )
+        except Exception as exc:
+            from ouroboros.workspace_diagnostics import sanitize_execution_text
+
+            admitted_task = None
+            error = sanitize_execution_text(
+                f"{type(exc).__name__}: {exc}"
+            )[:2000]
+            reason_code = str(
+                getattr(exc, "code", None)
+                or getattr(exc, "error_code", None)
+                or "remote_service_error"
+            )
+            from ouroboros.gateway.connections import _public_live_fields
+
+            live_fields = _public_live_fields(exc, default_phase="admission")
+        get_event_q().put({
+            "type": "remote_admission_result",
+            **live_fields,
+            "task_id": task_id,
+            "admission_id": admission_id,
+            "connection_id": str(sealed_ref.get("connection_id") or ""),
+            "project_id": str(task.get("project_id") or ""),
+            "admitted_task": admitted_task,
+            "error": error,
+            "reason_code": reason_code or "remote_admission_failed",
+        })
+
+    threading.Thread(
+        target=run,
+        name=f"remote-admission-{task_id}",
+        daemon=True,
+    ).start()
+    return {**registered, "submitted": True}
+
+
+def finish_remote_task_admission(task_id: str, admission_id: str) -> None:
+    """Forget process-local in-flight deduplication after queue completion."""
+
+    with _REMOTE_SUBMIT_LOCK:
+        _REMOTE_SUBMISSIONS.discard(
+            (str(task_id or ""), str(admission_id or ""))
+        )
+
+
+def recover_remote_task_admissions(service: Any = None) -> dict:
+    """Nonblocking, idempotent resubmission hook for restored REQUESTED rows.
+
+    The server calls this after queue snapshot restore and broker construction.
+    It pulls the global service only when one was not injected and never creates
+    another lifecycle store.
+    """
+
+    from ouroboros.gateway.connections import get_connection
+    from supervisor.task_lifecycle import list_requested_admissions
+
+    if service is None:
+        try:
+            from ouroboros.remote_workspace import get_remote_workspace_service
+
+            service = get_remote_workspace_service()
+        except (ImportError, RuntimeError):
+            service = None
+    if service is None:
+        return {"ok": False, "submitted": 0, "error": "remote_service_unavailable"}
+    submitted = 0
+    skipped: list[dict[str, str]] = []
+    for row in list_requested_admissions(recovery_required_only=True):
+        task = row.get("task") if isinstance(row.get("task"), dict) else {}
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        sealed = metadata.get("_sealed_workspace_ref")
+        try:
+            from ouroboros.workspace_ref import normalize_workspace_ref
+
+            workspace_ref = normalize_workspace_ref(sealed)
+        except ValueError as exc:
+            workspace_ref = None
+            skipped.append({
+                "task_id": str(row.get("task_id") or ""),
+                "error": f"invalid_workspace_ref: {exc}",
+            })
+        if workspace_ref is None or workspace_ref["kind"] != "ssh":
+            if not any(item["task_id"] == str(row.get("task_id") or "") for item in skipped):
+                skipped.append({
+                    "task_id": str(row.get("task_id") or ""),
+                    "error": "missing_ssh_workspace_ref",
+                })
+            continue
+        connection = get_connection(workspace_ref["connection_id"])
+        if connection is None or connection.get("lifecycle", "active") != "active":
+            skipped.append({
+                "task_id": str(row.get("task_id") or ""),
+                "error": "connection_unavailable",
+            })
+            continue
+        result = submit_remote_task_admission(
+            task,
+            connection=connection,
+            service=service,
+        )
+        if result.get("ok") and result.get("submitted"):
+            submitted += 1
+        elif not result.get("ok"):
+            skipped.append({
+                "task_id": str(row.get("task_id") or ""),
+                "error": str(result.get("error") or result.get("status") or "rejected"),
+            })
+    return {"ok": not skipped, "submitted": submitted, "skipped": skipped}
+
+
+def _resolve_remote_api_placement(
+    request: Request,
+    drive_root: object,
+    project_id: str,
+    workspace_root: Optional[pathlib.Path],
+) -> tuple[dict | None, dict | None, Any, JSONResponse | None]:
+    workspace_ref = _remote_project_workspace(drive_root, project_id)
+    if workspace_ref is None:
+        return None, None, None, None
+    if workspace_root is not None:
+        return None, None, None, json_error(
+            "workspace_root cannot override an SSH-bound project workspace",
+            400,
+        )
+    from ouroboros.gateway.connections import (
+        _remote_service,
+        _request_store_path,
+        get_connection,
+    )
+
+    connection = get_connection(
+        workspace_ref["connection_id"], _request_store_path(request)
+    )
+    if connection is None:
+        return None, None, None, json_error(
+            "remote project connection was not found", 404
+        )
+    if connection.get("lifecycle", "active") != "active":
+        return None, None, None, JSONResponse(
+            {
+                "error": "remote project connection is retired",
+                "error_code": "connection_retired",
+                "action": "rebind_project",
+            },
+            status_code=409,
+        )
+    service = _remote_service(request)
+    if service is None:
+        return None, None, None, JSONResponse(
+            {
+                "error": "remote workspace service is unavailable",
+                "error_code": "remote_service_unavailable",
+                "action": "restart_ouroboros",
+            },
+            status_code=503,
+        )
+    return workspace_ref, connection, service, None
+
+
+def _register_remote_api_task(
+    request: Request,
+    task: dict,
+    *,
+    workspace_ref: dict,
+    service: Any,
+    artifacts: list[dict[str, Any]],
+) -> JSONResponse:
+    task_id = str(task.get("id") or "")
+    project_id = str(task.get("project_id") or "")
+    task["artifacts"] = artifacts
+    task["artifact_status"] = ARTIFACT_STATUS_PENDING
+    from ouroboros.gateway.connections import _request_store_path, get_connection
+    from supervisor import queue as supervisor_queue
+
+    with supervisor_queue._queue_lock:
+        connection = get_connection(
+            workspace_ref["connection_id"],
+            _request_store_path(request),
+        )
+        if (
+            connection is None
+            or connection.get("lifecycle", "active") != "active"
+        ):
+            return JSONResponse(
+                {
+                    "error": "remote project connection became unavailable",
+                    "error_code": "connection_retired",
+                    "action": "rebind_project",
+                },
+                status_code=409,
+            )
+        registered = submit_remote_task_admission(
+            task,
+            connection=connection,
+            service=service,
+        )
+    if not registered.get("ok"):
+        return JSONResponse(
+            {
+                "error": str(
+                    registered.get("error")
+                    or registered.get("reason_code")
+                    or "remote admission was rejected"
+                ),
+                "error_code": str(
+                    registered.get("reason_code")
+                    or registered.get("error")
+                    or "remote_admission_rejected"
+                ),
+                "task_id": task_id,
+                "status": str(registered.get("status") or "failed"),
+            },
+            status_code=409,
+        )
+    try:
+        from ouroboros.gateway.connections import _broadcast_connection_state
+
+        _broadcast_connection_state(
+            workspace_ref["connection_id"],
+            {
+                "status": "connecting",
+                "phase": "admission",
+                "completion": "requested",
+                "task_id": task_id,
+                "project_id": project_id,
+            },
+        )
+    except Exception:
+        pass
+    return JSONResponse(
+        {"ok": True, "task_id": task_id, "status": "requested"},
+        status_code=202,
+    )
+
+
+def _apply_requested_executor(
+    body: dict,
+    raw_metadata: dict,
+    metadata: dict,
+    *,
+    workspace_root: Optional[pathlib.Path],
+    repo_dir: pathlib.Path,
+    drive_root: pathlib.Path,
+) -> str:
+    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
+        return (
+            "metadata.executor_ref/workspace_executor is reserved; "
+            "pass executor_ref as a top-level task field"
+        )
+    if "executor_ref" not in body:
+        return ""
+    raw = body.get("executor_ref")
+    if not isinstance(raw, dict) or not raw:
+        return "executor_ref must be a JSON object"
+    if workspace_root is None:
+        return "executor_ref requires an external workspace_root"
+    try:
+        normalized = normalize_executor_ref(raw)
+    except ValueError as exc:
+        return str(exc)
+    if normalized is None:
+        return ""
+    for mapping in normalized.mappings:
+        for protected_root, label in (
+            (repo_dir, "Ouroboros system repo"),
+            (drive_root, "Ouroboros data drive"),
+        ):
+            if paths_overlap_casefold(mapping.host_path, protected_root):
+                return f"executor_ref mapping must not overlap the {label}"
+    if not any(
+        path_is_relative_to(workspace_root, mapping.host_path)
+        for mapping in normalized.mappings
+    ):
+        return "executor_ref mappings must cover workspace_root"
+    metadata["executor_ref"] = {
+        "type": normalized.kind,
+        "id": normalized.executor_id,
+        "network": normalized.network,
+        "workspace_host_path": str(normalized.mappings[0].host_path),
+        "workspace_backend_path": normalized.mappings[0].backend_path,
+        "container_name": normalized.container_name,
+        "path_mappings": [
+            {
+                "host_path": str(mapping.host_path),
+                "backend_path": mapping.backend_path,
+            }
+            for mapping in normalized.mappings
+        ],
+    }
+    return ""
+
+
+def _requested_deadline(body: dict, raw_metadata: dict) -> tuple[str, str]:
+    try:
+        deadline_at = _normalize_deadline_at(
+            body.get("deadline_at") or raw_metadata.get("deadline_at") or ""
+        )
+    except ValueError as exc:
+        return "", str(exc)
+    try:
+        timeout_sec = float(body.get("timeout_sec") or body.get("timeout") or 0)
+    except (TypeError, ValueError):
+        timeout_sec = 0.0
+    if not deadline_at and timeout_sec > 0:
+        deadline_at = datetime.fromtimestamp(
+            time.time() + timeout_sec, timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+    return deadline_at, ""
+
+
 async def api_tasks_create(request: Request) -> JSONResponse:
     """POST /api/tasks — enqueue a managed headless task."""
 
@@ -265,6 +803,24 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         return json_error("chat_id and depth must be integers", 400)
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
+    if _has_remote_placement_input(body, raw_metadata):
+        return json_error(
+            "remote workspace placement is inherited from project_id and cannot "
+            "be supplied by a task request",
+            400,
+        )
+    (
+        remote_workspace_ref,
+        _remote_connection,
+        remote_service,
+        remote_error,
+    ) = _resolve_remote_api_placement(
+        request, drive_root, _task_project_id, workspace_root
+    )
+    if remote_error is not None:
+        return remote_error
+    if remote_workspace_ref is not None:
+        workspace_mode = "external"
     if _external_subagent_label(body, raw_metadata):
         return json_error("delegation_role=subagent is only allowed through the internal schedule_subagent tool", 400)
     if str(body.get("parent_task_id") or "").strip() or str(body.get("root_task_id") or "").strip():
@@ -274,67 +830,43 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         # let a caller believe isolation is active while the task runs unscoped.
         return json_error("project_id must be a top-level field, not metadata", 400)
     metadata = {str(k): v for k, v in raw_metadata.items() if str(k) not in _RESERVED_METADATA_KEYS}
+    if remote_workspace_ref is not None:
+        metadata["_sealed_workspace_ref"] = dict(remote_workspace_ref)
+        metadata["executor_ref"] = {
+            "type": "ssh_exec",
+            "id": remote_workspace_ref["connection_id"],
+            "network": "host",
+            "workspace_id": remote_workspace_ref["workspace_id"],
+        }
     allowed_resources, resource_policy, disabled_tools, acceptance_claims, policy_error = (
         _fold_contract_policies(body, raw_metadata, metadata)
     )
     if policy_error:
         return json_error(policy_error, 400)
-    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
-        return json_error("metadata.executor_ref/workspace_executor is reserved; pass executor_ref as a top-level task field", 400)
-    if "executor_ref" in body:
-        raw_executor_ref = body.get("executor_ref")
-        if not isinstance(raw_executor_ref, dict) or not raw_executor_ref:
-            return json_error("executor_ref must be a JSON object", 400)
-        if workspace_root is None:
-            return json_error("executor_ref requires an external workspace_root", 400)
-        try:
-            normalized_executor = normalize_executor_ref(raw_executor_ref)
-        except ValueError as exc:
-            return json_error(str(exc), 400)
-        if normalized_executor is not None:
-            for mapping in normalized_executor.mappings:
-                for protected_root, label in ((repo_dir, "Ouroboros system repo"), (drive_root, "Ouroboros data drive")):
-                    if paths_overlap_casefold(mapping.host_path, protected_root):
-                        return json_error(f"executor_ref mapping must not overlap the {label}", 400)
-            if not any(path_is_relative_to(workspace_root, mapping.host_path) for mapping in normalized_executor.mappings):
-                return json_error("executor_ref mappings must cover workspace_root", 400)
-            metadata["executor_ref"] = {
-                "type": normalized_executor.kind,
-                "id": normalized_executor.executor_id,
-                "network": normalized_executor.network,
-                "workspace_host_path": str(normalized_executor.mappings[0].host_path),
-                "workspace_backend_path": normalized_executor.mappings[0].backend_path,
-                "container_name": normalized_executor.container_name,
-                "path_mappings": [
-                    {"host_path": str(mapping.host_path), "backend_path": mapping.backend_path}
-                    for mapping in normalized_executor.mappings
-                ],
-            }
-    try:
-        deadline_at = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
-    except ValueError as exc:
-        return json_error(str(exc), 400)
-    timeout_sec = 0.0
-    try:
-        timeout_sec = float(body.get("timeout_sec") or body.get("timeout") or 0)
-    except (TypeError, ValueError):
-        timeout_sec = 0.0
-    if not deadline_at and timeout_sec > 0:
-        deadline_at = datetime.fromtimestamp(time.time() + timeout_sec, timezone.utc).isoformat().replace("+00:00", "Z")
+    executor_error = _apply_requested_executor(
+        body,
+        raw_metadata,
+        metadata,
+        workspace_root=workspace_root,
+        repo_dir=repo_dir,
+        drive_root=drive_root,
+    )
+    if executor_error:
+        return json_error(executor_error, 400)
+    deadline_at, deadline_error = _requested_deadline(body, raw_metadata)
+    if deadline_error:
+        return json_error(deadline_error, 400)
     if deadline_at:
         metadata["deadline_at"] = deadline_at
     child_drive = prepare_task_drive(drive_root, task_id, effective_drive_mode, project_id=_task_project_id)
-    # v6.52.0 (P1): stage attachments into the SAME drive the task will read from at
-    # runtime — the child drive when forked/empty, else the shared drive (matches the
-    # task['drive_root'] set at the end of this handler). The returned manifest renders
-    # READY read_file(root='artifact_store', ...) lines and feeds native image blocks.
-    from ouroboros.artifacts import stage_task_attachments
-
     effective_drive = child_drive or drive_root
-    attachment_manifest = stage_task_attachments(
-        effective_drive, task_id, _normalize_attachments(body.get("attachments"))
+    attachment_manifest, attachment_images, attachment_omissions = (
+        _stage_api_task_attachments(
+            effective_drive,
+            task_id,
+            body.get("attachments"),
+        )
     )
-    attachment_images = [m for m in attachment_manifest if m.get("is_image")]
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
     metadata.setdefault("source", str(body.get("source") or "api_task"))
@@ -368,6 +900,7 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         memory_mode=memory_mode,
         workspace_preflight=workspace_preflight_summary,
         attachments=attachment_manifest,
+        attachment_omissions=attachment_omissions,
     )
     task = {
         "id": task_id,
@@ -398,6 +931,7 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         # v6.52.0 (P1): the STAGED manifest (root/relpath/mime/is_image), not raw
         # host paths — relpaths resolve against task['drive_root'] at read time.
         "attachments": attachment_manifest,
+        "attachment_omissions": attachment_omissions,
         "attachment_images": attachment_images,
         # v6.52.0 (P1): record the effective drive (child when forked/empty, else the shared
         # drive) so build_user_content can resolve staged attachment IMAGES for EVERY task
@@ -411,6 +945,14 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         task["budget_drive_root"] = str(drive_root)
         metadata["child_drive_root"] = str(child_drive)
         metadata["budget_drive_root"] = str(drive_root)
+    if remote_workspace_ref is not None:
+        return _register_remote_api_task(
+            request,
+            task,
+            workspace_ref=remote_workspace_ref,
+            service=remote_service,
+            artifacts=artifacts,
+        )
     write_task_result(
         drive_root,
         task_id,
@@ -764,6 +1306,7 @@ def _compose_task_text(
     memory_mode: str,
     workspace_preflight: Dict[str, Any],
     attachments: Any,
+    attachment_omissions: Any = None,
 ) -> str:
     parts = [description]
     if workspace_root is not None:
@@ -786,6 +1329,24 @@ def _compose_task_text(
     rendered = _render_attachment_lines(attachments)
     if rendered:
         parts.append(f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]")
+    if isinstance(attachment_omissions, list) and attachment_omissions:
+        rows: list[str] = []
+        for item in attachment_omissions[:26]:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get("reason") or "omitted")
+            count = item.get("omitted_count")
+            if isinstance(count, int) and count > 0:
+                rows.append(f"- {reason}: {count} additional attachment(s)")
+            else:
+                label = str(item.get("label") or "attachment")
+                rows.append(f"- {label}: {reason}")
+        if rows:
+            parts.append(
+                "\n\n[ATTACHMENT_OMISSIONS]\n"
+                + "\n".join(rows)
+                + "\n[END_ATTACHMENT_OMISSIONS]"
+            )
     return "".join(parts)
 
 
@@ -796,29 +1357,9 @@ def _render_attachment_lines(attachments: Any) -> str:
     artifact_store root — NEVER a bare absolute host path. ``attachments`` is the
     manifest returned by ``stage_task_attachments`` (entries with root/relpath/mime/
     is_image)."""
-    if not isinstance(attachments, list):
-        return ""
-    lines: List[str] = []
-    for item in attachments:
-        if not isinstance(item, dict):
-            continue
-        relpath = str(item.get("relpath") or "").strip()
-        root = str(item.get("root") or "artifact_store").strip() or "artifact_store"
-        label = str(item.get("label") or pathlib.Path(relpath).name).strip()
-        if not relpath:
-            continue
-        kind = "image" if item.get("is_image") else (str(item.get("mime") or "").strip() or "file")
-        # v6.54.3: also surface the REAL staged path for process tools — scripts
-        # (openpyxl, audio, ffmpeg) open files by OS path, and omitting it made
-        # models GUESS wrong absolute paths that tripped light-mode path guards.
-        # The staged path lives inside this task's own artifact_store, so both
-        # forms address the same file.
-        abs_path = str(item.get("abs_path") or "").strip()
-        script_hint = f" | script/process path: {abs_path}" if abs_path else ""
-        lines.append(
-            f"- {label} ({kind}): read_file(root='{root}', path='{relpath}'){script_hint}"
-        )
-    return "\n".join(lines)
+    from ouroboros.artifacts import render_task_attachment_lines
+
+    return render_task_attachment_lines(attachments)
 
 
 def _is_workspace_result(result: Dict[str, Any]) -> bool:

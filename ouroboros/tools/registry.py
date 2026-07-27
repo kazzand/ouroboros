@@ -8,10 +8,12 @@ import inspect
 import logging
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+import uuid
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from ouroboros.runtime_mode_policy import (
     PROTECTED_RUNTIME_PATHS,
@@ -26,6 +28,8 @@ from ouroboros.tool_capabilities import (
     LOCAL_READONLY_SUBAGENT_MODE,
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     META_TOOL_NAMES,
+    PlacementDecision,
+    lexical_execution_placement,
 )
 from ouroboros.shell_parse import (
     is_absolute_path_text,
@@ -79,6 +83,10 @@ def _coerce_real_path(value: Any) -> pathlib.Path | None:
         return None
 def active_repo_dir_for(ctx: Any) -> pathlib.Path:
     """Return the active repo/workspace root for real and lightweight test contexts."""
+    from ouroboros.workspace_ref import is_remote_workspace, local_workspace_path_for
+
+    if is_remote_workspace(ctx):
+        return local_workspace_path_for(ctx)  # raises: never fall back to system repo
     active = getattr(ctx, "active_repo_dir", None)
     if callable(active):
         try:
@@ -405,6 +413,40 @@ def _is_pure_read_inspection(text_lower: str) -> bool:
     return True
 
 
+def _detect_owner_connections_self_call(text_lower: str) -> bool:
+    """Block model-controlled owner Connections HTTP/CLI calls, not source reads."""
+
+    import urllib.parse
+
+    from ouroboros.server_auth import is_owner_connections_path
+
+    decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
+    marker = "/api/owner/connections"
+    reaches_owner_path = False
+    start = 0
+    while True:
+        index = decoded.find(marker, start)
+        if index < 0:
+            break
+        candidate = decoded[index:]
+        for delimiter in " \t\r\n'\"`)]};|&<>":
+            candidate = candidate.split(delimiter, 1)[0]
+        if is_owner_connections_path(candidate):
+            reaches_owner_path = True
+            break
+        start = index + len(marker)
+    reaches_owner_cli = bool(
+        re.search(r"(?:^|[\s;&|()])(?:\S*/)?ouroboros\s+connections(?:\s|$)", decoded)
+        or (
+            "ouroboros.cli" in decoded
+            and re.search(r"\bconnections(?:\s|$)", decoded)
+        )
+    )
+    if not reaches_owner_path and not reaches_owner_cli:
+        return False
+    return not _is_pure_read_inspection(text_lower)
+
+
 def _detect_scope_review_floor_self_lowering(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script attempts to REACH the owner-controlled scope-review floor
     (CW1, v6.34.0). ``OUROBOROS_SCOPE_REVIEW_FLOOR`` is deprecated and enforcement-inert
@@ -714,43 +756,59 @@ _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
 # ONCE at dispatch (execute) so the handler AND every guard (protected-path,
 # protected-artifact, shrink) resolve the identical target — no desync bypass.
 _PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
+_REMOTE_DIRECT_NATIVE_TOOLS = frozenset({
+    "read_file",
+    "list_files",
+    "write_file",
+    "edit_text",
+    "search_code",
+    "query_code",
+    "run_command",
+    "run_script",
+    "start_service",
+    "service_status",
+    "service_logs",
+    "stop_service",
+    "vcs_status",
+    "vcs_diff",
+})
 
 
-def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> str:
-    """ROOT-FIX (v6.35.0): normalize an absolute / redundant-root-basename
-    active_workspace|system_repo path arg IN PLACE at the dispatch boundary, so
-    the handler AND every downstream guard (protected-path, protected-artifact,
-    accidental-truncation shrink guard) resolve the SAME target. One authoritative
-    normalization point is what makes a guard unable to desync from the operation.
+def _normalize_unambiguous_dispatch_path_args(
+    ctx: Any,
+    name: str,
+    args: Dict[str, Any],
+) -> None:
+    """Normalize paths whose explicit root already fixes their placement."""
 
-    v6.54.3 root-label fix: returns a dispatch note ("" when nothing rerouted).
-    When ``root='user_files'`` carries an ABSOLUTE path that resolves under the
-    ACTIVE WORKSPACE root, the root label is wrong, not the intent: reads
-    (read_file/list_files/search_code) are auto-routed to
-    ``root='active_workspace'`` with a visible note appended AFTER the result
-    (trailing, so first-line failure classification is never masked),
-    and writes (write_file/edit_text) return an actionable
-    ROOT_REQUIRED_ACTIVE_WORKSPACE redirect instead of a generic access denial.
-    The destination root still passes every downstream gate (profile access
-    decision, protected-path guards, subagent filters) — only the label is
-    corrected, never the authority. ``query_code`` is excluded: its
-    root=user_files external-target contract handles absolute paths natively."""
+    if name not in _PATH_NORMALIZED_TOOLS:
+        return
+    root_arg = str(args.get("root") or "active_workspace")
+    if root_arg not in ("active_workspace", "system_repo"):
+        return
+    try:
+        norm_root = active_repo_dir_for(ctx) if root_arg == "active_workspace" else system_repo_dir_for(ctx)
+        for _key in ("path", "dir"):
+            if isinstance(args.get(_key), str) and args[_key]:
+                args[_key] = normalize_root_relative(norm_root, args[_key])
+        if isinstance(args.get("files"), list):
+            for _f in args["files"]:
+                if isinstance(_f, dict) and isinstance(_f.get("path"), str) and _f["path"]:
+                    _f["path"] = normalize_root_relative(norm_root, _f["path"])
+    except Exception:
+        pass
+
+
+def _classify_ambiguous_dispatch_path_args(
+    ctx: Any,
+    name: str,
+    args: Dict[str, Any],
+) -> str:
+    """Classify absolute user_files paths only after non-path Home gates."""
+
     if name not in _PATH_NORMALIZED_TOOLS:
         return ""
     root_arg = str(args.get("root") or "active_workspace")
-    if root_arg in ("active_workspace", "system_repo"):
-        try:
-            norm_root = active_repo_dir_for(ctx) if root_arg == "active_workspace" else system_repo_dir_for(ctx)
-            for _key in ("path", "dir"):
-                if isinstance(args.get(_key), str) and args[_key]:
-                    args[_key] = normalize_root_relative(norm_root, args[_key])
-            if isinstance(args.get("files"), list):
-                for _f in args["files"]:
-                    if isinstance(_f, dict) and isinstance(_f.get("path"), str) and _f["path"]:
-                        _f["path"] = normalize_root_relative(norm_root, _f["path"])
-        except Exception:
-            pass
-        return ""
     if root_arg != "user_files" or name == "query_code":
         return ""
     try:
@@ -802,6 +860,18 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
         "root='active_workspace'. Pass root='active_workspace' directly for "
         "workspace paths."
     )
+
+
+def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> str:
+    """Canonical dispatch path normalization, retained as one compatibility seam.
+
+    Explicit active-workspace/system roots are normalized first.  The separate
+    ambiguous ``user_files`` classifier may inspect target containment and is
+    therefore invoked by ``execute`` only at stage 3, after non-path authority.
+    """
+
+    _normalize_unambiguous_dispatch_path_args(ctx, name, args)
+    return _classify_ambiguous_dispatch_path_args(ctx, name, args)
 
 
 _WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "youtube_transcript"})
@@ -971,6 +1041,29 @@ def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
             args[canonical] = args.pop(alias)
     if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
         args.pop("root", None)
+
+
+def canonical_execution_args(
+    entry: "ToolEntry",
+    args: Mapping[str, Any],
+    native_facts: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Return the one policy/handler argument object without mutating inputs.
+
+    Target classification and native preparation may supply their normalized
+    argument view as ``native_facts["execution_args"]``.  Alias conversion and
+    compatibility-only argument dropping happen here, but public signature
+    validation deliberately remains at the execute-prepared boundary.
+    """
+
+    prepared = args
+    if isinstance(native_facts, Mapping):
+        candidate = native_facts.get("execution_args")
+        if isinstance(candidate, Mapping):
+            prepared = candidate
+    canonical = copy.deepcopy(dict(prepared))
+    _normalize_tool_call_args(entry, canonical)
+    return canonical
 
 
 def _format_tool_arg_error(entry: "ToolEntry") -> str:
@@ -1164,13 +1257,16 @@ class ToolContext:
 
     def active_repo_dir(self) -> pathlib.Path:
         if self.is_workspace_mode():
-            return pathlib.Path(self.workspace_root)
+            from ouroboros.workspace_ref import local_workspace_path_for
+
+            return local_workspace_path_for(self)
         return pathlib.Path(self.repo_dir)
 
     def is_workspace_mode(self) -> bool:
+        from ouroboros.workspace_ref import has_workspace
+
         return (
-            self.workspace_root is not None
-            and bool(str(self.workspace_mode or "").strip())
+            has_workspace(self)
             and not workspace_mode_block_reason(self)
         )
 
@@ -1727,6 +1823,7 @@ class ToolRegistry:
 
     def _external_workspace_git_block(self, raw_cmd: Any, args: Dict[str, Any]) -> Optional[str]:
         from ouroboros.git_shell_policy import external_workspace_git_violation
+        from ouroboros.workspace_ref import RemoteWorkspacePathError
 
         # External-workspace git is no longer confined to the active workspace
         # (host scratch is legitimate), so the Ouroboros runtime is protected by
@@ -1743,9 +1840,28 @@ class ToolRegistry:
             for _k in ("drive_root", "child_drive_root", "headless_child_drive_root", "budget_drive_root"):
                 if _meta.get(_k):
                     git_protected_roots.append(pathlib.Path(str(_meta.get(_k))))
+        try:
+            active_root = active_repo_dir_for(self._ctx)
+        except RemoteWorkspacePathError:
+            # This branch is reached only for an explicitly Home-owned cwd in
+            # an SSH task.  Default/active-workspace cwd was already routed to
+            # execd, so use the exact Home cwd rather than inventing a local
+            # path for the remote worktree.
+            try:
+                active_root, _cwd_root, _allowed = resolve_shell_cwd(
+                    self._ctx,
+                    str(args.get("cwd") or ""),
+                )
+            except Exception as exc:
+                return shell_cwd_block_message(
+                    self._ctx,
+                    str(args.get("cwd") or ""),
+                    operation="shell",
+                    error=exc,
+                )
         git_violation = external_workspace_git_violation(
             raw_cmd,
-            active_root=active_repo_dir_for(self._ctx),
+            active_root=active_root,
             cwd=str(args.get("cwd") or ""),
             protected_roots=git_protected_roots,
             allow_network=_resource_allowed(self._ctx, "network"),
@@ -1755,6 +1871,60 @@ class ToolRegistry:
         if git_violation.startswith("task_contract.allowed_resources"):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
         return f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}."
+
+    def _resolve_home_shell_guard_cwd(
+        self,
+        args: Mapping[str, Any],
+    ) -> tuple[pathlib.Path | None, str, str]:
+        """Resolve a Home-owned process cwd once, or return its policy error."""
+
+        operation = (
+            "service"
+            if str(args.get("__tool_name") or "") == "start_service"
+            else "shell"
+        )
+        try:
+            work_dir, cwd_root, _allowed = resolve_shell_cwd(
+                self._ctx,
+                str(args.get("cwd") or ""),
+                operation=operation,
+            )
+            return pathlib.Path(work_dir), cwd_root, ""
+        except Exception as exc:
+            return None, "", shell_cwd_block_message(
+                self._ctx,
+                str(args.get("cwd") or ""),
+                operation=operation,
+                error=exc,
+            )
+
+    def _home_process_state_block(
+        self,
+        raw_cmd: Any,
+        args: Mapping[str, Any],
+        work_dir: pathlib.Path,
+        *,
+        writeish: bool,
+    ) -> str:
+        """Protect Home artifact/executor state using the exact selected cwd."""
+
+        cwd = str(args.get("cwd") or "")
+        artifact_block = protected_artifact_shell_block_reason(
+            self._ctx,
+            raw_cmd,
+            cwd=cwd,
+            default_cwd=work_dir,
+        )
+        if artifact_block:
+            return artifact_block
+        if not writeish:
+            return ""
+        return workspace_executor_state_write_block(
+            raw_cmd,
+            drive_root=pathlib.Path(self._ctx.drive_root),
+            cwd=cwd,
+            default_cwd=work_dir,
+        ) or ""
 
     def _external_runtime_protected_paths(self) -> tuple[list, list, list, list]:
         """Ouroboros runtime roots that an EXTERNAL-workspace task must not touch via
@@ -1919,6 +2089,11 @@ class ToolRegistry:
         cmd_lower = (" ".join(str(x) for x in raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)).lower()
         cmd_path_lower = cmd_lower.replace("\\", "/")
         while "//" in cmd_path_lower: cmd_path_lower = cmd_path_lower.replace("//", "/")
+        effective_work_dir, effective_cwd_root, cwd_block = (
+            self._resolve_home_shell_guard_cwd(args)
+        )
+        if cwd_block or effective_work_dir is None:
+            return cwd_block
         # Subagents must not read owner secrets/credentials/control state via shell
         # (read_file already denies these). read_file is the gated inspection path.
         if (acting_subagent or self._is_local_readonly_subagent()) and _subagent_shell_targets_secret(cmd_path_lower):
@@ -1940,11 +2115,21 @@ class ToolRegistry:
         explicit_write_targets = list(dict.fromkeys(str(token) for target_argv in write_target_argvs for token in writer_target_tokens(target_argv) if str(token or "").strip()))
         executable_path_tokens = {str(target_argv[0]) for target_argv in write_target_argvs if target_argv}
         writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and argv_executable in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
-        if protected_artifact_block := protected_artifact_shell_block_reason(self._ctx, raw_cmd, cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx)):
-            return protected_artifact_block
-        if writeish and (executor_state_block := workspace_executor_state_write_block(raw_cmd, drive_root=pathlib.Path(self._ctx.drive_root), cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx))):
-            return executor_state_block
-        if workspace_mode and writeish:
+        state_block = self._home_process_state_block(
+            raw_cmd,
+            args,
+            effective_work_dir,
+            writeish=writeish,
+        )
+        if state_block:
+            return state_block
+        from ouroboros.workspace_ref import is_remote_workspace
+
+        home_owned_remote_cwd = (
+            is_remote_workspace(self._ctx)
+            and effective_cwd_root != "active_workspace"
+        )
+        if workspace_mode and writeish and not home_owned_remote_cwd:
             active_root_declared = active_repo_dir_for(self._ctx)
             active_root = active_root_declared.resolve(strict=False)
             try:
@@ -2088,6 +2273,8 @@ class ToolRegistry:
             return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
         if _detect_scope_review_floor_self_lowering(cmd_lower, writeish=writeish):
             return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells."
+        if _detect_owner_connections_self_call(cmd_lower):
+            return "⚠️ OWNER_CONNECTIONS_SELF_CALL_BLOCKED: shell/CLI command looks like an attempt to access /api/owner/connections or run the owner Connections CLI. Connection trust, bootstrap and lifecycle are owner-controlled; ask the owner to use Settings → Connections or the controlling-terminal CLI. Pure source inspection remains available."
         if _detect_safety_mode_self_lowering(cmd_lower):
             return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly."
         if _detect_owner_skill_attest_self_call(cmd_lower):
@@ -2239,26 +2426,61 @@ class ToolRegistry:
 
     def _snapshot_owner_files(self) -> Dict[pathlib.Path, Optional[str]]:
         from ouroboros import config as _cfg
+        from ouroboros.gateway.connections import (
+            connection_store_path,
+            is_connection_store_path,
+        )
+
         out: Dict[pathlib.Path, Optional[str]] = {}
         settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
         try:
             out[settings_path] = settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None
         except OSError:
             out[settings_path] = None
+        connection_path = connection_store_path()
+        try:
+            out[connection_path] = (
+                connection_path.read_text(encoding="utf-8")
+                if connection_path.is_file()
+                else None
+            )
+        except OSError:
+            out[connection_path] = None
+        try:
+            for path in connection_path.parent.iterdir():
+                if path != connection_path and is_connection_store_path(
+                    path,
+                    store_path=connection_path,
+                ):
+                    try:
+                        out[path] = (
+                            path.read_text(encoding="utf-8")
+                            if path.is_file()
+                            else None
+                        )
+                    except OSError:
+                        out[path] = None
+        except OSError:
+            pass
         root = pathlib.Path(self._ctx.drive_root) / "state" / "skills"
-        if not root.is_dir():
-            return out
-        for path in root.glob("*/*"):
-            if path.name.lower() not in SKILL_OWNER_STATE_FILENAMES:
-                continue
-            try:
-                out[path] = path.read_text(encoding="utf-8")
-            except OSError:
-                out[path] = None
+        if root.is_dir():
+            for path in root.glob("*/*"):
+                if path.name.lower() not in SKILL_OWNER_STATE_FILENAMES:
+                    continue
+                try:
+                    out[path] = path.read_text(encoding="utf-8")
+                except OSError:
+                    out[path] = None
         return out
 
     def _restore_owner_files(self, before: Dict[pathlib.Path, Optional[str]]) -> bool:
         from ouroboros import config as _cfg
+        from ouroboros.gateway.connections import (
+            connection_store_path,
+            is_connection_store_path,
+        )
+        from ouroboros.utils import write_text_atomic
+
         root = pathlib.Path(self._ctx.drive_root) / "state" / "skills"
         current = set()
         if root.is_dir():
@@ -2268,6 +2490,16 @@ class ToolRegistry:
             )
         settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
         current.add(settings_path)
+        connection_path = connection_store_path()
+        current.add(connection_path)
+        try:
+            current.update(
+                path
+                for path in connection_path.parent.iterdir()
+                if is_connection_store_path(path, store_path=connection_path)
+            )
+        except OSError:
+            pass
         changed = False
         for path in current - set(before):
             try:
@@ -2284,7 +2516,12 @@ class ToolRegistry:
                     continue
                 if not path.exists() or path.read_text(encoding="utf-8") != content:
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content, encoding="utf-8")
+                    write_text_atomic(path, content, fsync=path == connection_path)
+                    if path == connection_path:
+                        try:
+                            os.chmod(path, 0o600)
+                        except OSError:
+                            pass
                     changed = True
             except OSError:
                 pass
@@ -2476,7 +2713,1088 @@ class ToolRegistry:
             return _managed_update_code_tool_block(self._ctx, name)
         return ""
 
-    def _resolve_python_predispatch(
+    def _stage_raw_lookup_and_lexical_placement(
+        self,
+        name: str,
+        args: Mapping[str, Any] | None,
+    ) -> tuple[str, Dict[str, Any], Any, PlacementDecision | None]:
+        """Stage 1: pure lookup/copy and exhaustive built-in affinity lookup."""
+
+        tool_name = str(name or "").strip()
+        execution_args = copy.deepcopy(dict(args or {}))
+        entry = self._entries.get(tool_name)
+        placement = (
+            lexical_execution_placement(tool_name, execution_args)
+            if tool_name in _WORKSPACE_ALLOWED_TOOLS
+            else None
+        )
+        return tool_name, execution_args, entry, placement
+
+    def _stage_non_path_home_authority(
+        self,
+        name: str,
+        args: Mapping[str, Any],
+        entry: Any,
+        ext_tool: Any,
+        is_mcp: bool,
+        local_readonly_subagent: bool,
+        acting_subagent: bool,
+        acting_tool_grants: set[str],
+    ) -> str:
+        """Stage 2: gates that must win before any target-path classification."""
+
+        ephemeral_block = self._ephemeral_block(name, ext_tool, is_mcp)
+        if ephemeral_block:
+            return ephemeral_block
+        if name in _disabled_tools(self._ctx):
+            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {name!r} for this task."
+        available, unavailable_reason, unavailable_detail = _builtin_tool_availability(name, self._ctx)
+        if not available:
+            suffix = f" ({unavailable_detail})" if unavailable_detail else ""
+            return f"⚠️ CAPABILITY_UNAVAILABLE: {name!r} is unavailable: {unavailable_reason}{suffix}."
+        if name == "vlm_query" and str(args.get("image_url") or "").strip() and (
+            not _resource_allowed(self._ctx, "web") or not _resource_allowed(self._ctx, "network")
+        ):
+            return "⚠️ RESOURCE_CONSTRAINT_BLOCKED: remote image_url for vlm_query requires allowed_resources.web/network."
+        if name in _WEB_TOOLS and not _resource_allowed(self._ctx, "web"):
+            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.web=false blocks {name!r}."
+        if (is_mcp or ext_tool) and not _resource_allowed(self._ctx, "network"):
+            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks external tool {name!r}."
+        return self._subagent_and_update_gate(
+            name,
+            entry,
+            ext_tool,
+            is_mcp,
+            local_readonly_subagent,
+            acting_subagent,
+            acting_tool_grants,
+        )
+
+    def _stage_target_classification(
+        self,
+        name: str,
+        args: Dict[str, Any],
+    ) -> str:
+        """Stage 3: resolve the selected target's dispatch-path ambiguity."""
+
+        return _normalize_dispatch_path_args(self._ctx, name, args)
+
+    @staticmethod
+    def _remote_root_relative(remote_root: str, value: Any) -> str:
+        """Normalize a model path without asking Home's filesystem about it."""
+
+        text = str(value or ".").strip().replace("\\", "/") or "."
+        root = str(remote_root or "").rstrip("/")
+        if text.startswith("/"):
+            normalized = posixpath.normpath(text)
+            if normalized == root:
+                return "."
+            if not normalized.startswith(root + "/"):
+                raise ValueError("path is outside the active remote workspace")
+            text = normalized[len(root) + 1 :]
+        parts = [part for part in text.split("/") if part not in {"", "."}]
+        if any(part == ".." for part in parts):
+            raise ValueError("path escapes the active remote workspace")
+        return "/".join(parts) or "."
+
+    def _remote_service(self):
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        service = get_remote_workspace_service()
+        if service is None:
+            raise RuntimeError("remote workspace broker is unavailable")
+        return service
+
+    def _remote_prepare_execute(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        operation: str,
+        args: Dict[str, Any],
+        entry: Any = None,
+        authorize: bool,
+        python_resolution: Any = None,
+        blobs: Mapping[str, bytes] | None = None,
+    ):
+        """Two-phase remote call: prepare facts, then authorize exact args."""
+
+        from ouroboros.workspace_diagnostics import (
+            ToolExecutionEnvelope,
+            envelope_from_exception,
+        )
+
+        service = self._remote_service()
+        request_id = uuid.uuid4().hex
+        operation_id = uuid.uuid4().hex
+        task_id = str(getattr(self._ctx, "task_id", "") or "")
+        prepared = None
+        try:
+            request_args = copy.deepcopy(args)
+            if operation in {"run_command", "run_script", "verify_remote_check"}:
+                from ouroboros.tools.shell import _resolve_effective_timeout
+
+                raw_timeout = request_args.get("timeout_sec")
+                if raw_timeout is None:
+                    raw_timeout = request_args.get("timeout")
+                request_args["timeout_sec"] = _resolve_effective_timeout(
+                    360,
+                    self._ctx,
+                    override_sec=raw_timeout,
+                )
+                request_args.pop("timeout", None)
+            deadline_ms = None
+            try:
+                from ouroboros.deadline_utils import parse_deadline_ts
+
+                metadata = getattr(self._ctx, "task_metadata", {})
+                parsed_deadline = parse_deadline_ts(
+                    metadata.get("deadline_at")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if parsed_deadline is not None:
+                    deadline_ms = int(parsed_deadline.timestamp() * 1000)
+            except Exception:
+                deadline_ms = None
+            prepared = service.prepare(
+                dict(workspace_ref),
+                request_id=request_id,
+                operation_id=operation_id,
+                tool=operation,
+                args=request_args,
+                blobs=dict(blobs or {}),
+                deadline_ms=deadline_ms,
+                task_id=task_id,
+            )
+            diagnostic = getattr(prepared, "diagnostic", None)
+            if diagnostic is not None:
+                return ToolExecutionEnvelope(
+                    text=getattr(diagnostic, "message", "") or "Remote preparation failed.",
+                    diagnostic=diagnostic,
+                    trace={"request_id": request_id, "operation_id": operation_id},
+                )
+            prepared_args = getattr(prepared, "execution_args", None)
+            if not isinstance(prepared_args, Mapping):
+                raise RuntimeError("remote prepare omitted execution_args")
+            canonical = (
+                canonical_execution_args(
+                    entry,
+                    request_args,
+                    {"execution_args": prepared_args},
+                )
+                if entry is not None
+                else copy.deepcopy(dict(prepared_args))
+            )
+            if entry is not None:
+                public_params = set(_entry_public_params(entry))
+                if (
+                    _entry_has_public_param_schema(entry)
+                    and any(key not in public_params for key in canonical)
+                ):
+                    service.abort_prepared(
+                        dict(workspace_ref),
+                        prepared,
+                        task_id=task_id,
+                        reason="invalid_arguments",
+                    )
+                    return ToolExecutionEnvelope(text=_format_tool_arg_error(entry))
+                try:
+                    inspect.signature(entry.handler).bind(self._ctx, **canonical)
+                except TypeError:
+                    service.abort_prepared(
+                        dict(workspace_ref),
+                        prepared,
+                        task_id=task_id,
+                        reason="invalid_arguments",
+                    )
+                    return ToolExecutionEnvelope(text=_format_tool_arg_error(entry))
+            safety_message = ""
+            if authorize:
+                safety_block, safety_message = self._stage_home_policy_and_safety(
+                    operation,
+                    canonical,
+                    python_resolution,
+                )
+                if safety_block:
+                    service.abort_prepared(
+                        dict(workspace_ref),
+                        prepared,
+                        task_id=task_id,
+                        reason="denied",
+                    )
+                    return ToolExecutionEnvelope(text=safety_block)
+            envelope = service.execute_prepared(
+                dict(workspace_ref),
+                prepared,
+                canonical_args=canonical,
+                task_id=task_id,
+            )
+            if not isinstance(envelope, ToolExecutionEnvelope):
+                raise RuntimeError("remote broker returned an invalid execution envelope")
+            if safety_message:
+                envelope = replace(
+                    envelope,
+                    text=_compose_execute_result(
+                        envelope.text,
+                        "",
+                        safety_message,
+                    ),
+                )
+            return envelope
+        except Exception as exc:
+            if prepared is not None:
+                try:
+                    service.abort_prepared(
+                        dict(workspace_ref),
+                        prepared,
+                        task_id=task_id,
+                        reason="client_error",
+                    )
+                except Exception:
+                    pass
+            return envelope_from_exception(
+                exc,
+                request_id=request_id,
+                operation_id=operation_id,
+                phase="prepare" if prepared is None else "execute_prepared",
+                domain="transport",
+                completion="not_started" if prepared is None else "unknown",
+                retryable=True,
+            )
+
+    def _execute_remote_reviewed_payload(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        package: Mapping[str, Any],
+        blobs: Mapping[str, bytes],
+        safety_tool: str,
+        safety_args: Mapping[str, Any],
+    ) -> str:
+        safety_block, safety_message = self._stage_home_policy_and_safety(
+            safety_tool,
+            safety_args,
+            None,
+        )
+        if safety_block:
+            return safety_block
+        envelope = self._remote_prepare_execute(
+            workspace_ref=workspace_ref,
+            operation="execute_reviewed_payload",
+            args=dict(package),
+            authorize=False,
+            blobs=blobs,
+        )
+        from ouroboros.workspace_diagnostics import publish_execution_envelope
+
+        publish_execution_envelope(envelope)
+        return _compose_execute_result(envelope.text, "", safety_message)
+
+    def _remote_classify_ambiguous_paths(
+        self,
+        workspace_ref: Mapping[str, Any],
+        name: str,
+        args: Dict[str, Any],
+    ) -> tuple[str, bool]:
+        """Classify only absolute root=user_files candidates on the target."""
+
+        if (
+            name not in _PATH_NORMALIZED_TOOLS
+            or name == "query_code"
+            or str(args.get("root") or "active_workspace") != "user_files"
+        ):
+            return "", False
+        candidates: list[tuple[Dict[str, Any], str]] = []
+        for key in ("path", "dir"):
+            value = args.get(key)
+            if isinstance(value, str) and is_absolute_path_text(value):
+                candidates.append((args, key))
+        for item in args.get("files") or []:
+            if isinstance(item, dict):
+                value = item.get("path")
+                if isinstance(value, str) and is_absolute_path_text(value):
+                    candidates.append((item, "path"))
+        for owner, key in candidates:
+            original = str(owner[key])
+            envelope = self._remote_prepare_execute(
+                workspace_ref=workspace_ref,
+                operation="classify_ambiguous_workspace_path",
+                args={"path": original},
+                authorize=False,
+            )
+            if envelope.diagnostic is not None:
+                return envelope.text, True
+            if not bool(envelope.trace.get("inside_workspace")):
+                continue
+            if name in {"write_file", "edit_text"}:
+                return (
+                    "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path "
+                    f"{original!r} is under the active workspace, but root='user_files' "
+                    "does not write there. Retry the same call with "
+                    "root='active_workspace' (the same path is accepted).",
+                    True,
+                )
+            args["root"] = "active_workspace"
+            owner[key] = str(envelope.trace.get("relative_path") or ".")
+            return (
+                "⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: absolute path "
+                f"{original!r} is under the active workspace; the call ran with "
+                "root='active_workspace'. Pass root='active_workspace' directly "
+                "for workspace paths.",
+                False,
+            )
+        return "", False
+
+    def _remote_dispatch_selected(
+        self,
+        workspace_ref: Mapping[str, Any],
+        name: str,
+        args: Mapping[str, Any],
+    ) -> bool:
+        """Return whether this public call's native half belongs to the SSH root."""
+
+        if name not in _REMOTE_DIRECT_NATIVE_TOOLS:
+            return False
+        if name in {"vcs_status", "vcs_diff"}:
+            return True
+        if name in {"service_status", "service_logs", "stop_service"}:
+            from ouroboros.workspace_executor import remote_service_ref
+
+            return remote_service_ref(
+                self._ctx,
+                str(args.get("name") or "service"),
+            ) is not None
+        if name == "start_service" or name in {"run_command", "run_script"}:
+            cwd = str(args.get("cwd") or "").strip().replace("\\", "/")
+            if not cwd or cwd == "active_workspace":
+                return True
+            if cwd in {"task_drive", "artifact_store", "user_files", "runtime_data"}:
+                return False
+            remote_root = str(workspace_ref.get("remote_root") or "").rstrip("/")
+            if cwd == remote_root or cwd.startswith(remote_root + "/"):
+                return True
+            if not is_absolute_path_text(cwd) and not cwd.startswith("~"):
+                return True
+            return False
+        return str(args.get("root") or "active_workspace") == "active_workspace"
+
+    def _remote_shell_safety_check(
+        self,
+        name: str,
+        args: Mapping[str, Any],
+        *,
+        runtime_mode: str,
+        remote_root: str,
+    ) -> str:
+        """Path-free Home guard for a process whose cwd/files live on target."""
+
+        guard_args = process_shell_guard_args(
+            name,
+            args,
+            ctx=self._ctx,
+            runtime_mode=runtime_mode,
+        )
+        raw_cmd = guard_args.get("cmd", guard_args.get("command", ""))
+        argv = strip_leading_env_assignments(unwrap_env_argv(shell_argv(raw_cmd)))
+        if sudo_noninteractive_violation(argv):
+            return (
+                "⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. "
+                "Use sudo -n; if it fails, report that privileged setup is blocked."
+            )
+        text = (
+            " ".join(str(item) for item in raw_cmd)
+            if isinstance(raw_cmd, list)
+            else str(raw_cmd)
+        )
+        lowered = text.lower().replace("\\", "/")
+        if (
+            self._is_acting_subagent() or self._is_local_readonly_subagent()
+        ) and _subagent_shell_targets_secret(lowered):
+            return (
+                "⚠️ SUBAGENT_SECRET_READ_BLOCKED: subagents may not read owner "
+                "secrets, credentials, or owner-control state via shell."
+            )
+        if _detect_runtime_mode_elevation(lowered):
+            return "⚠️ ELEVATION_BLOCKED: runtime mode is owner-controlled."
+        if (
+            _detect_context_mode_self_lowering(lowered)
+            or _detect_scope_review_floor_self_lowering(lowered)
+            or _detect_safety_mode_self_lowering(lowered)
+        ):
+            return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: owner safety controls are not writable by the agent."
+        if (
+            _detect_mutative_toggle_self_change(lowered)
+            or _detect_evolution_owner_control_self_change(lowered)
+        ):
+            return "⚠️ ELEVATION_BLOCKED: owner-controlled evolution/delegation settings are not writable by the agent."
+        if "gh auth" in re.sub(r"\s+", " ", lowered):
+            return "⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted."
+        if "gh repo create" in lowered or "gh repo delete" in lowered:
+            return "⚠️ SAFETY_VIOLATION: Creating/deleting GitHub repositories requires admin approval."
+
+        metadata = (
+            getattr(self._ctx, "task_metadata", {})
+            if isinstance(getattr(self._ctx, "task_metadata", {}), dict)
+            else {}
+        )
+        remote_manifest = metadata.get("_remote_attachment_manifest")
+        attachment_paths = {
+            posixpath.normpath(str(item.get("execution_path") or ""))
+            for item in (
+                remote_manifest if isinstance(remote_manifest, list) else []
+            )
+            if isinstance(item, dict)
+            and str(item.get("execution_path") or "").startswith("/")
+        }
+        absolute_tokens = {
+            posixpath.normpath(str(token))
+            for token in shell_argv_with_path_tokens(raw_cmd)
+            if str(token or "").startswith("/")
+        }
+        if any(
+            "/task_files/" in candidate and candidate not in attachment_paths
+            for candidate in absolute_tokens
+        ):
+            return (
+                "⚠️ REMOTE_ATTACHMENT_PATH_BLOCKED: process tools may use only "
+                "the exact current-task attachment execution_path; cache parents, "
+                "siblings, globs, and other task paths are blocked."
+            )
+
+        writeish = shell_has_write_indicator(raw_cmd)
+        if writeish:
+            if (
+                ("../" in lowered or lowered.startswith(".."))
+                and not (
+                    str(runtime_mode).lower() == "pro"
+                    and not self._is_acting_subagent()
+                )
+            ):
+                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not escape the active remote workspace."
+            root = str(remote_root or "").rstrip("/")
+            for candidate in absolute_tokens:
+                if not candidate.startswith("/") or candidate == "/dev/null":
+                    continue
+                if candidate in attachment_paths:
+                    continue
+                if candidate != root and not candidate.startswith(root + "/"):
+                    return (
+                        "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands "
+                        "may not target absolute paths outside the active remote workspace."
+                    )
+        git_words = [str(item).lower() for item in argv]
+        if git_words and pathlib.PurePosixPath(git_words[0]).name == "git":
+            mutating_refs = {
+                "commit", "tag", "reset", "checkout", "switch", "branch",
+                "merge", "rebase", "cherry-pick",
+            }
+            if any(word in mutating_refs for word in git_words[1:2]):
+                return (
+                    "⚠️ WORKSPACE_GIT_BLOCKED: remote workspace tasks must leave "
+                    "changes as files/patch artifacts, not commits or ref changes."
+                )
+        return ""
+
+    def _execute_remote_direct(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        name: str,
+        entry: Any,
+        args: Dict[str, Any],
+        runtime_mode: str,
+        route_note: str,
+    ) -> str:
+        """Run one direct native operation through the broker's prepared token."""
+
+        remote_root = str(workspace_ref.get("remote_root") or "")
+        if name in _PATH_NORMALIZED_TOOLS:
+            for key in ("path", "dir"):
+                if isinstance(args.get(key), str) and args[key]:
+                    try:
+                        args[key] = self._remote_root_relative(remote_root, args[key])
+                    except ValueError as exc:
+                        return f"⚠️ WORKSPACE_PATH_BLOCKED: {exc}."
+            for item in args.get("files") or []:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    try:
+                        item["path"] = self._remote_root_relative(
+                            remote_root,
+                            item["path"],
+                        )
+                    except ValueError as exc:
+                        return f"⚠️ WORKSPACE_PATH_BLOCKED: {exc}."
+
+        broker_args = copy.deepcopy(args)
+        if name in {"run_command", "run_script", "start_service"}:
+            if name == "run_command":
+                cmd = broker_args.get("cmd")
+                if (
+                    not isinstance(cmd, list)
+                    or not cmd
+                    or any(not isinstance(item, str) or not item.strip() for item in cmd)
+                ):
+                    return (
+                        "⚠️ SHELL_ARG_ERROR: cmd must be a non-empty JSON "
+                        "array of non-blank strings."
+                    )
+                from ouroboros.tools.shell import (
+                    _ENV_REF_PATTERN,
+                    _GLUED_REDIRECT_RE,
+                    _SHELL_BUILTINS,
+                    _SHELL_INTERPRETERS,
+                    _SHELL_OPERATORS,
+                )
+
+                if cmd[0] in _SHELL_BUILTINS:
+                    return (
+                        f'⚠️ SHELL_CMD_ERROR: "{cmd[0]}" is a shell builtin and '
+                        "cannot be executed directly. Use cwd= for cd, or "
+                        '["sh", "-c", "..."] for intentional shell syntax.'
+                    )
+                if _SHELL_OPERATORS.intersection(cmd):
+                    return (
+                        "⚠️ SHELL_CMD_ERROR: shell operators in argv are not "
+                        'interpreted. Use ["sh", "-c", "..."].'
+                    )
+                if any(_GLUED_REDIRECT_RE.match(item) for item in cmd):
+                    return (
+                        "⚠️ SHELL_CMD_ERROR: shell redirection in argv is not "
+                        'interpreted. Use ["sh", "-c", "..."].'
+                    )
+                if pathlib.PurePath(cmd[0]).name.lower() not in _SHELL_INTERPRETERS:
+                    bad_ref = next(
+                        (
+                            match.group(0)
+                            for item in cmd
+                            if (match := _ENV_REF_PATTERN.search(item))
+                        ),
+                        "",
+                    )
+                    if bad_ref:
+                        return (
+                            f"⚠️ SHELL_ENV_ERROR: literal env reference "
+                            f"{bad_ref!r} is not expanded in argv."
+                        )
+            elif name == "run_script":
+                if not str(broker_args.get("script") or "").strip():
+                    return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
+                allowed = {
+                    "python", "python3", "python.exe", "python3.exe",
+                    "bash", "sh", "node", "ruby",
+                }
+                interpreter = str(
+                    broker_args.get("interpreter") or "python3"
+                ).strip()
+                if pathlib.PurePath(interpreter).name not in allowed:
+                    return (
+                        "⚠️ RUN_SCRIPT_BLOCKED: interpreter must be one of "
+                        f"{sorted(allowed)}."
+                    )
+            else:
+                from ouroboros.tools.services import (
+                    _readiness_timeout,
+                    _sanitize_service_name,
+                    task_service_teardown,
+                )
+
+                service_name, name_error = _sanitize_service_name(
+                    str(broker_args.get("name") or "service")
+                )
+                if name_error:
+                    return name_error
+                _, readiness_error = _readiness_timeout(
+                    broker_args.get("readiness")
+                    if isinstance(broker_args.get("readiness"), dict)
+                    else {}
+                )
+                if readiness_error:
+                    return readiness_error
+                broker_args["name"] = service_name
+                broker_args["keep_alive"] = bool(
+                    broker_args.get("keep_alive")
+                ) or task_service_teardown(self._ctx) == "keep"
+            for field_name in ("outputs", "scratch"):
+                value = broker_args.get(field_name, [])
+                if value is not None and (
+                    not isinstance(value, list)
+                    or any(not isinstance(item, str) for item in value)
+                ):
+                    return (
+                        f"⚠️ TOOL_ARG_ERROR ({name}): {field_name} must be "
+                        "an array of strings."
+                    )
+        if name in {"service_status", "service_logs", "stop_service"}:
+            from ouroboros.workspace_executor import remote_service_ref
+
+            ref = remote_service_ref(
+                self._ctx,
+                str(args.get("name") or "service"),
+            )
+            if ref is None:
+                return "⚠️ SERVICE_NOT_FOUND"
+            broker_args["_service_ref"] = ref
+
+        if name in _SHELL_GUARDED_TOOLS:
+            shell_block = self._remote_shell_safety_check(
+                name,
+                broker_args,
+                runtime_mode=runtime_mode,
+                remote_root=remote_root,
+            )
+            if shell_block:
+                return shell_block
+
+        envelope = self._remote_prepare_execute(
+            workspace_ref=workspace_ref,
+            operation=name,
+            args=broker_args,
+            entry=entry,
+            authorize=True,
+        )
+        from ouroboros.workspace_diagnostics import publish_execution_envelope
+
+        publish_execution_envelope(envelope)
+        scratch_fingerprints = envelope.trace.get("scratch_fingerprints")
+        if isinstance(scratch_fingerprints, dict) and scratch_fingerprints:
+            from ouroboros.artifacts import record_task_scratch
+
+            record_task_scratch(
+                self._ctx,
+                {
+                    str(path): str(digest)
+                    for path, digest in scratch_fingerprints.items()
+                },
+            )
+        service_name = str(args.get("name") or "service")
+        service_ref = envelope.trace.get("service_ref")
+        if name == "start_service" and isinstance(service_ref, dict):
+            from ouroboros.workspace_executor import record_remote_service_ref
+
+            record_remote_service_ref(self._ctx, service_name, service_ref)
+        elif name in {"service_status", "service_logs"}:
+            from ouroboros.workspace_executor import remote_service_ref
+
+            expected = remote_service_ref(self._ctx, service_name)
+            observed = envelope.trace.get("service_ref")
+            if (
+                expected is not None
+                and isinstance(observed, dict)
+                and str(expected.get("service_id")) != str(observed.get("service_id"))
+            ):
+                return "⚠️ REMOTE_SERVICE_REF_MISMATCH: broker returned a different service identity."
+        elif name == "stop_service" and envelope.diagnostic is None:
+            from ouroboros.workspace_executor import forget_remote_service_ref
+
+            forget_remote_service_ref(self._ctx, service_name)
+        return _compose_execute_result(envelope.text, route_note, "")
+
+    def _execute_remote_verify(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        entry: Any,
+        args: Dict[str, Any],
+        runtime_mode: str,
+    ) -> str:
+        """Run the native check remotely, then persist the receipt on Home."""
+
+        from ouroboros.tools.verify import (
+            _RUN_KINDS,
+            _normalize_check,
+            record_remote_verification_result,
+        )
+
+        kind = str(args.get("contract_kind") or "")
+        if kind not in _RUN_KINDS:
+            return self._stage_execute_prepared(
+                "verify_and_record",
+                entry,
+                args,
+                None,
+                None,
+            )[1]
+        argv = _normalize_check(args.get("check"))
+        if not argv:
+            return (
+                f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind={kind} "
+                "requires `check`."
+            )
+        remote_args = {
+            "cmd": argv,
+            "cwd": str(args.get("cwd") or ""),
+            "timeout_sec": int(args.get("timeout_sec") or 120),
+        }
+        shell_block = self._remote_shell_safety_check(
+            "verify_and_record",
+            {**args, "check": argv},
+            runtime_mode=runtime_mode,
+            remote_root=str(workspace_ref.get("remote_root") or ""),
+        )
+        if shell_block:
+            return shell_block
+        envelope = self._remote_prepare_execute(
+            workspace_ref=workspace_ref,
+            operation="verify_remote_check",
+            args=remote_args,
+            authorize=True,
+        )
+        from ouroboros.workspace_diagnostics import publish_execution_envelope
+
+        publish_execution_envelope(envelope)
+        if envelope.diagnostic is not None:
+            return envelope.text
+        public = dict(args)
+        public.pop("cwd", None)
+        public.pop("timeout_sec", None)
+        return record_remote_verification_result(
+            self._ctx,
+            envelope=envelope,
+            **public,
+        )
+
+    def _execute_remote_frames(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        entry: Any,
+        args: Dict[str, Any],
+    ) -> str:
+        """Extract on target, verify blobs, and expose only Home artifact paths."""
+
+        remote_root = str(workspace_ref.get("remote_root") or "")
+        native_args = copy.deepcopy(args)
+        try:
+            native_args["path"] = self._remote_root_relative(
+                remote_root,
+                native_args.get("path"),
+            )
+        except ValueError as exc:
+            return f"⚠️ WORKSPACE_PATH_BLOCKED: {exc}."
+        envelope = self._remote_prepare_execute(
+            workspace_ref=workspace_ref,
+            operation="extract_video_frames",
+            args=native_args,
+            entry=entry,
+            authorize=True,
+        )
+        from ouroboros.workspace_diagnostics import publish_execution_envelope
+
+        publish_execution_envelope(envelope)
+        if envelope.diagnostic is not None:
+            return envelope.text
+        from ouroboros.remote_workspace import get_remote_workspace_service
+        from ouroboros.tool_access import resource_root_path
+
+        service = get_remote_workspace_service()
+        out_dir = (
+            resource_root_path(self._ctx, "artifact_store") / "video_frames"
+        ).resolve(strict=False)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written: list[str] = []
+        for index, artifact in enumerate(envelope.artifacts, 1):
+            blob_id = str(artifact.get("blob_id") or "")
+            digest = str(artifact.get("sha256") or "")
+            size = int(artifact.get("size") or 0)
+            if not blob_id or blob_id != digest or size < 0:
+                return "⚠️ REMOTE_MEDIA_ERROR: target returned an invalid frame blob declaration."
+            data = service.fetch_blob(
+                dict(workspace_ref),
+                blob_id,
+                max_bytes=size,
+            )
+            if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                return "⚠️ REMOTE_MEDIA_ERROR: imported frame failed integrity verification."
+            name = pathlib.PurePath(str(artifact.get("name") or "")).name
+            if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                name = f"remote_frame_{index:02d}.jpg"
+            target = out_dir / name
+            temp = out_dir / f".{name}.{uuid.uuid4().hex}.tmp"
+            temp.write_bytes(data)
+            os.replace(temp, target)
+            written.append(str(target))
+        if not written:
+            return "⚠️ EXTRACT_VIDEO_FRAMES_UNAVAILABLE: no frames produced on remote target."
+        return "Extracted video frame(s):\n" + "\n".join(written)
+
+    def _remote_media_source(
+        self,
+        workspace_ref: Mapping[str, Any],
+        name: str,
+        args: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve only an exact attachment cache path or active-workspace file."""
+
+        key = "file_path" if name == "vlm_query" else "path"
+        raw = str(args.get(key) or "").strip().replace("\\", "/")
+        if not raw:
+            return None
+        metadata = (
+            getattr(self._ctx, "task_metadata", {})
+            if isinstance(getattr(self._ctx, "task_metadata", {}), dict)
+            else {}
+        )
+        manifest = metadata.get("_remote_attachment_manifest")
+        for item in manifest if isinstance(manifest, list) else []:
+            if (
+                isinstance(item, dict)
+                and raw == str(item.get("execution_path") or "")
+                and str(item.get("attachment_id") or "")
+            ):
+                return {
+                    "attachment_id": str(item["attachment_id"]),
+                    "arg_key": key,
+                }
+        remote_root = str(workspace_ref.get("remote_root") or "").rstrip("/")
+        if raw.startswith("/"):
+            if raw == remote_root:
+                return None
+            if raw.startswith(remote_root + "/"):
+                return {
+                    "path": raw[len(remote_root) + 1 :],
+                    "arg_key": key,
+                }
+            return None
+        pure = pathlib.PurePosixPath(raw)
+        if any(part in {"", ".", ".."} for part in pure.parts):
+            return None
+        return {"path": pure.as_posix(), "arg_key": key}
+
+    def _execute_remote_media(
+        self,
+        *,
+        workspace_ref: Mapping[str, Any],
+        name: str,
+        entry: Any,
+        args: Dict[str, Any],
+        source: Mapping[str, Any],
+    ) -> str:
+        """Import one verified remote image/PDF, call the existing Home handler."""
+
+        from ouroboros.remote_task_files import MEDIA_EXPORT_OPERATION
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        max_bytes = 25 * 1024 * 1024 if name == "ocr_pdf" else 20 * 1024 * 1024
+        native_args = {
+            key: source[key]
+            for key in ("path", "attachment_id")
+            if source.get(key)
+        }
+        native_args["max_bytes"] = max_bytes
+        envelope = self._remote_prepare_execute(
+            workspace_ref=workspace_ref,
+            operation=MEDIA_EXPORT_OPERATION,
+            args=native_args,
+            authorize=False,
+        )
+        from ouroboros.workspace_diagnostics import publish_execution_envelope
+
+        publish_execution_envelope(envelope)
+        if envelope.diagnostic is not None:
+            return envelope.text
+        if len(envelope.artifacts) != 1:
+            return "⚠️ REMOTE_MEDIA_ERROR: target returned an invalid file declaration."
+        artifact = envelope.artifacts[0]
+        blob_id = str(artifact.get("blob_id") or "")
+        digest = str(artifact.get("sha256") or "")
+        size = int(artifact.get("size") or -1)
+        if (
+            blob_id != digest
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or size < 0
+            or size > max_bytes
+        ):
+            return "⚠️ REMOTE_MEDIA_ERROR: target returned invalid file integrity facts."
+        data = get_remote_workspace_service().fetch_blob(
+            dict(workspace_ref),
+            blob_id,
+            max_bytes=max(1, size),
+        )
+        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            return "⚠️ REMOTE_MEDIA_ERROR: imported file failed integrity verification."
+
+        import shutil
+
+        cache_root = (
+            pathlib.Path(self._ctx.task_drive_root())
+            / "remote_media_cache"
+        )
+        cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(cache_root, 0o700)
+        temporary = cache_root / uuid.uuid4().hex
+        temporary.mkdir(exist_ok=False, mode=0o700)
+        os.chmod(temporary, 0o700)
+        name_hint = pathlib.PurePosixPath(
+            str(artifact.get("name") or "")
+        ).name
+        suffix = pathlib.PurePosixPath(name_hint).suffix
+        suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,16}", suffix) else ""
+        target = temporary / f"{digest}{suffix}"
+        descriptor = os.open(
+            str(target),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        local_args = copy.deepcopy(args)
+        local_args[str(source["arg_key"])] = str(target)
+        try:
+            inspect.signature(entry.handler).bind(self._ctx, **local_args)
+            return str(entry.handler(self._ctx, **local_args))
+        except TypeError:
+            return _format_tool_arg_error(entry)
+        except Exception as exc:
+            return f"⚠️ TOOL_ERROR ({name}): {exc}"
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+            try:
+                cache_root.rmdir()
+            except OSError:
+                pass
+
+    def _maybe_execute_remote(
+        self,
+        *,
+        name: str,
+        entry: Any,
+        args: Dict[str, Any],
+        runtime_mode: str,
+        ext_tool: Mapping[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Dispatch the SSH-owned half, or decline cleanly to the Home path."""
+
+        try:
+            from ouroboros.workspace_ref import workspace_ref_for
+
+            workspace_ref = workspace_ref_for(self._ctx)
+        except Exception:
+            workspace_ref = None
+        if workspace_ref is None or workspace_ref["kind"] != "ssh":
+            return False, ""
+        if (
+            ext_tool
+            and str(ext_tool.get("execution_affinity") or "home")
+            == "active_workspace"
+        ):
+            from ouroboros.extension_loader import parse_extension_surface_name
+            from ouroboros.tools.skill_exec import build_remote_reviewed_payload
+
+            parsed_surface = parse_extension_surface_name(name)
+            short_surface = parsed_surface[1] if parsed_surface else ""
+            error, package, payload_blobs = build_remote_reviewed_payload(
+                self._ctx,
+                skill_name=str(ext_tool.get("skill") or ""),
+                surface=short_surface,
+                registered_surface=name,
+                call_args=args,
+                repo_path=str(ext_tool.get("skills_repo_path") or "") or None,
+            )
+            if error:
+                return True, error
+            if package is None:
+                return True, (
+                    "⚠️ REMOTE_PAYLOAD_BLOCKED: active_workspace extension "
+                    "affinity could not be bound to a reviewed payload."
+                )
+            return True, self._execute_remote_reviewed_payload(
+                workspace_ref=workspace_ref,
+                package=package,
+                blobs=payload_blobs,
+                safety_tool=name,
+                safety_args=args,
+            )
+        if name == "skill_exec":
+            from ouroboros.tools.skill_exec import build_remote_reviewed_payload
+
+            error, package, payload_blobs = build_remote_reviewed_payload(
+                self._ctx,
+                skill_name=str(args.get("skill") or ""),
+                script_rel=str(args.get("script") or ""),
+                call_args=args.get("args"),
+            )
+            if error:
+                return True, error
+            if package is not None:
+                return True, self._execute_remote_reviewed_payload(
+                    workspace_ref=workspace_ref,
+                    package=package,
+                    blobs=payload_blobs,
+                    safety_tool=name,
+                    safety_args=args,
+                )
+        route_note, terminal = self._remote_classify_ambiguous_paths(
+            workspace_ref,
+            name,
+            args,
+        )
+        if terminal:
+            return True, route_note
+        if name in {"view_image", "ocr_pdf", "vlm_query"}:
+            media_source = self._remote_media_source(
+                workspace_ref,
+                name,
+                args,
+            )
+            if media_source is not None:
+                return True, self._execute_remote_media(
+                    workspace_ref=workspace_ref,
+                    name=name,
+                    entry=entry,
+                    args=args,
+                    source=media_source,
+                )
+        if (
+            name == "verify_and_record"
+            and str(args.get("contract_kind") or "")
+            in {"visible_verifier", "explicit_command", "explicit_metric"}
+            and self._remote_dispatch_selected(
+                workspace_ref,
+                "run_command",
+                args,
+            )
+        ):
+            return True, self._execute_remote_verify(
+                workspace_ref=workspace_ref,
+                entry=entry,
+                args=args,
+                runtime_mode=runtime_mode,
+            )
+        if name == "extract_video_frames":
+            media_path = str(args.get("path") or "").replace("\\", "/")
+            remote_root = str(workspace_ref.get("remote_root") or "").rstrip("/")
+            if (
+                not is_absolute_path_text(media_path)
+                or media_path == remote_root
+                or media_path.startswith(remote_root + "/")
+            ):
+                return True, self._execute_remote_frames(
+                    workspace_ref=workspace_ref,
+                    entry=entry,
+                    args=args,
+                )
+        if self._remote_dispatch_selected(workspace_ref, name, args):
+            return True, self._execute_remote_direct(
+                workspace_ref=workspace_ref,
+                name=name,
+                entry=entry,
+                args=args,
+                runtime_mode=runtime_mode,
+                route_note=route_note,
+            )
+        return False, ""
+
+    @staticmethod
+    def _stage_root_dependent_home_authority(route_note: str) -> str:
+        """Stage 4: reject a target-classified route before native preparation."""
+
+        if route_note.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE"):
+            return route_note
+        return ""
+
+    def _stage_native_fact_preparation(
         self,
         name: str,
         args: Dict[str, Any],
@@ -2504,7 +3822,26 @@ class ToolRegistry:
             )
         return args, python_resolution, ""
 
-    def _invoke_builtin_handler(
+    def _stage_home_policy_and_safety(
+        self,
+        name: str,
+        args: Mapping[str, Any],
+        python_resolution: Any,
+    ) -> tuple[str, str]:
+        """Stage 6: apply the LLM safety policy to the canonical arguments."""
+
+        from ouroboros.safety import check_safety
+
+        is_safe, safety_msg = check_safety(
+            name,
+            args,
+            messages=getattr(self._ctx, "messages", None),
+            ctx=self._ctx,
+            python_resolution=python_resolution,
+        )
+        return ("" if is_safe else safety_msg), safety_msg
+
+    def _stage_execute_prepared(
         self,
         name: str,
         entry: Any,
@@ -2523,7 +3860,6 @@ class ToolRegistry:
         try:
             try:
                 if entry is not None:
-                    _normalize_tool_call_args(entry, args)
                     public_params = set(_entry_public_params(entry))
                     if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
                         return _format_tool_arg_error(entry), None
@@ -2551,19 +3887,40 @@ class ToolRegistry:
             if worktree_before is not None:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
+    def _stage_home_post_processing(
+        self,
+        name: str,
+        result: str,
+        route_note: str,
+        safety_msg: str,
+        *,
+        owner_snapshot: Dict[pathlib.Path, Optional[str]],
+        light_repo_before: Optional[Dict[str, Any]],
+        workspace_refs_before: Optional[Dict[str, str]],
+    ) -> str:
+        """Stage 8: preserve existing process postchecks and note composition."""
+
+        if name in _PROCESS_COMMAND_TOOLS:
+            result = self._run_shell_post_checks(
+                result,
+                owner_snapshot=owner_snapshot,
+                light_repo_before=light_repo_before,
+                workspace_refs_before=workspace_refs_before,
+                tool_name=name,
+            )
+        return _compose_execute_result(result, route_note, safety_msg)
+
     def execute(self, name: str, args: Dict[str, Any]) -> str:
-        name = str(name or "").strip()
-        args = dict(args or {})
-        _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
-        if _route_note.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE"):
-            return _route_note
+        name, args, entry, _placement = self._stage_raw_lookup_and_lexical_placement(
+            name,
+            args,
+        )
         task_constraint = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
         acting_self_worktree = acting_subagent and str(getattr(task_constraint, "surface", "") or "") == "self_worktree"
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = set(getattr(task_constraint, "external_tool_grants", ()) or ()) if acting_subagent else set()
-        entry = self._entries.get(name)
         ext_tool = None
         try:
             from ouroboros.extension_loader import parse_extension_surface_name as _ext_parse_name
@@ -2590,28 +3947,18 @@ class ToolRegistry:
             except Exception:
                 _mcp_is_name = None
         is_mcp = bool(_mcp_is_name and _mcp_is_name(name))
-        _eph = self._ephemeral_block(name, ext_tool, is_mcp)  # CW3: built-in deny set + extension/MCP
-        if _eph:
-            return _eph
-        if name in _disabled_tools(self._ctx):
-            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {name!r} for this task."
-        available, unavailable_reason, unavailable_detail = _builtin_tool_availability(name, self._ctx)
-        if not available:
-            suffix = f" ({unavailable_detail})" if unavailable_detail else ""
-            return f"⚠️ CAPABILITY_UNAVAILABLE: {name!r} is unavailable: {unavailable_reason}{suffix}."
-        if name == "vlm_query" and str(args.get("image_url") or "").strip() and (
-            not _resource_allowed(self._ctx, "web") or not _resource_allowed(self._ctx, "network")
-        ):
-            return "⚠️ RESOURCE_CONSTRAINT_BLOCKED: remote image_url for vlm_query requires allowed_resources.web/network."
-        if name in _WEB_TOOLS and not _resource_allowed(self._ctx, "web"):
-            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.web=false blocks {name!r}."
-        if (is_mcp or ext_tool) and not _resource_allowed(self._ctx, "network"):
-            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks external tool {name!r}."
-        _gate = self._subagent_and_update_gate(
-            name, entry, ext_tool, is_mcp, local_readonly_subagent, acting_subagent, acting_tool_grants
+        authority_block = self._stage_non_path_home_authority(
+            name,
+            args,
+            entry,
+            ext_tool,
+            is_mcp,
+            local_readonly_subagent,
+            acting_subagent,
+            acting_tool_grants,
         )
-        if _gate:
-            return _gate
+        if authority_block:
+            return authority_block
 
         workspace_block_reason = ""
         try:
@@ -2661,6 +4008,16 @@ class ToolRegistry:
             heal_block = self._heal_mode_block(name, args, task_constraint, ext_tool, is_mcp)
             if heal_block:
                 return heal_block
+        if ext_tool:
+            remote_handled, remote_result = self._maybe_execute_remote(
+                name=name,
+                entry=entry,
+                args=args,
+                runtime_mode=_runtime_mode,
+                ext_tool=ext_tool,
+            )
+            if remote_handled:
+                return remote_result
         if is_mcp:
             return self._dispatch_mcp_tool(name, args)
         if entry is None:
@@ -2721,11 +4078,31 @@ class ToolRegistry:
             effective_constraint = task_constraint
         else:
             effective_constraint = synth_constraint or task_constraint
-        args, python_resolution, python_block = self._resolve_python_predispatch(
+
+        remote_handled, remote_result = self._maybe_execute_remote(
+            name=name,
+            entry=entry,
+            args=args,
+            runtime_mode=_runtime_mode,
+        )
+        if remote_handled:
+            return remote_result
+
+        _route_note = self._stage_target_classification(name, args)
+        route_block = self._stage_root_dependent_home_authority(_route_note)
+        if route_block:
+            return route_block
+
+        args, python_resolution, python_block = self._stage_native_fact_preparation(
             name, args, _runtime_mode, effective_constraint,
         )
         if python_block:
             return python_block
+        args = canonical_execution_args(
+            entry,
+            args,
+            {"execution_args": args},
+        )
         allow_short_relative = bool(
             effective_constraint and effective_constraint.mode == "skill_repair"
         )
@@ -2797,17 +4174,13 @@ class ToolRegistry:
             if block_msg:
                 return block_msg
 
-        # LLM safety supervisor.
-        from ouroboros.safety import check_safety
-        is_safe, safety_msg = check_safety(
+        safety_block, safety_msg = self._stage_home_policy_and_safety(
             name,
             args,
-            messages=getattr(self._ctx, "messages", None),
-            ctx=self._ctx,
-            python_resolution=python_resolution,
+            python_resolution,
         )
-        if not is_safe:
-            return safety_msg
+        if safety_block:
+            return safety_block
         owner_snapshot = self._snapshot_owner_files() if name in _PROCESS_COMMAND_TOOLS else {}
         light_repo_before = (
             _light_repo_snapshot(system_repo_dir_for(self._ctx))
@@ -2822,21 +4195,20 @@ class ToolRegistry:
         worktree_before = (
             self._worktree_status_snapshot() if entry.mutates_worktree else None
         )
-        early_error, result = self._invoke_builtin_handler(
+        early_error, result = self._stage_execute_prepared(
             name, entry, args, python_resolution, worktree_before,
         )
         if early_error is not None:
             return early_error
-        if name in _PROCESS_COMMAND_TOOLS:
-            result = self._run_shell_post_checks(
-                result,
-                owner_snapshot=owner_snapshot,
-                light_repo_before=light_repo_before,
-                workspace_refs_before=workspace_refs_before,
-                tool_name=name,
-            )
-
-        return _compose_execute_result(result, _route_note, safety_msg)
+        return self._stage_home_post_processing(
+            name,
+            result,
+            _route_note,
+            safety_msg,
+            owner_snapshot=owner_snapshot,
+            light_repo_before=light_repo_before,
+            workspace_refs_before=workspace_refs_before,
+        )
 
     def _worktree_status_snapshot(self) -> str:
         try:
@@ -2875,6 +4247,31 @@ class ToolRegistry:
                 timeout_sec=entry.timeout_sec,
                 mutates_worktree=entry.mutates_worktree,
             )
+
+    def workspace_capability_manifest(
+        self,
+        *,
+        repo_root: pathlib.Path,
+    ) -> Dict[str, Any]:
+        """Build execd compatibility from the registry's unfiltered built-ins.
+
+        This intentionally bypasses per-task visibility/dynamic filtering while
+        still deriving every public schema from the one ``_entries`` SSOT.
+        """
+
+        from ouroboros.tool_capabilities import (
+            WORKSPACE_TOOL_EXECUTION_AFFINITY,
+            build_workspace_capability_manifest,
+        )
+
+        public_schemas = [
+            self._schema_for_entry(self._entries[name])
+            for name in sorted(WORKSPACE_TOOL_EXECUTION_AFFINITY)
+        ]
+        return build_workspace_capability_manifest(
+            public_schemas,
+            repo_root=pathlib.Path(repo_root),
+        )
 
     @property
     def CODE_TOOLS(self) -> frozenset:

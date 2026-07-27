@@ -447,14 +447,21 @@ _TREE_FLUSH_SENTENCE = (
 def _workspace_delivery(ctx: Any) -> bool:
     """True when the task's deliverable is a workspace tree. Prefers the
     canonical ``ToolContext.is_workspace_mode()`` authority (registry.py);
-    falls back to the raw attribute for lightweight test contexts."""
+    falls back to its dependency-light helper for lightweight contexts."""
+    from ouroboros.workspace_ref import (
+        RemoteWorkspacePathError,
+        has_workspace,
+    )
+
     probe = getattr(ctx, "is_workspace_mode", None)
     if callable(probe):
         try:
             return bool(probe())
+        except RemoteWorkspacePathError:
+            raise
         except Exception:
             return False
-    return bool(getattr(ctx, "workspace_root", None))
+    return has_workspace(ctx)
 
 
 def build_time_budget_note(

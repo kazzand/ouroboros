@@ -345,7 +345,12 @@ body.resizing-panels { user-select: none; }
 .chat-live-actions {
     display: flex;
     justify-content: flex-end;
+    gap: var(--space-2);
     padding: 0 var(--space-3) var(--space-2);
+}
+
+.chat-live-remote-actions {
+    flex-wrap: wrap;
 }
 
 .chat-live-project-btn {
@@ -3464,6 +3469,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     display: flex;
     flex-direction: column;
     min-width: 0;
+    flex: 1;
 }
 
 .activity-name {
@@ -3495,11 +3501,106 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-style: italic;
 }
 
+.activity-notice {
+    padding: 9px 12px;
+    border: 1px solid rgba(96, 165, 250, 0.28);
+    border-radius: 8px;
+    color: rgba(219, 234, 254, 0.92);
+    background: rgba(59, 130, 246, 0.09);
+    font-size: 12px;
+}
+
+.activity-notice[data-tone="warn"] {
+    border-color: rgba(251, 191, 36, 0.32);
+    color: #fde68a;
+    background: rgba(245, 158, 11, 0.09);
+}
+
+.activity-connection-state {
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: rgba(191, 219, 254, 0.9);
+    background: rgba(59, 130, 246, 0.13);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.activity-connection-state[data-state="ready"] {
+    color: #bbf7d0;
+    background: rgba(34, 197, 94, 0.13);
+}
+
+.activity-connection-state[data-state="warn"],
+.activity-connection-state[data-state="unknown"] {
+    color: #fde68a;
+    background: rgba(245, 158, 11, 0.13);
+}
+
+.activity-remote-details {
+    max-width: min(760px, 100%);
+    margin-top: 6px;
+    font-size: 11px;
+    color: rgba(191, 219, 254, 0.82);
+}
+
+.activity-remote-details > summary {
+    cursor: pointer;
+}
+
+.activity-remote-evidence {
+    margin-top: 6px;
+}
+
+.activity-remote-evidence > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.activity-remote-evidence a {
+    color: #93c5fd;
+}
+
+.activity-remote-evidence pre {
+    max-height: 180px;
+    margin: 4px 0 0;
+    padding: 8px;
+    overflow: auto;
+    border-radius: 6px;
+    background: rgba(2, 6, 23, 0.55);
+    color: rgba(226, 232, 240, 0.86);
+    font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .activity-empty,
 .activity-loading {
     font-size: 13px;
     color: rgba(148, 163, 184, 0.75);
     padding: 8px 2px;
+}
+
+@media (max-width: 640px) {
+    .activity-scroll {
+        padding: 12px;
+    }
+
+    .activity-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .activity-row-actions {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+    }
+
+    .activity-sub {
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
 }
 
 /* P2: main-screen Update pill + staged choice dialog. */
@@ -5494,11 +5595,16 @@ textarea.chat-input {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     gap: 8px;
     padding: 6px 10px;
     border-bottom: 1px solid var(--divider);
     font-size: 12px;
     word-break: break-all;
+}
+
+.new-project-dir-status {
+    color: var(--text-muted);
 }
 
 .new-project-browser-list {

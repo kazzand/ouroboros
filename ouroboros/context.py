@@ -210,11 +210,13 @@ def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
 def _task_uses_external_context(task: Dict[str, Any]) -> bool:
     """Return True for structured headless/workspace/delegated task surfaces."""
 
+    from ouroboros.workspace_ref import has_workspace
+
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     source = str(metadata.get("source") or task.get("source") or "").strip().lower()
     actor = str(task.get("actor_id") or metadata.get("actor_id") or "").strip().lower()
     delegation_role = str(task.get("delegation_role") or metadata.get("delegation_role") or "").strip().lower()
-    if str(task.get("workspace_root") or metadata.get("workspace_root") or "").strip():
+    if has_workspace(task):
         return True
     if delegation_role == "subagent":
         return True
@@ -271,6 +273,33 @@ _DECISION_TURN_OUTCOME_RULE = (
     "of future work that no tool call actually scheduled is a forbidden "
     "outcome — an unscheduled promise reads to the owner as work in motion."
 )
+
+
+def _active_workspace_runtime_projection(task: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Return the model-facing placement without exposing transport identity."""
+
+    from ouroboros.workspace_ref import has_workspace, workspace_ref_for
+
+    if not has_workspace(task):
+        return None
+    projection: Dict[str, Any] = {
+        "workspace_mode": str(task.get("workspace_mode") or ""),
+        "memory_mode": str(task.get("memory_mode") or ""),
+        "rule": (
+            "read_file/write_file/list_files/search_code/run_command target the active workspace; "
+            "Ouroboros self-review/commit tools are unavailable; final changes are exported as artifacts."
+        ),
+    }
+    local_root = str(task.get("workspace_root") or "").strip()
+    workspace_ref = workspace_ref_for(task)
+    if local_root:
+        projection["workspace_root"] = local_root
+    elif workspace_ref and workspace_ref["kind"] == "ssh":
+        projection["workspace_ref"] = {
+            "kind": "ssh",
+            "remote_root": workspace_ref["remote_root"],
+        }
+    return projection
 
 
 def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
@@ -336,16 +365,9 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
         "task_contract, [ATTACHMENTS], disabled_tools, filesystem roots, and queue "
         "capacity here when they conflict with older prompt wording."
     )
-    if str(task.get("workspace_root") or "").strip():
-        runtime_data["active_workspace"] = {
-            "workspace_root": str(task.get("workspace_root") or ""),
-            "workspace_mode": str(task.get("workspace_mode") or ""),
-            "memory_mode": str(task.get("memory_mode") or ""),
-            "rule": (
-                "read_file/write_file/list_files/search_code/run_command target the active workspace; "
-                "Ouroboros self-review/commit tools are unavailable; final changes are exported as artifacts."
-            ),
-        }
+    active_workspace = _active_workspace_runtime_projection(task)
+    if active_workspace is not None:
+        runtime_data["active_workspace"] = active_workspace
     if str(runtime_mode).lower() == "light":
         runtime_data["runtime_mode_rule"] = (
             "light mode forbids Ouroboros repo mutation and control-plane mutation, not user-file work; "
@@ -485,8 +507,10 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     # the robot-room incident was exactly a fact/affordance split. A set-but-broken
     # working_dir is disclosed loudly instead of a silent system-repo fallback.
     try:
+        from ouroboros.workspace_ref import has_workspace
+
         _room_pid = str(task.get("project_id") or "").strip()
-        if _room_pid and not str(task.get("workspace_root") or "").strip():
+        if _room_pid and not has_workspace(task):
             from ouroboros.config import DATA_DIR as _DATA_DIR
             from ouroboros.projects_registry import get_project as _get_project
             from ouroboros.workspace_admission import room_chat_lens_dir as _room_lens

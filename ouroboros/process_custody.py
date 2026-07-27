@@ -109,8 +109,13 @@ def record_process(
     purpose: str,
     scope: str,
     owner_task_id: str = "",
-) -> Dict[str, Any]:
-    """Append a custody record for an already-spawned process."""
+) -> Optional[Dict[str, Any]]:
+    """Append a custody record for an already-spawned process.
+
+    ``None`` means the ledger write failed. Existing callers remain fail-soft;
+    process owners that cannot safely tolerate an unledgered child opt into
+    ``spawn_supervised(required_custody=True)``.
+    """
     if scope not in _VALID_SCOPES:
         raise ValueError(f"process custody scope must be one of {_VALID_SCOPES}, got {scope!r}")
     try:
@@ -132,8 +137,27 @@ def record_process(
         "owner_task": str(owner_task_id or ""),
         "session_id": _SESSION_ID,
     }
-    append_jsonl(ledger_path(drive_root), entry)
-    return entry
+    return entry if append_jsonl(ledger_path(drive_root), entry) else None
+
+
+def _kill_uncustodied_child(proc: subprocess.Popen) -> None:
+    """Best-effort group kill for a child that could not enter custody."""
+
+    try:
+        pgid = process_group_id(proc.pid)
+        if pgid:
+            kill_process_group_id(pgid)
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 
 
 def spawn_supervised(
@@ -144,6 +168,7 @@ def spawn_supervised(
     scope: str,
     owner_task_id: str = "",
     new_process_group: bool = True,
+    required_custody: bool = False,
     **popen_kwargs: Any,
 ) -> subprocess.Popen:
     """Popen + durable custody record (the single supervised chokepoint).
@@ -152,13 +177,15 @@ def spawn_supervised(
     spawning worker cannot orphan the child invisibly — the reaper finds it
     in the ledger on the next generation.
     """
+    if required_custody and not new_process_group:
+        raise ValueError("required custody needs an isolated process group")
     if new_process_group:
         merged = dict(subprocess_new_group_kwargs())
         merged.update(popen_kwargs)
         popen_kwargs = merged
     proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 — callers pass vetted argv lists
     try:
-        record_process(
+        record = record_process(
             drive_root,
             pid=proc.pid,
             cmd=cmd,
@@ -166,8 +193,20 @@ def spawn_supervised(
             scope=scope,
             owner_task_id=owner_task_id,
         )
+        if required_custody and record is None:
+            raise RuntimeError(
+                f"required process custody registration failed for {purpose or proc.pid}"
+            )
     except Exception:
-        log.warning("process custody record failed for pid %s (%s)", proc.pid, purpose, exc_info=True)
+        if required_custody:
+            _kill_uncustodied_child(proc)
+            raise
+        log.warning(
+            "process custody record failed for pid %s (%s)",
+            proc.pid,
+            purpose,
+            exc_info=True,
+        )
     return proc
 
 

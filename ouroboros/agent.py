@@ -457,7 +457,13 @@ class OuroborosAgent:
         # robot-room incident: "." resolved to the system repo and the agent
         # narrated the wrong tree). A set-but-broken working_dir rides as a LOUD
         # note instead (never a silent repo fallback).
-        if bool(task.get("_is_direct_chat")) and _resolved_project_id and not str(task.get("workspace_root") or "").strip():
+        from ouroboros.workspace_ref import has_workspace
+
+        if (
+            bool(task.get("_is_direct_chat"))
+            and _resolved_project_id
+            and not has_workspace(task)
+        ):
             try:
                 from ouroboros.workspace_admission import room_chat_lens_dir
 

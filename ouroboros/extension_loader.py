@@ -28,7 +28,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from ouroboros.contracts.plugin_api import (
     ExtensionRegistrationError,
@@ -93,6 +93,7 @@ class _PluginAPIConfig:
     env_allowlist: Sequence[str]
     state_dir: pathlib.Path
     settings_reader: Callable[[], Dict[str, Any]]
+    tool_execution_affinity: Mapping[str, str] | None = None
     drive_root: pathlib.Path | None = None
     granted_keys: Sequence[str] | None = None
     subscribe_events: Sequence[str] | None = None
@@ -275,11 +276,22 @@ def _register_out_of_process_surfaces(
         bundle.import_root = None
         _load_failures.pop(skill.name, None)
 
+        declared_affinity = dict(skill.manifest.tool_execution_affinity or {})
+        registered_short_names: set[str] = set()
+        expected_prefix = extension_name_prefix(skill.name)
         for raw in catalog.get("tools") or []:
             item = _validate_child_tool_descriptor(skill.name, dict(raw or {}))
             name = str(item.get("name") or "")
             if not name:
                 continue
+            short_name = name[len(expected_prefix):]
+            registered_short_names.add(short_name)
+            from ouroboros.tool_capabilities import normalize_dynamic_execution_affinity
+
+            item["execution_affinity"] = normalize_dynamic_execution_affinity(
+                declared_affinity.get(short_name),
+                present=short_name in declared_affinity,
+            )
             if name in _tools:
                 raise ExtensionRegistrationError(f"tool {name!r} already registered")
             item["handler"] = _out_of_process_handler_proxy
@@ -288,6 +300,12 @@ def _register_out_of_process_surfaces(
             item["skills_repo_path"] = str(skill.skill_dir.parent)
             _tools[name] = item
             bundle.tools.append(name)
+        unknown_affinity_names = set(declared_affinity) - registered_short_names
+        if unknown_affinity_names:
+            raise ExtensionRegistrationError(
+                "tool_execution_affinity names tools that were not registered: "
+                f"{sorted(unknown_affinity_names)}"
+            )
 
         for raw in catalog.get("routes") or []:
             item = _validate_child_route_descriptor(skill.name, dict(raw or {}))
@@ -573,6 +591,17 @@ class PluginAPIImpl:
         self._runtime_skill_dir = pathlib.Path(config.runtime_skill_dir) if config.runtime_skill_dir is not None else self._skill_dir
         self._dependency_site_dirs_enabled = bool(config.dependency_site_dirs_enabled)
         self._settings_reader = config.settings_reader
+        from ouroboros.tool_capabilities import normalize_dynamic_execution_affinity
+
+        self._tool_execution_affinity = {
+            str(name).strip(): normalize_dynamic_execution_affinity(value, present=True)
+            for name, value in (config.tool_execution_affinity or {}).items()
+        }
+        if any(not name for name in self._tool_execution_affinity):
+            raise ExtensionRegistrationError(
+                "tool_execution_affinity tool names must be non-empty"
+            )
+        self._registered_tool_short_names: set[str] = set()
         self._registration_closed = False
         self._runtime_closing = False
         self._runtime_closed = False
@@ -705,6 +734,12 @@ class PluginAPIImpl:
         # keyword-only / zero-arg handlers). Dispatch reads this stored flag.
         from ouroboros.extension_process_runner import _handler_wants_ctx
         wants_ctx = _handler_wants_ctx(handler)
+        from ouroboros.tool_capabilities import normalize_dynamic_execution_affinity
+
+        execution_affinity = normalize_dynamic_execution_affinity(
+            self._tool_execution_affinity.get(short),
+            present=short in self._tool_execution_affinity,
+        )
         with _lock:
             self._register_surface_locked(_tools, full, {
                 "name": full,
@@ -714,9 +749,11 @@ class PluginAPIImpl:
                 "schema": dict(schema or {}),
                 "timeout_sec": max(1, int(timeout_sec)),
                 "skill": self._skill,
+                "execution_affinity": execution_affinity,
                 **({"_model_credential_probe": self._model_credential_available}
                    if current_execution_mode() is ExecutionMode.IN_PROCESS else {}),
             }, "tools", "tool")
+            self._registered_tool_short_names.add(short)
 
     def register_route(
         self,
@@ -1026,6 +1063,15 @@ class PluginAPIImpl:
     def _close_registration(self) -> None:
         with _lock:
             self._registration_closed = True
+            unknown = (
+                set(self._tool_execution_affinity)
+                - self._registered_tool_short_names
+            )
+            if unknown:
+                raise ExtensionRegistrationError(
+                    "tool_execution_affinity names tools that were not registered: "
+                    f"{sorted(unknown)}"
+                )
 
     def _close_runtime_access(self) -> None:
         with _lock:
@@ -1800,6 +1846,9 @@ def load_extension(
                 env_allowlist=list(skill.manifest.env_from_settings or []),
                 state_dir=state_dir,
                 settings_reader=settings_reader,
+                tool_execution_affinity=dict(
+                    skill.manifest.tool_execution_affinity or {}
+                ),
                 drive_root=pathlib.Path(drive_root),
                 granted_keys=granted_core,
                 subscribe_events=list(getattr(skill.manifest, "subscribe_events", []) or []),

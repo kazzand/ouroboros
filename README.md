@@ -126,6 +126,89 @@ ouroboros schedule list
 
 External workspaces must be separate Git worktree roots and may not overlap Ouroboros's own repository or data directory. Patch, streaming, detached-task, and schedule semantics are documented in the CLI help and the canonical [architecture](docs/ARCHITECTURE.md).
 
+### Remote SSH Projects
+
+Remote SSH workspaces keep one Ouroboros mind on **Home**: models, identity,
+memory, policy, review, task state, provider/MCP credentials, and the UI/CLI all
+remain on the machine running Ouroboros. A restricted `ouroboros-execd` runs
+native file, Git, and process operations in the selected remote Git worktree.
+Local and SSH projects expose the same model-facing tool names and schemas;
+placement changes the executor, not the model's faculty set.
+
+Setup is owner-driven:
+
+1. Configure an ordinary alias in Home's `~/.ssh/config` and complete its first
+   host-key, password, or MFA interaction in a normal terminal. Ouroboros uses
+   local OpenSSH and `ssh-agent`; it neither stores nor uploads SSH credentials.
+2. Configure an Ouroboros **Network Password** and restart. The owner-only
+   connection API requires it even on loopback; this password authenticates
+   Settings/CLI to Ouroboros and is unrelated to SSH authentication.
+3. Open **Settings → Connections**, add the alias, then **Test** and
+   **Bootstrap** it. Bootstrap uploads the matching standalone executor from
+   Home, so the target needs no Python, `sudo`, systemd, listening port, or
+   outbound internet. Test is only a transport/platform probe: it does not pin
+   target identity or make the connection selectable. The first successful
+   Bootstrap performs the execd handshake, pins continuity, and records healthy
+   compatibility for the current Home process.
+4. Create a Project, choose **SSH**, select the healthy connection, browse to
+   the remote folder, and attach its Git worktree. Remote tasks are
+   Project-only and keep that placement for their lifetime.
+
+The thin CLI provides the same six owner-administration actions:
+
+```bash
+ouroboros connections list [--json]
+ouroboros connections add --name NAME --ssh-alias ALIAS [--json]
+ouroboros connections test ID [--json]
+ouroboros connections bootstrap ID [--json]
+ouroboros connections retrust ID [--json]
+ouroboros connections retire ID [--json]
+```
+
+These commands prompt for the Network Password on a controlling terminal. The
+CLI intentionally has no remote task runner, terminal, or TUI; create/select
+remote Projects in the UI and work in their ordinary Project room.
+
+V1 execd targets are GNU/glibc Linux `x86_64` and `aarch64` (glibc 2.17 or
+newer). macOS/Windows targets, Alpine/musl, non-Git folders, remote desktop,
+general SOCKS/private-network proxying, arbitrary remote environment injection,
+and task handoff between machines are not supported. Shell commands run with
+the selected remote Unix account's authority; execd is a placement and custody
+boundary, not a container sandbox.
+
+OpenSSH `known_hosts` remains the transport trust authority. Ouroboros
+additionally pins execd's continuity ID after the first successful Bootstrap;
+Test never changes that pin. This ID is not a hardware identity or a
+replacement for `known_hosts`. If it changes, verify the host through normal
+OpenSSH first, then use **Retrust** and confirm the old/new IDs while no task or
+lease is active. Live compatibility/health evidence is intentionally
+process-local, so after restarting Home run the fast Bootstrap check again
+before selecting that connection for a new Project. **Reconnect** is a separate
+UI action for rebuilding and reconciling already admitted Project sessions; it
+is not another name for Test and is intentionally absent from the six-command
+owner CLI.
+
+Common setup failures are intentionally fail-closed:
+
+- **Auth/host trust:** run `ssh ALIAS true` in a normal Home terminal, resolve
+  the prompt there, then Test again. Ouroboros never answers interactive SSH
+  prompts.
+- **Owner auth not configured:** set the Network Password in Settings, restart,
+  sign in, and reopen Connections. CLI commands cannot take it from argv,
+  environment variables, or a pipe.
+- **Unsupported platform or missing bundle:** use a supported GNU/glibc target
+  and an Ouroboros build that contains the matching execd asset; Bootstrap
+  never falls back to remote Python.
+- **Host/workspace identity changed:** do not bypass the mismatch. Verify the
+  machine or Git worktree replacement, then Retrust or rebind the Project.
+- **`completion_unknown`:** transport ended after a mutation may have started.
+  Inspect the task's diagnostic, request ID, stdout/stderr, and imported
+  artifacts before retrying; Ouroboros does not blindly repeat it.
+
+For failure phases, lifecycle behavior, data locations, credential boundaries,
+browser loopback forwarding, and troubleshooting, see
+[Remote SSH workspace placement](docs/ARCHITECTURE.md#remote-ssh-workspace-placement).
+
 ### For Agents
 
 Another agent, script, or CI job can invoke Ouroboros through the same gateway-backed CLI:

@@ -117,8 +117,30 @@ class TestBrowserModuleState:
             ("**/api/owner/skills/**", browser_mod._block_owner_skill_attest_post),
             ("**/api/settings", browser_mod._block_owner_settings_post),
         ]
-        # v6.26.0: the main agent gets a metadata-only SSRF route guard too.
-        assert len(routes) == 6 and routes[5][0] == "**/*"
+        # Playwright invokes matching handlers in reverse registration order:
+        # the terminal SSRF guard falls back to the Connections catch-all,
+        # which falls back to these five precise owner guards. This preserves
+        # encoded-path coverage without shadowing an older guard.
+        assert routes[5] == (
+            "**/*",
+            browser_mod._block_owner_connections_request,
+        )
+        assert len(routes) == 7 and routes[6][0] == "**/*"
+
+        connection_events = []
+        connection_route = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                url="http://127.0.0.1:8765/api%2Fowner%2Fconnections%2Fc1",
+            ),
+            abort=lambda: connection_events.append("abort"),
+            fallback=lambda: connection_events.append("fallback"),
+        )
+        routes[5][1](connection_route)
+        connection_route.request.url = (
+            "http://127.0.0.1:8765/api/owner/connectionsevil"
+        )
+        routes[5][1](connection_route)
+        assert connection_events == ["abort", "fallback"]
 
         browser_mod._ensure_browser(ctx, engine="webkit", device="iphone 13")
         assert contexts[-1].kwargs["viewport"] == {"width": 390, "height": 844}

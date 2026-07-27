@@ -92,6 +92,36 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
 - External workspace support must keep Ouroboros governance context pinned to
   the system repo while contextual repo tools resolve against the active
   workspace through `ToolContext.active_repo_dir()`.
+- An SSH workspace has no native Home path. Use the sealed `workspace_ref` and
+  executor placement; a Home `Path` request must fail loudly and must never
+  fall back to the system repo. Local and SSH placement must expose the same
+  model-facing tool names/schemas at equal role/runtime/resource policy.
+- Home-only consumers of SSH source must use the shared stable snapshot bridge,
+  verify every declared blob, and clean the temporary mirror on success and
+  failure. A remote mutation imported from a Home model requires the exact
+  source/HEAD/index precondition, a complete before→after change manifest,
+  `git apply --check`, an expected post-content fingerprint, and explicit
+  rollback evidence. Never copy Home model/provider credentials to execd.
+- Fetch externalized remote process/result blobs only from envelope-declared
+  size/SHA refs under per-blob and aggregate caps. Redact and durably publish
+  Home task artifacts before result ACK; an integrity/import failure remains
+  typed `phase=import, completion=completed` and must not ACK. Keep model text
+  bounded and expose safe Home refs rather than remote CAS identities.
+- Remote loopback browsing uses only the broker-owned non-multiplexed local
+  forward. Reject inherited SSH forwards/commands/environment effects before
+  spawn, bind only Home and remote loopback, require process custody, retry a
+  bounded ephemeral-port race, and route-block the bridged page from unrelated
+  Home/private origins. Do not add SOCKS, generic private-network proxying or a
+  browser-only model schema.
+- Connection administration stays owner-only and thin. The CLI surface is
+  exactly `connections list/add/test/bootstrap/retrust/retire`, backed by the
+  same authenticated gateway as Settings; do not add a remote task runner,
+  terminal emulator, TUI, SSH password store, or per-tool SSH command path.
+  `test` is a read-only transport/platform probe and must not initialize or
+  change the execd continuity pin. The first successful `bootstrap` may pin
+  continuity; compatibility plus fresh health remain process-local evidence,
+  so a Home restart requires the fast verified Bootstrap path before Project
+  selection rather than a new mutable field in `remote_connections.json`.
 - Workspace-mode tasks must use an explicit allowlist, reject system-repo/data
   overlap, require a git worktree root, and return patch artifacts instead of
   committing in the target repository.
@@ -1176,6 +1206,15 @@ cmd_sha256) fingerprint — never add command-line-class matching, which would l
 a dev instance reap a packaged instance's processes.
 `tests/test_process_custody.py` enforces the chokepoint with an explicit
 allowlist for bounded synchronous helpers.
+
+Remote processes are never written into Home's PID ledger: remote PID/PGID
+values belong only to execd/custodian state. Home records and owns the local
+OpenSSH/broker/forward children through the same required-custody rule. A
+current Home server generation owns every remote task/service lease. Task
+cancel and service stop preserve the connection; full-app Panic stops lease
+renewal, sends priority kills and immediately closes local custody without
+waiting for ACK. The independent remote custodian is the only authority for
+the physically partitioned 15-second ceiling.
 
 ## Platform Abstraction Rule
 

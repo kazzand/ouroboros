@@ -924,10 +924,12 @@ def _pkg_read(rel: str) -> str:
 @pytest.mark.skipif(not _BUNDLE_FILES_PRESENT, reason=_PACKAGING_SKIP_REASON)
 def test_spec_bundles_assets_and_icon():
     source = _pkg_read("Ouroboros.spec")
+    gitignore = _pkg_read(".gitignore")
     assert "('repo.bundle', '.')" in source
     assert "('repo_bundle_manifest.json', '.')" in source
     assert "('assets', 'assets')" in source
     assert "icon='assets/icon.icns'" in source
+    assert "/assets/execd/" in gitignore
 
 
 @pytest.mark.skipif(not _BUNDLE_FILES_PRESENT, reason=_PACKAGING_SKIP_REASON)
@@ -989,6 +991,13 @@ def test_cross_platform_build_scripts_are_present():
     assert (_REPO_PATH / "scripts" / "pyi_rth_pythonnet.py").exists()
 
 
+def test_execd_stage_smoke_passes_attested_release_identity():
+    source = _pkg_read("scripts/smoke_execd_stage.py")
+    assert "initialize_continuity_host_id(base / \"state\")" in source
+    assert 'release_id="smoke-release"' in source
+    assert 'artifact_sha256="b" * 64' in source
+
+
 def test_build_sh_supports_unsigned_macos_release():
     build_source = _pkg_read("build.sh")
     assert 'OUROBOROS_SIGN' in build_source
@@ -1026,6 +1035,21 @@ def test_ci_release_prerelease_flag_uses_preflight_output():
     assert "prerelease: ${{ needs.release-preflight.outputs.is_prerelease == 'true' }}" in workflow
     assert "re.search(r'(?:rc|alpha|beta|a|b)\\.?\\d+$'" in workflow
     assert "fh.write(f\"is_prerelease={'true' if is_prerelease else 'false'}\\n\")" in workflow
+
+
+def test_ci_release_publishes_only_named_execd_assets():
+    workflow = _ci_workflow()
+
+    release_job = workflow.split("\n  release:\n", 1)[1]
+    assert "pattern: ouroboros-*" in release_job
+    files = release_job.split("files: |", 1)[1].split(
+        "generate_release_notes:", 1
+    )[0]
+    assert "release-artifacts/Ouroboros-*" in files
+    assert "release-artifacts/ouroboros-execd-*-linux-gnu-x86_64.tar.gz" in files
+    assert "release-artifacts/ouroboros-execd-*-linux-gnu-aarch64.tar.gz" in files
+    assert "release-artifacts/ouroboros-execd-*-manifest.json" in files
+    assert "release-artifacts/*" not in files
 
 
 def test_ci_build_job_exports_release_tag_and_fetches_full_history():

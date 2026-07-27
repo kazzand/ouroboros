@@ -813,6 +813,35 @@ def test_skill_manifest_parses_frontmatter():
     assert "Weather skill" in manifest.body
 
 
+def test_skill_manifest_execution_affinity_is_private_and_fail_closed():
+    manifest = parse_skill_manifest_text(
+        "---\n"
+        "name: placed\n"
+        "type: extension\n"
+        "entry: plugin.py\n"
+        "tool_execution_affinity:\n"
+        "  inspect: active_workspace\n"
+        "---\n"
+    )
+    assert manifest.tool_execution_affinity == {"inspect": "active_workspace"}
+    script = parse_skill_manifest_text(
+        "---\n"
+        "name: placed-script\n"
+        "type: script\n"
+        "runtime: python3\n"
+        "scripts:\n"
+        "  - name: run.py\n"
+        "    execution_affinity: ACTIVE_WORKSPACE\n"
+        "---\n"
+    )
+    assert script.scripts[0]["execution_affinity"] == "active_workspace"
+    with pytest.raises(SkillManifestError, match="execution_affinity"):
+        parse_skill_manifest_text(
+            '{"name":"bad","type":"script","scripts":'
+            '[{"name":"run.py","execution_affinity":"remote"}]}'
+        )
+
+
 def test_skill_manifest_parses_json():
     raw = (
         '{"name": "jira", "description": "Jira bridge", '
@@ -1224,7 +1253,16 @@ def test_task_create_request_declares_executor_ref_contract():
     assert TaskCreateRequest.__required_keys__ == frozenset({"description"})
 
     executor_keys = set(ExecutorRef.__annotations__.keys())
-    for required in ("type", "workspace_host_path", "workspace_backend_path", "network", "container_name", "path_mappings"):
+    for required in (
+        "type",
+        "id",
+        "workspace_host_path",
+        "workspace_backend_path",
+        "network",
+        "container_name",
+        "workspace_id",
+        "path_mappings",
+    ):
         assert required in executor_keys
     assert normalize_executor_ref(
         {

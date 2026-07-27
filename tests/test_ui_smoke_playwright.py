@@ -2296,3 +2296,513 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_remote_connections_owner_flow(direct_server_with_data):
+    """Exercise auth, Test/Bootstrap selection, Reconnect and mobile layout."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from urllib.parse import parse_qs, urlsplit
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    connection_id = "conn-ui-smoke"
+    project_id = "remote-ui-project"
+    workspace_id = "workspace-ui-smoke"
+    remote_root = "/srv/work"
+    state = {
+        "unlocked": False,
+        "connections": [],
+        "reconnect_attempts": 0,
+        "project_request": None,
+    }
+
+    def json_response(route, status: int, payload: dict) -> None:
+        route.fulfill(
+            status=status,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    def owner_api(route) -> None:
+        request = route.request
+        parsed_url = urlsplit(request.url)
+        path = parsed_url.path
+        method = request.method.upper()
+        if not state["unlocked"]:
+            json_response(
+                route,
+                401,
+                {
+                    "error": "Owner authentication is required.",
+                    "error_code": "owner_auth_required",
+                },
+            )
+            return
+
+        if path == "/api/owner/connections" and method == "GET":
+            json_response(route, 200, {"connections": state["connections"]})
+            return
+        if path == "/api/owner/connections" and method == "POST":
+            payload = json.loads(request.post_data or "{}")
+            row = {
+                "id": connection_id,
+                "name": payload["name"],
+                "ssh_alias": payload["ssh_alias"],
+                "lifecycle": "active",
+                "status": "unknown",
+                "bootstrap_compatible": False,
+                "health_fresh": False,
+            }
+            state["connections"] = [row]
+            json_response(route, 200, {"ok": True, "connection": row})
+            return
+
+        row = state["connections"][0]
+        if path.endswith("/test") and method == "POST":
+            row.update(
+                status="ready",
+                phase="connect",
+                platform="linux",
+                architecture="x86_64",
+                bootstrap_compatible=False,
+                health_fresh=False,
+            )
+            json_response(
+                route,
+                200,
+                {
+                    "ok": True,
+                    "connection_id": connection_id,
+                    "status": "ready",
+                    "phase": "connect",
+                    "platform": "linux",
+                    "architecture": "x86_64",
+                    "bootstrap_compatible": False,
+                    "health_fresh": False,
+                    "observed_host_id": "host-ui-smoke",
+                },
+            )
+            return
+        if path.endswith("/bootstrap") and method == "POST":
+            row.update(
+                status="ready",
+                phase="bootstrap",
+                platform="linux",
+                architecture="x86_64",
+                build="ui-smoke",
+                expected_host_id="host-ui-smoke",
+                bootstrap_compatible=True,
+                health_fresh=True,
+            )
+            json_response(
+                route,
+                200,
+                {
+                    "ok": True,
+                    "connection_id": connection_id,
+                    "connection": row,
+                    "status": "ready",
+                    "phase": "bootstrap",
+                    "platform": "linux",
+                    "architecture": "x86_64",
+                    "build": "ui-smoke",
+                    "bootstrap_compatible": True,
+                    "health_fresh": True,
+                },
+            )
+            return
+        if path.endswith("/reconnect") and method == "POST":
+            state["reconnect_attempts"] += 1
+            if state["reconnect_attempts"] == 1:
+                row.update(
+                    status="ready",
+                    phase="reconcile",
+                    completion="completed",
+                    bootstrap_compatible=True,
+                    health_fresh=True,
+                )
+                json_response(
+                    route,
+                    200,
+                    {
+                        "ok": True,
+                        "connection_id": connection_id,
+                        "status": "ready",
+                        "phase": "reconcile",
+                        "completion": "completed",
+                        "bootstrap_compatible": True,
+                        "health_fresh": True,
+                    },
+                )
+            else:
+                row.update(
+                    status="degraded",
+                    phase="reconcile",
+                    completion="unknown",
+                    error_code="ssh_transport_closed",
+                    action="retry_reconnect",
+                    health_fresh=False,
+                )
+                json_response(
+                    route,
+                    503,
+                    {
+                        "error": "SSH transport closed during reconciliation.",
+                        "error_code": "ssh_transport_closed",
+                        "connection_id": connection_id,
+                        "status": "degraded",
+                        "phase": "reconcile",
+                        "completion": "unknown",
+                        "action": "retry_reconnect",
+                        "bootstrap_compatible": True,
+                        "health_fresh": False,
+                    },
+                )
+            return
+        if path.endswith("/dirs") and method == "GET":
+            requested_path = parse_qs(parsed_url.query).get("path", [""])[0]
+            if requested_path == remote_root:
+                json_response(
+                    route,
+                    200,
+                    {
+                        "connection_id": connection_id,
+                        "path": remote_root,
+                        "parent": "/srv",
+                        "dirs": [],
+                        "truncated": False,
+                    },
+                )
+            else:
+                json_response(
+                    route,
+                    200,
+                    {
+                        "connection_id": connection_id,
+                        "path": "/srv",
+                        "parent": "/",
+                        "dirs": [
+                            {
+                                "name": "work",
+                                "path": remote_root,
+                                "is_git": True,
+                            },
+                        ],
+                        "truncated": False,
+                    },
+                )
+            return
+
+        json_response(
+            route,
+            404,
+            {"error": f"Unexpected owner API call: {method} {path}"},
+        )
+
+    def owner_login(route) -> None:
+        payload = json.loads(route.request.post_data or "{}")
+        if payload.get("password") == "ui-smoke-password":
+            state["unlocked"] = True
+            json_response(route, 200, {"ok": True})
+        else:
+            json_response(
+                route,
+                401,
+                {"error": "Invalid password.", "error_code": "owner_auth_required"},
+            )
+
+    def project_api(route) -> None:
+        from ouroboros.projects_registry import create_project
+
+        request = route.request
+        if request.method.upper() != "POST":
+            route.continue_()
+            return
+        payload = json.loads(request.post_data or "{}")
+        state["project_request"] = payload
+        admitted_ref = {
+            "kind": "ssh",
+            "connection_id": connection_id,
+            "remote_root": remote_root,
+            "workspace_id": workspace_id,
+        }
+        project = create_project(
+            data_dir,
+            project_id,
+            name=str(payload.get("name") or "Remote UI project"),
+            workspace_ref=admitted_ref,
+            origin="owner_ui",
+        )
+        json_response(route, 200, {"project": project})
+
+    try:
+        with sync_playwright() as pw:
+            launch_options = {}
+            browser_executable = os.environ.get("OUROBOROS_UI_BROWSER_EXECUTABLE", "").strip()
+            if browser_executable:
+                launch_options["executable_path"] = browser_executable
+            browser = pw.chromium.launch(headless=True, **launch_options)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.add_init_script(
+                    """
+                    (() => {
+                        const NativeWebSocket = window.WebSocket;
+                        window.__ouroCapturedWSFrames = [];
+                        window.__ouroSockets = [];
+                        window.WebSocket = class TrackingWebSocket extends NativeWebSocket {
+                            constructor(...args) {
+                                super(...args);
+                                window.__ouroSockets.push(this);
+                            }
+                            send(data) {
+                                let payload = null;
+                                try { payload = JSON.parse(String(data)); } catch {}
+                                if (
+                                    payload?.type === 'chat'
+                                    && payload?.project_id === 'remote-ui-project'
+                                ) {
+                                    window.__ouroCapturedWSFrames.push(payload);
+                                    return;
+                                }
+                                return super.send(data);
+                            }
+                        };
+                    })();
+                    """
+                )
+                page.route("**/api/owner/connections**", owner_api)
+                page.route("**/auth/login", owner_login)
+                page.route("**/api/projects", project_api)
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+                page.click('[data-nav-page="settings"]')
+                page.locator('[data-settings-tab="connections"]').click()
+                auth_form = page.locator("[data-conn-auth]")
+                auth_form.wait_for(state="visible", timeout=30_000)
+                auth_form.locator('input[name="password"]').fill("ui-smoke-password")
+                auth_form.locator('button[type="submit"]').click()
+
+                add_form = page.locator("[data-conn-add]")
+                add_form.wait_for(state="visible", timeout=30_000)
+                add_form.locator('input[name="name"]').fill("UI smoke host")
+                add_form.locator('input[name="ssh_alias"]').fill("ui-smoke")
+                add_form.locator('button[type="submit"]').click()
+                row = page.locator(f'[data-connection-id="{connection_id}"]')
+                row.wait_for(state="visible", timeout=30_000)
+
+                row.locator('[data-conn-action="test"]').click()
+                page.wait_for_function(
+                    "() => (document.querySelector('[data-conn-status]')?.textContent || '')"
+                    ".includes('Transport test passed')",
+                    timeout=30_000,
+                )
+                row.locator("summary").click()
+                details = row.locator("details").inner_text()
+                assert "Bootstrap compatible (this run)\nno" in details
+                assert "Health fresh\nno" in details
+
+                # A successful transport probe alone must not expose the target
+                # in the SSH Project picker.
+                page.locator("#nav-projects-add").click()
+                page.locator('input[name="np-source"][value="ssh"]').check()
+                picker = page.locator("[data-np-connection]")
+                page.wait_for_function(
+                    "() => (document.querySelector('[data-np-connection]')"
+                    "?.options[0]?.textContent || '')"
+                    ".includes('No fresh bootstrapped connections')",
+                    timeout=30_000,
+                )
+                assert picker.locator("option").count() == 1
+                assert "No fresh bootstrapped connections" in picker.locator("option").inner_text()
+                page.get_by_role("button", name="Cancel", exact=True).click()
+
+                row.locator('[data-conn-action="bootstrap"]').click()
+                page.wait_for_function(
+                    "() => (document.querySelector('[data-conn-status]')?.textContent || '')"
+                    ".includes('Remote executor is ready')",
+                    timeout=30_000,
+                )
+                row.locator("summary").click()
+                details = row.locator("details").inner_text()
+                assert "Bootstrap compatible (this run)\nyes" in details
+                assert "Health fresh\nyes" in details
+
+                # Bootstrap supplies both current-process compatibility and
+                # fresh health, so the same Project picker now offers it.
+                page.locator("#nav-projects-add").click()
+                page.locator('input[name="np-source"][value="ssh"]').check()
+                picker = page.locator("[data-np-connection]")
+                page.wait_for_function(
+                    "() => document.querySelector('[data-np-connection]')?.options.length > 1",
+                    timeout=30_000,
+                )
+                assert "UI smoke host (ui-smoke)" in picker.locator("option").nth(1).inner_text()
+                page.locator("[data-np-name]").fill("Remote UI project")
+                picker.select_option(connection_id)
+                remote_dirs = page.locator("[data-np-remote-dirs]")
+                remote_dirs.get_by_role("button", name="work ⎇", exact=True).click()
+                page.wait_for_function(
+                    f"() => document.querySelector('[data-np-remote-path] strong')"
+                    f"?.textContent === {json.dumps(remote_root)}",
+                    timeout=30_000,
+                )
+                page.locator("[data-np-remote-path]").get_by_role(
+                    "button",
+                    name="Select and validate",
+                    exact=True,
+                ).click()
+                page.locator("[data-np-create]").click()
+                page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
+                assert page.locator("#project-panel-title").inner_text() == "Remote UI project"
+
+                assert state["project_request"] == {
+                    "name": "Remote UI project",
+                    "workspace_ref": {
+                        "kind": "ssh",
+                        "connection_id": connection_id,
+                        "remote_root": remote_root,
+                    },
+                }
+                from ouroboros.projects_registry import get_project
+
+                created = get_project(data_dir, project_id)
+                assert created is not None
+                assert created["working_dir"] == ""
+                assert created["workspace_ref"] == {
+                    "kind": "ssh",
+                    "connection_id": connection_id,
+                    "remote_root": remote_root,
+                    "workspace_id": workspace_id,
+                }
+
+                # Submit through the ordinary Project room. The task request
+                # carries only Project identity: placement cannot be overridden
+                # at task level and is resolved from the sealed Project ref.
+                project_input = page.locator(f"#pchat-{project_id}-input")
+                project_input.fill("Report the remote repository status.")
+                page.locator(f"#pchat-{project_id}-send").click()
+                page.wait_for_function(
+                    "() => window.__ouroCapturedWSFrames.length === 1",
+                    timeout=30_000,
+                )
+                task_request = page.evaluate("() => window.__ouroCapturedWSFrames[0]")
+                assert task_request["type"] == "chat"
+                assert task_request["content"] == "Report the remote repository status."
+                assert task_request["project_id"] == project_id
+                assert int(task_request["chat_id"]) == int(created["chat_id"])
+                for forbidden in (
+                    "workspace_ref",
+                    "executor_ref",
+                    "connection_id",
+                    "remote_root",
+                    "workspace_id",
+                ):
+                    assert forbidden not in task_request
+
+                def emit_connection_state(payload: dict) -> None:
+                    page.evaluate(
+                        """
+                        payload => {
+                            const socket = [...window.__ouroSockets]
+                                .reverse()
+                                .find(item => item.readyState === WebSocket.OPEN);
+                            if (!socket) throw new Error('no open Ouroboros WebSocket');
+                            socket.dispatchEvent(new MessageEvent('message', {
+                                data: JSON.stringify(payload),
+                            }));
+                        }
+                        """,
+                        {"type": "connection_state", **payload},
+                    )
+
+                page.wait_for_function(
+                    "() => window.__ouroSockets.some("
+                    "item => item.readyState === WebSocket.OPEN)",
+                    timeout=30_000,
+                )
+                task_id = "task-ui-remote"
+                emit_connection_state(
+                    {
+                        "connection_id": connection_id,
+                        "task_id": task_id,
+                        "project_id": project_id,
+                        "status": "connecting",
+                        "phase": "admission",
+                        "completion": "requested",
+                    }
+                )
+                task_card = page.locator(
+                    f'#panel-pchat-{project_id} [data-task-id="{task_id}"]'
+                )
+                task_card.wait_for(state="visible", timeout=30_000)
+                assert task_card.get_attribute("data-remote-state") == "connecting"
+                emit_connection_state(
+                    {
+                        "connection_id": connection_id,
+                        "task_id": task_id,
+                        "project_id": project_id,
+                        "status": "disconnected",
+                        "phase": "reconcile",
+                        "completion": "unknown",
+                        "error_code": "ssh_transport_closed",
+                        "action": "retry_reconnect",
+                    }
+                )
+                page.wait_for_function(
+                    f"() => document.querySelector("
+                    f"{json.dumps(f'#panel-pchat-{project_id} [data-task-id={task_id}]')}"
+                    ")?.dataset.remoteState === 'disconnected'",
+                    timeout=30_000,
+                )
+                task_card.get_by_role("button", name="Reconnect", exact=True).click()
+                page.wait_for_function(
+                    f"() => document.querySelector("
+                    f"{json.dumps(f'#panel-pchat-{project_id} [data-task-id={task_id}]')}"
+                    ")?.dataset.remoteState === 'ready'",
+                    timeout=30_000,
+                )
+                assert "Remote connection: Ready" in task_card.inner_text()
+                assert "completion=completed" in task_card.inner_text()
+
+                # The Settings action is still independently available. Its
+                # next failed attempt must project the broker's typed error,
+                # rather than replaying a stale result from Test/Bootstrap.
+                page.click('[data-nav-page="settings"]')
+                page.locator('[data-settings-tab="connections"]').click()
+                row = page.locator(f'[data-connection-id="{connection_id}"]')
+                row.wait_for(state="visible", timeout=30_000)
+                reconnect = row.locator('[data-conn-action="reconnect"]')
+                reconnect.click()
+                page.wait_for_function(
+                    "() => (document.querySelector('[data-conn-status]')?.textContent || '')"
+                    ".includes('retry_reconnect')",
+                    timeout=30_000,
+                )
+                assert "ssh_transport_closed" in row.inner_text()
+
+                page.set_viewport_size({"width": 390, "height": 844})
+                page.wait_for_timeout(100)
+                page.evaluate(
+                    "() => document.querySelector('[data-connection-id]')"
+                    "?.scrollIntoView({block: 'center'})"
+                )
+                for action in ("test", "bootstrap", "reconnect", "retrust", "retire"):
+                    box = row.locator(f'[data-conn-action="{action}"]').bounding_box()
+                    assert box is not None
+                    assert box["x"] >= 0
+                    assert box["x"] + box["width"] <= 390
+                assert page.evaluate(
+                    "() => document.documentElement.scrollWidth"
+                    " <= document.documentElement.clientWidth"
+                )
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

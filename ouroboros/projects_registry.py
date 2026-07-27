@@ -35,7 +35,7 @@ _BINDINGS_NAME = "project_task_bindings.json"
 # additive fields (git provenance, trusted_at) migrate deliberately. Old rows read
 # as version 0; new fields must stay additive with safe-empty defaults because
 # reconcile_projects mints rows that will lack them.
-_REGISTRY_SCHEMA_VERSION = 2
+_REGISTRY_SCHEMA_VERSION = 3
 # v6.73.0: project_task_bindings.json gains source_text / origin_absent fields.
 _BINDINGS_SCHEMA_VERSION = 1
 _LOCK = threading.RLock()
@@ -106,7 +106,83 @@ def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             row[field] = 0
     row["delete_error"] = str(row.get("delete_error") or "")
+    working_dir = str(row.get("working_dir") or "").strip()
+    raw_workspace_ref = row.get("workspace_ref")
+    if raw_workspace_ref in (None, "", {}):
+        # Additive migration: legacy rows remain byte-for-byte on disk until the
+        # next ordinary registry write, while every reader sees the typed local
+        # placement immediately.
+        if working_dir:
+            from ouroboros.workspace_ref import normalize_workspace_ref
+
+            row["workspace_ref"] = normalize_workspace_ref({
+                "kind": "local",
+                "local_root": working_dir,
+            })
+        else:
+            row["workspace_ref"] = None
+    else:
+        from ouroboros.workspace_ref import normalize_workspace_ref
+
+        workspace_ref = normalize_workspace_ref(raw_workspace_ref)
+        if workspace_ref and workspace_ref["kind"] == "ssh" and working_dir:
+            raise ValueError(
+                "SSH project workspace_ref cannot coexist with non-empty working_dir"
+            )
+        row["workspace_ref"] = workspace_ref
     return row
+
+
+def _normalized_project_placement(
+    *,
+    working_dir: Any = "",
+    workspace_ref: Any = None,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Normalize one durable project placement without conflating provenance."""
+
+    from ouroboros.workspace_ref import normalize_workspace_ref
+
+    working = str(working_dir or "").strip()
+    normalized = normalize_workspace_ref(workspace_ref)
+    if normalized is None and working:
+        normalized = normalize_workspace_ref({
+            "kind": "local",
+            "local_root": working,
+        })
+    if normalized and normalized["kind"] == "ssh":
+        if working:
+            raise ValueError(
+                "SSH project workspace_ref cannot coexist with non-empty working_dir"
+            )
+        return "", dict(normalized)
+    if normalized and normalized["kind"] == "local":
+        working = str(normalized["local_root"])
+    return working, dict(normalized) if normalized else None
+
+
+def workspace_identity_key(project_or_ref: Any) -> str:
+    """Stable placement identity: canonical local path or connection/workspace pair."""
+
+    raw = (
+        project_or_ref.get("workspace_ref")
+        if isinstance(project_or_ref, dict) and "workspace_ref" in project_or_ref
+        else project_or_ref
+    )
+    if raw in (None, "", {}) and isinstance(project_or_ref, dict):
+        raw = {
+            "kind": "local",
+            "local_root": str(project_or_ref.get("working_dir") or ""),
+        } if str(project_or_ref.get("working_dir") or "").strip() else None
+    if raw in (None, "", {}):
+        return ""
+    from ouroboros.workspace_ref import normalize_workspace_ref
+
+    ref = normalize_workspace_ref(raw)
+    if ref is None:
+        return ""
+    if ref["kind"] == "local":
+        return f"local:{ref['local_root']}"
+    return f"ssh:{ref['connection_id']}:{ref['workspace_id']}"
 
 
 def _validated_name(value: Any, fallback: str = "") -> str:
@@ -472,6 +548,7 @@ def create_project(
     *,
     name: str = "",
     working_dir: str = "",
+    workspace_ref: Any = None,
     origin: str = "owner",
 ) -> Dict[str, Any]:
     """Register (or idempotently return) a project entry.
@@ -483,6 +560,10 @@ def create_project(
     pid = sanitize_project_id(project_id)
     if not pid:
         raise ValueError(f"unusable project id: {project_id!r}")
+    normalized_working_dir, normalized_workspace_ref = _normalized_project_placement(
+        working_dir=working_dir,
+        workspace_ref=workspace_ref,
+    )
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)
         for existing in data["projects"]:
@@ -497,7 +578,8 @@ def create_project(
             "id": pid,
             "name": _validated_name(name, pid),
             "chat_id": project_chat_id(pid),
-            "working_dir": str(working_dir or "").strip(),
+            "working_dir": normalized_working_dir,
+            "workspace_ref": normalized_workspace_ref,
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
             "last_active_at": utc_now_iso(),
@@ -532,7 +614,53 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                elif key == "working_dir":
+                    value, workspace_ref = _normalized_project_placement(
+                        working_dir=value,
+                    )
+                    entry["workspace_ref"] = workspace_ref
                 entry[key] = value
+            _save(drive_root, data)
+            return dict(entry)
+    return None
+
+
+def rebind_project_workspace(
+    drive_root: Any,
+    project_id: str,
+    workspace_ref: Any,
+    *,
+    expected_routing_generation: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Atomically replace/detach placement after the caller proves quiescence.
+
+    Queue/broker fencing belongs to the caller.  The expected generation closes
+    the stale read→commit window without teaching this data module queue state.
+    """
+
+    pid = sanitize_project_id(project_id)
+    if not pid:
+        return None
+    working_dir, normalized = _normalized_project_placement(
+        workspace_ref=workspace_ref,
+    )
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        for entry in data["projects"]:
+            if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
+                continue
+            generation = int(entry.get("routing_generation") or 0)
+            if (
+                expected_routing_generation is not None
+                and generation != int(expected_routing_generation)
+            ):
+                raise ValueError("project_routing_generation_changed")
+            if workspace_identity_key(entry) == workspace_identity_key(normalized):
+                return dict(entry)
+            entry["working_dir"] = working_dir
+            entry["workspace_ref"] = normalized
+            entry["routing_generation"] = generation + 1
+            entry["last_active_at"] = utc_now_iso()
             _save(drive_root, data)
             return dict(entry)
     return None
@@ -771,6 +899,8 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             "name": project.get("name"),
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
+            "workspace_ref": project.get("workspace_ref"),
+            "workspace_identity_key": workspace_identity_key(project),
             "provenance": project.get("provenance") or "",
             "last_active_at": project.get("last_active_at") or "",
             "lifecycle": project.get("lifecycle") or PROJECT_ACTIVE,
@@ -809,9 +939,11 @@ __all__ = [
     "registered_project_chat_ids",
     "reserved_project_chat_ids",
     "projects_summary",
+    "rebind_project_workspace",
     "reconcile_projects",
     "touch_project",
     "update_project",
+    "workspace_identity_key",
 ]
 
 

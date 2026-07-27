@@ -88,6 +88,16 @@ def collect_routes(
         api_update_preflight,
         api_update_status,
     )
+    from ouroboros.gateway.connections import (
+        api_connection_bootstrap,
+        api_connection_dirs,
+        api_connection_reconnect,
+        api_connection_retrust,
+        api_connection_retire,
+        api_connection_test,
+        api_connections_add,
+        api_connections_list,
+    )
     from ouroboros.gateway.projects import (
         api_fs_dirs,
         api_project_delete,
@@ -195,6 +205,38 @@ def collect_routes(
         Route("/api/owner/scope-review-floor", endpoint=api_owner_scope_review_floor, methods=["POST"]),
         Route("/api/owner/safety-mode", endpoint=api_owner_safety_mode, methods=["POST"]),
         Route("/api/owner/capability-ack", endpoint=api_acknowledge_capability, methods=["POST"]),
+        Route("/api/owner/connections", endpoint=api_connections_list, methods=["GET"]),
+        Route("/api/owner/connections", endpoint=api_connections_add, methods=["POST"]),
+        Route(
+            "/api/owner/connections/{connection_id}/test",
+            endpoint=api_connection_test,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/owner/connections/{connection_id}/bootstrap",
+            endpoint=api_connection_bootstrap,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/owner/connections/{connection_id}/reconnect",
+            endpoint=api_connection_reconnect,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/owner/connections/{connection_id}/retrust",
+            endpoint=api_connection_retrust,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/owner/connections/{connection_id}/dirs",
+            endpoint=api_connection_dirs,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/owner/connections/{connection_id}",
+            endpoint=api_connection_retire,
+            methods=["DELETE"],
+        ),
         Route("/api/model-catalog", endpoint=api_model_catalog),
         Route("/api/projects", endpoint=api_projects_list, methods=["GET"]),
         Route("/api/projects", endpoint=api_projects_create, methods=["POST"]),

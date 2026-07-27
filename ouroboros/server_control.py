@@ -114,6 +114,18 @@ def execute_panic_stop(
     except Exception:
         pass
 
+    # Remote panic is intentionally best-effort and non-blocking. The broker
+    # stops lease renewal, priority-sends current-generation kills, then closes
+    # its custodied OpenSSH groups without waiting for a remote acknowledgement.
+    try:
+        from ouroboros.remote_workspace import get_remote_workspace_service
+
+        remote_service = get_remote_workspace_service()
+        if remote_service is not None:
+            remote_service.panic_close_all()
+    except Exception:
+        pass
+
     try:
         from ouroboros.local_model import get_manager
 

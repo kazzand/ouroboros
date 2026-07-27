@@ -487,6 +487,116 @@ def _handle_external_workspace_integration(
     )
 
 
+def _integrate_remote_subagent_patch(
+    ctx: ToolContext,
+    *,
+    child_task_id: str,
+    child_surface: str,
+    reason: str,
+    requested_target: str,
+    patch_path: pathlib.Path,
+    manifest: Dict[str, Any],
+    child_result: Dict[str, Any],
+    touched: List[str],
+) -> str:
+    """Apply an imported child patch to the exact reviewed remote fingerprint."""
+
+    del child_surface, child_result
+    from ouroboros.workspace_executor import execute_remote_system_operation
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(ctx)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        return "⚠️ INTEGRATE_TARGET_ERROR: sealed remote workspace is unavailable."
+    remote_root = str(workspace_ref["remote_root"])
+    if requested_target and requested_target.rstrip("/") != remote_root.rstrip("/"):
+        return (
+            "⚠️ INTEGRATE_TARGET_FORBIDDEN: target_root must be the active "
+            f"remote workspace {remote_root}; got {requested_target}."
+        )
+    patch_touched, parse_error = _patch_touched_paths(patch_path, patch_path.parent)
+    if parse_error:
+        return (
+            "⚠️ INTEGRATE_PATCH_UNREADABLE: cannot parse remote child patch "
+            f"{child_task_id}: {parse_error[:300]}"
+        )
+    authoritative_touched = sorted(patch_touched or set(touched))
+    protected = protected_paths_in(authoritative_touched)
+    if protected:
+        constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+        is_acting = bool(
+            constraint
+            and getattr(constraint, "mode", "") == ACTING_SUBAGENT_MODE
+        )
+        grant_ok = (
+            not is_acting
+            or bool(getattr(constraint, "protected_paths_grant", False))
+        )
+        runtime_mode = get_runtime_mode()
+        if not (mode_allows_protected_write(runtime_mode) and grant_ok):
+            return protected_write_block_message(
+                path=protected[0].path,
+                runtime_mode=runtime_mode,
+                action=f"integrate remote subagent patch {child_task_id} touching",
+            )
+    snapshot = execute_remote_system_operation(
+        ctx,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    snapshot_manifest = (
+        snapshot.trace.get("snapshot")
+        if isinstance(snapshot.trace, dict)
+        else None
+    )
+    if (
+        not isinstance(snapshot_manifest, dict)
+        or not snapshot_manifest.get("complete")
+        or not str(snapshot_manifest.get("fingerprint") or "")
+    ):
+        return "⚠️ INTEGRATE_REMOTE_SNAPSHOT_FAILED: target snapshot is partial or unstable."
+    patch_bytes = patch_path.read_bytes()
+    digest = _sha256_file(patch_path)
+    expected_digest = str(manifest.get("sha256") or "")
+    if expected_digest and digest != expected_digest:
+        return "⚠️ INTEGRATE_PATCH_CORRUPT: child patch changed before remote apply."
+    applied = execute_remote_system_operation(
+        ctx,
+        "guarded_patch_apply",
+        {
+            "expected_fingerprint": str(snapshot_manifest["fingerprint"]),
+            "patch_blob_id": digest,
+        },
+        blobs={digest: patch_bytes},
+    )
+    if str(applied.text or "").lstrip().startswith("⚠️"):
+        return str(applied.text)
+    verdict_path = _write_verdict(
+        ctx,
+        child_task_id,
+        outcome="applied_remote",
+        reason=reason,
+        files=authoritative_touched,
+        manifest=manifest,
+        applied=True,
+        conflicts=[],
+        protected=[item.path for item in protected],
+        target=remote_root,
+    )
+    disposition_warning = _record_integration_disposition(
+        ctx,
+        child_task_id,
+        "integrated",
+        reason,
+        "applied the child patch to the fingerprint-bound remote workspace",
+    )
+    return (
+        f"✅ Applied subagent patch from {child_task_id} to remote workspace "
+        f"{remote_root} ({len(authoritative_touched)} file(s)). "
+        f"Verdict: {verdict_path or '(unwritten)'}.{disposition_warning}"
+    )
+
+
 def _integrate_subagent_patch(
     ctx: ToolContext,
     task_id: str = "",
@@ -570,6 +680,21 @@ def _integrate_subagent_patch(
                 f"⚠️ INTEGRATE_PATCH_CORRUPT: sha256 mismatch for {child_task_id} "
                 f"(manifest {expected_digest[:12]} != file {actual_digest[:12]}); refusing to apply."
             )
+
+    from ouroboros.workspace_ref import is_remote_workspace
+
+    if is_remote_workspace(ctx):
+        return _integrate_remote_subagent_patch(
+            ctx,
+            child_task_id=child_task_id,
+            child_surface=child_surface,
+            reason=reason,
+            requested_target=str(target_root or "").strip(),
+            patch_path=patch_path,
+            manifest=manifest,
+            child_result=child_result or {},
+            touched=touched,
+        )
 
     # Top-only routing for EVERY caller: integration always targets your OWN active
     # repo/worktree. An explicit target_root must equal it (no foreign target, which

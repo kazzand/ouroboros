@@ -234,6 +234,8 @@ _SUBAGENT_SECRET_FILE_NAMES = frozenset({
     "credentials",
     "credentials.json",
     "keys.json",
+    "remote_connections.json",
+    "remote_connections.json.lock",
     "secret.json",
     "secrets.json",
     "settings.json",
@@ -484,6 +486,10 @@ def _data_read(
             return f"⚠️ DATA_READ_BLOCKED: {e}"
     else:
         target = ctx.drive_path(norm)
+    from ouroboros.gateway.connections import is_connection_store_path
+
+    if is_connection_store_path(target):
+        return "⚠️ DATA_READ_BLOCKED: remote connection state is owner-only."
     if is_restricted_subagent_profile(ctx):
         root = pathlib.Path(ctx.drive_root).resolve(strict=False)
         try:
@@ -563,6 +569,15 @@ def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
         return json.dumps(items, ensure_ascii=False, indent=2)
     # Drop any projects/<id> entry so a generic root listing never exposes the store.
     items = _filter_out_project_store(_normalize_data_read_path(ctx, dir), _list_dir(ctx.drive_root, dir, max_entries))
+    from ouroboros.gateway.connections import is_connection_store_path
+
+    items = [
+        item
+        for item in items
+        if not is_connection_store_path(
+            pathlib.Path(ctx.drive_root) / str(item).rstrip("/")
+        )
+    ]
     if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_listing(items, pathlib.Path(ctx.drive_root))
     return json.dumps(items, ensure_ascii=False, indent=2)
@@ -681,6 +696,13 @@ def _data_write(
     # not-yet-existing case variants.
     from ouroboros import config as _cfg
     target_path = pathlib.Path(p)
+    from ouroboros.gateway.connections import is_connection_store_path
+
+    if is_connection_store_path(target_path):
+        return (
+            "⚠️ DATA_WRITE_BLOCKED: remote connection trust and lifecycle state "
+            "is owner-only; use Settings or the connections CLI."
+        )
     settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
     data_root = pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
     ctx_data_root = pathlib.Path(ctx.drive_root).resolve(strict=False)
@@ -1025,13 +1047,42 @@ def _read_file(
         protected_block = block_reason_for_path(ctx, target, "read_bytes")
         if protected_block:
             return protected_block
-        return _annotate_reread(ctx, target, start_line, max_lines, _repo_read(
-            ctx,
-            path,
-            max_lines=max_lines,
-            start_line=start_line,
-            display_path=_root_display_path(normalized, path),
-        ))
+        if (
+            ctx.is_workspace_mode()
+            and not is_restricted_subagent_profile(ctx)
+        ):
+            from ouroboros.workspace_native import execute_native_operation
+
+            repo_root = active_repo_dir_for(ctx).resolve(strict=True)
+            rel = normalize_root_relative(repo_root, path)
+            envelope = execute_native_operation(
+                repo_root,
+                "read_file",
+                {
+                    "path": rel,
+                    "max_lines": max_lines,
+                    "start_line": start_line,
+                },
+            ).envelope
+            return _annotate_reread(
+                ctx,
+                target,
+                start_line,
+                max_lines,
+                envelope.text,
+            )
+        try:
+            return _annotate_reread(ctx, target, start_line, max_lines, _repo_read(
+                ctx,
+                path,
+                max_lines=max_lines,
+                start_line=start_line,
+                display_path=_root_display_path(normalized, path),
+            ))
+        except FileNotFoundError:
+            return f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)}"
+        except Exception as exc:
+            return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
     if normalized == "runtime_data":
         try:
             target = resolve_resource_path(ctx, root=normalized, path=path)
@@ -1111,6 +1162,19 @@ def _list_files(
                 # narrated the wrong tree). Same JSON-array shape as every root.
                 _rel = normalize_root_relative(_room, str(path or "."))
                 return json.dumps(_list_dir(_room, _rel, max_entries), ensure_ascii=False, indent=2)
+            if (
+                ctx.is_workspace_mode()
+                and not is_restricted_subagent_profile(ctx)
+            ):
+                from ouroboros.workspace_native import execute_native_operation
+
+                repo_root = active_repo_dir_for(ctx).resolve(strict=True)
+                rel = normalize_root_relative(repo_root, path)
+                return execute_native_operation(
+                    repo_root,
+                    "list_files",
+                    {"path": rel, "max_entries": max_entries},
+                ).envelope.text
             return _repo_list(ctx, dir=path, max_entries=max_entries)
         if normalized == "runtime_data":
             return _data_list(ctx, dir=path, max_entries=max_entries)
@@ -1194,7 +1258,15 @@ def _write_file(
     if normalized in {"active_workspace", "system_repo"}:
         from ouroboros.tools.git import _repo_write
 
-        return _repo_write(ctx, path=path, content=content, files=files or [], force=force, display_root=normalized)
+        return _repo_write(
+            ctx,
+            path=path,
+            content=content,
+            files=files or [],
+            mode=mode,
+            force=force,
+            display_root=normalized,
+        )
     if normalized == "runtime_data":
         if files:
             results = []
@@ -1372,6 +1444,13 @@ def _edit_text(
             if (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
                 return b
             data_root = pathlib.Path(ctx.drive_root).resolve(strict=False)
+            from ouroboros.gateway.connections import is_connection_store_path
+
+            if is_connection_store_path(target):
+                return (
+                    "⚠️ EDIT_TEXT_BLOCKED: remote connection trust and lifecycle "
+                    "state is owner-only; use Settings or the connections CLI."
+                )
             if _is_workspace_executor_control_state_path(target, data_root):
                 return (
                     "⚠️ EDIT_TEXT_BLOCKED: workspace executor process records are "
@@ -1689,6 +1768,26 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             re.compile(query)
         except re.error as e:
             return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+
+    if (
+        normalized == "active_workspace"
+        and ctx.is_workspace_mode()
+        and not subagent_readonly
+        and project_room_lens_dir(ctx) is None
+    ):
+        from ouroboros.workspace_query_native import search_workspace
+
+        return search_workspace(
+            root_path,
+            {
+                "query": query,
+                "path": path,
+                "regex": regex,
+                "max_results": max_results,
+                "include": include,
+            },
+            path_allowed=_path_allowed_for_rg,
+        ).text
 
     import time as _time
     _search_t0 = _time.monotonic()  # start the wall-clock budget BEFORE rg, so a

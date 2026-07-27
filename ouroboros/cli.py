@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import pathlib
@@ -13,7 +14,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, Iterator, List, Optional
-
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -35,10 +35,29 @@ class ConnectionCLIError(CLIError):
     pass
 
 
+class GatewayHTTPError(CLIError):
+    def __init__(self, status_code: int, payload: Any):
+        self.status_code = int(status_code)
+        self.payload = payload if isinstance(payload, dict) else {
+            "error": str(payload or "HTTP request failed")
+        }
+        super().__init__(
+            f"HTTP {self.status_code}: "
+            f"{self.payload.get('error') or self.payload.get('error_code') or 'request failed'}"
+        )
+
+
 class OuroborosHTTPClient:
-    def __init__(self, base_url: str = "", timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = "",
+        timeout: float = 30.0,
+        *,
+        owner_password: str = "",
+    ):
         self.base_url = (base_url or _default_base_url()).rstrip("/")
         self.timeout = timeout
+        self.owner_password = str(owner_password or "")
 
     def request(
         self,
@@ -50,6 +69,8 @@ class OuroborosHTTPClient:
     ) -> Any:
         data = None
         headers = {"Accept": "application/json"}
+        if self.owner_password:
+            headers["X-Ouroboros-Password"] = self.owner_password
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -64,12 +85,16 @@ class OuroborosHTTPClient:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
+            payload: Any = {}
             try:
                 payload = json.loads(raw)
                 message = payload.get("error") or raw
             except Exception:
                 message = raw or str(exc)
-            raise CLIError(f"HTTP {exc.code}: {message}") from exc
+            raise GatewayHTTPError(
+                exc.code,
+                payload if isinstance(payload, dict) else {"error": message},
+            ) from exc
         except urllib.error.URLError as exc:
             raise ConnectionCLIError(f"cannot reach Ouroboros server at {self.base_url}: {exc}") from exc
         except TimeoutError as exc:
@@ -113,6 +138,7 @@ def _server_command(args: argparse.Namespace) -> int:
     old_argv = sys.argv[:]
     try:
         import json
+
         import __main__
 
         # Preserve module-mode launches. When started via `python -m
@@ -444,6 +470,295 @@ def _mcp_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_owner_password() -> str:
+    """Read only from a controlling terminal; never stdin, argv, or environment."""
+
+    if os.name == "nt":
+        if not sys.stdin.isatty():
+            raise CLIError(
+                "owner password requires an interactive controlling terminal"
+            )
+        return getpass.getpass("Ouroboros owner password: ")
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError as exc:
+        raise CLIError(
+            "owner password requires an interactive controlling terminal"
+        ) from exc
+    with os.fdopen(fd, "r+", encoding="utf-8", closefd=True) as terminal:
+        return getpass.getpass("Ouroboros owner password: ", stream=terminal)
+
+
+def _confirm_host_retrust(old_host_id: str, new_host_id: str) -> bool:
+    prompt = (
+        "Remote host identity changed.\n"
+        f"Old: {old_host_id}\n"
+        f"New: {new_host_id}\n"
+        "Trust this replacement host? Type 'yes' to continue: "
+    )
+    if os.name == "nt":
+        if not sys.stdin.isatty():
+            raise CLIError(
+                "host retrust confirmation requires an interactive controlling terminal"
+            )
+        return input(prompt).strip().lower() == "yes"
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError as exc:
+        raise CLIError(
+            "host retrust confirmation requires an interactive controlling terminal"
+        ) from exc
+    with os.fdopen(fd, "r+", encoding="utf-8", closefd=True) as terminal:
+        terminal.write(prompt)
+        terminal.flush()
+        return terminal.readline().strip().lower() == "yes"
+
+
+def _connection_error_exit(error: GatewayHTTPError, *, as_json: bool) -> int:
+    payload = dict(error.payload)
+    payload.setdefault("status_code", error.status_code)
+    if as_json:
+        _print_json(payload)
+    else:
+        phase = str(payload.get("phase") or "").strip()
+        action = str(payload.get("action") or "").strip()
+        suffix = " ".join(
+            part for part in (
+                f"phase={phase}" if phase else "",
+                f"action={action}" if action else "",
+            )
+            if part
+        )
+        print(
+            f"error: {payload.get('error') or payload.get('error_code') or error}"
+            + (f" ({suffix})" if suffix else ""),
+            file=sys.stderr,
+        )
+    code = str(payload.get("error_code") or "")
+    if code in {
+        "auth_required",
+        "confirmation_required",
+        "host_identity_changed",
+        "host_identity_confirmation_stale",
+        "host_identity_missing",
+        "owner_action_required",
+        "owner_auth_not_configured",
+        "owner_auth_required",
+    }:
+        return 3
+    if error.status_code == 409:
+        return 5
+    if code in {
+        "remote_service_unavailable",
+        "remote_service_invalid_response",
+        "unsupported_ssh_client",
+        "remote_platform_unsupported",
+        "remote_libc_unsupported",
+        "remote_glibc_too_old",
+        "execd_preamble_invalid",
+        "execd_release_unselected",
+        "execd_bundle_unavailable",
+        "execd_bundle_invalid",
+        "execd_artifact_mismatch",
+        "capability_mismatch",
+        "incompatible_protocol",
+    }:
+        return 4
+    return 2
+
+
+def _connection_local_error(
+    message: str,
+    *,
+    error_code: str,
+    action: str,
+    as_json: bool,
+    exit_code: int,
+) -> int:
+    payload = {
+        "ok": False,
+        "error": message,
+        "error_code": error_code,
+        "action": action,
+    }
+    if as_json:
+        _print_json(payload)
+    else:
+        print(f"error: {message} (action={action})", file=sys.stderr)
+    return exit_code
+
+
+def _observed_cli_host_id(payload: Any) -> str:
+    row = payload if isinstance(payload, dict) else {}
+    for source in (
+        row,
+        row.get("handshake") if isinstance(row.get("handshake"), dict) else {},
+        row.get("diagnostic") if isinstance(row.get("diagnostic"), dict) else {},
+    ):
+        value = str(
+            source.get("host_id") or source.get("observed_host_id") or ""
+        ).strip()
+        if value:
+            return value
+    return ""
+
+
+def _print_connection_result(data: Any, *, as_json: bool) -> None:
+    if as_json:
+        _print_json(data)
+        return
+    payload = data if isinstance(data, dict) else {}
+    row = payload.get("connection") if isinstance(payload.get("connection"), dict) else payload
+    connection_id = str(row.get("id") or payload.get("connection_id") or "")
+    name = str(row.get("name") or "")
+    status = str(payload.get("status") or row.get("status") or "unknown")
+    phase = str(payload.get("phase") or "")
+    completion = str(payload.get("completion") or "")
+    print(
+        " ".join(
+            value
+            for value in (
+                connection_id,
+                name,
+                f"status={status}",
+                f"phase={phase}" if phase else "",
+                f"completion={completion}" if completion else "",
+            )
+            if value
+        )
+    )
+    for warning in list(payload.get("warnings") or [])[:4]:
+        if isinstance(warning, dict):
+            print(
+                "warning: "
+                + json.dumps(warning, ensure_ascii=False, sort_keys=True),
+                file=sys.stderr,
+            )
+
+
+def _connections_command(args: argparse.Namespace) -> int:
+    command = str(args.connections_command or "")
+    as_json = bool(getattr(args, "json", False))
+    try:
+        password = _read_owner_password()
+    except CLIError as exc:
+        return _connection_local_error(
+            str(exc),
+            error_code="owner_auth_required",
+            action="run_from_controlling_terminal",
+            as_json=as_json,
+            exit_code=3,
+        )
+    client = OuroborosHTTPClient(
+        getattr(args, "url", "") or "",
+        owner_password=password,
+    )
+    try:
+        if command == "list":
+            data = client.request("GET", "/api/owner/connections")
+            if as_json:
+                _print_json(data)
+            else:
+                rows = data.get("connections") if isinstance(data, dict) else []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        print(
+                            f"{row.get('id', '')}\t{row.get('name', '')}\t"
+                            f"{row.get('ssh_alias', '')}\t"
+                            f"{row.get('lifecycle', 'active')}\t"
+                            f"{row.get('status', 'unknown')}"
+                        )
+            return 0
+        if command == "add":
+            data = client.request(
+                "POST",
+                "/api/owner/connections",
+                {"name": args.name, "ssh_alias": args.ssh_alias},
+            )
+        elif command in {"test", "bootstrap"}:
+            data = client.request(
+                "POST",
+                f"/api/owner/connections/{urllib.parse.quote(args.connection_id)}/{command}",
+                {},
+                timeout=120.0 if command == "bootstrap" else 30.0,
+            )
+        elif command == "retire":
+            data = client.request(
+                "DELETE",
+                f"/api/owner/connections/{urllib.parse.quote(args.connection_id)}",
+            )
+        elif command == "retrust":
+            listing = client.request("GET", "/api/owner/connections")
+            rows = listing.get("connections") if isinstance(listing, dict) else []
+            current = next(
+                (
+                    row for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get("id") or "") == args.connection_id
+                ),
+                None,
+            )
+            if current is None:
+                return _connection_local_error(
+                    f"unknown connection: {args.connection_id}",
+                    error_code="connection_not_found",
+                    action="list_connections",
+                    as_json=as_json,
+                    exit_code=2,
+                )
+            old_host_id = str(current.get("expected_host_id") or "")
+            try:
+                probe = client.request(
+                    "POST",
+                    f"/api/owner/connections/{urllib.parse.quote(args.connection_id)}/test",
+                    {},
+                )
+            except GatewayHTTPError as exc:
+                probe = exc.payload
+            new_host_id = _observed_cli_host_id(probe)
+            if not old_host_id or not new_host_id:
+                return _connection_local_error(
+                    "retrust requires both the pinned and currently observed host identities",
+                    error_code="host_identity_missing",
+                    action="test_connection",
+                    as_json=as_json,
+                    exit_code=3,
+                )
+            try:
+                confirmed = _confirm_host_retrust(old_host_id, new_host_id)
+            except CLIError as exc:
+                return _connection_local_error(
+                    str(exc),
+                    error_code="confirmation_required",
+                    action="run_from_controlling_terminal",
+                    as_json=as_json,
+                    exit_code=3,
+                )
+            if not confirmed:
+                return _connection_local_error(
+                    "host retrust declined; no connection metadata changed",
+                    error_code="confirmation_declined",
+                    action="none",
+                    as_json=as_json,
+                    exit_code=2,
+                )
+            data = client.request(
+                "POST",
+                f"/api/owner/connections/{urllib.parse.quote(args.connection_id)}/retrust",
+                {
+                    "confirm": True,
+                    "old_host_id": old_host_id,
+                    "new_host_id": new_host_id,
+                },
+            )
+        else:
+            raise CLIError(f"unknown connections command: {command}")
+    except GatewayHTTPError as exc:
+        return _connection_error_exit(exc, as_json=as_json)
+    _print_connection_result(data, as_json=as_json)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ouroboros")
     parser.add_argument("--url", default="", help="Ouroboros server URL")
@@ -554,6 +869,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_marketplace_parser(subparsers)
     _add_local_model_parser(subparsers)
     _add_mcp_parser(subparsers)
+    _add_connections_parser(subparsers)
     return parser
 
 
@@ -641,6 +957,27 @@ def _add_mcp_parser(subparsers: argparse._SubParsersAction) -> None:
     test = sub.add_parser("test")
     test.add_argument("--server-id", default="")
     test.set_defaults(func=_mcp_command)
+
+
+def _add_connections_parser(subparsers: argparse._SubParsersAction) -> None:
+    connections = subparsers.add_parser(
+        "connections",
+        help="manage owner-authorized SSH connection metadata",
+    )
+    sub = connections.add_subparsers(dest="connections_command", required=True)
+    listing = sub.add_parser("list")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=_connections_command)
+    add = sub.add_parser("add")
+    add.add_argument("--name", required=True)
+    add.add_argument("--ssh-alias", required=True, dest="ssh_alias")
+    add.add_argument("--json", action="store_true")
+    add.set_defaults(func=_connections_command)
+    for command in ("test", "bootstrap", "retrust", "retire"):
+        action = sub.add_parser(command)
+        action.add_argument("connection_id")
+        action.add_argument("--json", action="store_true")
+        action.set_defaults(func=_connections_command)
 
 
 def _client(args: argparse.Namespace, *, start: bool = False) -> OuroborosHTTPClient:

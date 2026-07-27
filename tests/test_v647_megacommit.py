@@ -38,18 +38,23 @@ def test_scrub_repo_from_pythonpath_drops_only_repo_entry():
     assert "PYTHONPATH" not in scrub_repo_from_pythonpath({"PYTHONPATH": repo + "/"}, repo)
 
 
-def test_shell_env_for_cwd_scrubs_external_keeps_repo():
+def test_shell_env_for_cwd_scrubs_owner_password_everywhere(monkeypatch):
     from ouroboros.tools.shell import _shell_env_for_cwd
 
+    monkeypatch.setenv("OUROBOROS_NETWORK_PASSWORD", "owner-secret")
+    monkeypatch.setenv("SHELL_ENV_SENTINEL", "kept")
     repo = Path(tempfile.mkdtemp())
     (repo / "sub").mkdir()
     ext = Path(tempfile.mkdtemp())
     ctx = types.SimpleNamespace(repo_dir=str(repo))
-    # a command inside the repo inherits os.environ (None -> no scrub)
-    assert _shell_env_for_cwd(ctx, repo / "sub") is None
-    # a command outside the repo gets a scrubbed env (dict, not None)
-    env = _shell_env_for_cwd(ctx, ext)
-    assert isinstance(env, dict)
+    # Both paths preserve ordinary command context but never inherit the
+    # gateway credential used for owner-only actions.
+    inside = _shell_env_for_cwd(ctx, repo / "sub")
+    outside = _shell_env_for_cwd(ctx, ext)
+    assert inside["SHELL_ENV_SENTINEL"] == "kept"
+    assert outside["SHELL_ENV_SENTINEL"] == "kept"
+    assert "OUROBOROS_NETWORK_PASSWORD" not in inside
+    assert "OUROBOROS_NETWORK_PASSWORD" not in outside
 
 
 # ── R5: effect-based artifact-audit gate ──────────────────────────────────────

@@ -237,6 +237,35 @@ def _hold_wedged_worker(task_id: str, task_type: str, worker_id: int, terminal_r
             log.debug("Reaper: failed to send wedged owner notification for %s", task_id, exc_info=True)
 
 
+def _respawn_after_reap(queue_module: Any, workers_module: Any, worker_id: int) -> None:
+    """Replace a confirmed-dead worker without racing supervisor shutdown."""
+
+    try:
+        with queue_module._queue_lock:
+            if worker_id in workers_module.WORKERS:
+                workers_module.respawn_worker(worker_id)
+    except Exception:
+        log.warning(
+            "Reaper: respawn failed for worker %d; clearing reaping for recovery",
+            worker_id,
+            exc_info=True,
+        )
+        try:
+            with queue_module._queue_lock:
+                worker = workers_module.WORKERS.get(worker_id)
+                if worker is not None:
+                    worker.reaping = False
+        except Exception:
+            pass
+    try:
+        queue_module.persist_queue_snapshot(reason="worker_respawn_after_reap")
+    except Exception:
+        log.debug(
+            "Reaper: failed to persist queue snapshot after respawn",
+            exc_info=True,
+        )
+
+
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
     """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
 
@@ -283,6 +312,13 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         _hold_wedged_worker(task_id, task_type, worker_id, terminal_reason, runtime_sec, owner_chat_id)
         return
 
+    # The worker can no longer send its own TASK_FINISH.  Release the target
+    # lease only after death is confirmed (never race a live worker), and do it
+    # before retry/respawn so the transport renewal loop cannot keep the old
+    # remote task alive indefinitely.  The shared helper is idempotent and
+    # fail-soft; terminal durability below must not depend on SSH availability.
+    _q.finish_remote_task_lease(task, task_id)
+
     try:
         from ouroboros.tools.services import archive_task_service_logs
 
@@ -291,10 +327,10 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         log.debug("Reaper: failed to archive service logs for %s", task_id, exc_info=True)
 
     from ouroboros.task_results import (
+        _TRULY_TERMINAL_STATUSES,
         STATUS_FAILED,
         STATUS_INTERRUPTED,
         STATUS_SCHEDULED,
-        _TRULY_TERMINAL_STATUSES,
         load_task_result,
         write_task_result,
     )
@@ -512,28 +548,5 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
             except Exception:
                 log.debug("Reaper: failed to emit task_done for %s", task_id, exc_info=True)
 
-    # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
-    #    can recover the slot on a later tick instead of stranding it permanently.
-    #    Hold _queue_lock across the membership check AND the respawn so it is mutually
-    #    exclusive with kill_workers (which clears WORKERS under the same lock at shutdown).
-    #    Otherwise the reaper could pass the check, start a replacement process, and insert it
-    #    into WORKERS only AFTER shutdown cleanup already cleared the pool — an orphan worker
-    #    surviving shutdown. _queue_lock is an RLock and respawn_worker re-acquires it
-    #    internally, so taking it here is safe (and a cleared pool makes the check fail closed).
-    try:
-        with _q._queue_lock:
-            if worker_id in workers_mod.WORKERS:
-                workers_mod.respawn_worker(worker_id)
-    except Exception:
-        log.warning("Reaper: respawn failed for worker %d; clearing reaping for recovery", worker_id, exc_info=True)
-        try:
-            with _q._queue_lock:
-                _w = workers_mod.WORKERS.get(worker_id)
-                if _w is not None:
-                    _w.reaping = False
-        except Exception:
-            pass
-    try:
-        _q.persist_queue_snapshot(reason="worker_respawn_after_reap")
-    except Exception:
-        log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
+    # Replacement remains one shutdown-serialized responsibility.
+    _respawn_after_reap(_q, workers_mod, worker_id)

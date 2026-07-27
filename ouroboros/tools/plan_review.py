@@ -763,7 +763,10 @@ def _resolve_plan_roots(
     ctx: ToolContext, files_to_touch: list,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Resolve governance and subject roots without silently mixing them."""
-    governance, subject = review_repo_dirs_for(ctx)
+    from ouroboros.remote_plan_review import materialized_plan_roots
+
+    roots = materialized_plan_roots(ctx)
+    governance, subject = roots if roots is not None else review_repo_dirs_for(ctx)
     for raw in files_to_touch or []:
         candidate = pathlib.Path(str(raw or ""))
         resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
@@ -1144,6 +1147,9 @@ def _finalize_plan_review_output(
     )
 
 
+from ouroboros.remote_plan_review import remote_snapshot_lifecycle
+
+@remote_snapshot_lifecycle
 async def _run_plan_review_async(
     ctx: ToolContext,
     request: _PlanReviewRequest,
@@ -1260,7 +1266,13 @@ async def _run_plan_review_async(
     }
     head_snapshots = ""
     if files_to_touch:
-        head_snapshots = build_head_snapshot_section(subject_repo, files_to_touch)
+        head_snapshots = build_head_snapshot_section(
+            subject_repo,
+            files_to_touch,
+            verified_filesystem_snapshot=bool(
+                getattr(ctx, "_remote_plan_review_snapshot", None)
+            ),
+        )
 
     system_prompt = _build_system_prompt(
         checklist,
@@ -1455,6 +1467,7 @@ def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list)
     Returns (resolved_class, escalation_note)."""
     from ouroboros.tool_access import path_is_relative_to
     from ouroboros.tools.registry import active_repo_dir_for
+    from ouroboros.workspace_ref import RemoteWorkspacePathError
 
     declared = str(plan_class or "").strip().lower()
     if declared not in _PLAN_CLASSES:
@@ -1470,6 +1483,8 @@ def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list)
         return "self_mod", ""
     try:
         active = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
+    except RemoteWorkspacePathError:
+        return (declared or "external"), ""
     except Exception:
         active = system_repo
     touches_system = False

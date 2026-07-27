@@ -14,11 +14,6 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from supervisor.state import (
-    load_state, append_jsonl, atomic_write_text,
-    QUEUE_SNAPSHOT_PATH, budget_remaining, EVOLUTION_BUDGET_RESERVE, reconstruct_task_cost,
-)
-from supervisor.message_bus import send_with_budget
 from ouroboros.config import (
     FINALIZATION_GRACE_DEFAULT_SEC,
     get_finalization_grace_sec,
@@ -27,8 +22,8 @@ from ouroboros.config import (
     get_task_idle_timeout_sec,
 )
 from ouroboros.contracts.task_contract import attach_task_contract, build_task_contract, normalize_allowed_resources
-from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.outcomes import normalize_outcome_axes, terminal_outcome_axes
+from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 from supervisor.evolution_lifecycle import (
     _read_evolution_campaign,
@@ -40,14 +35,41 @@ from supervisor.evolution_lifecycle import (
     pause_evolution_campaign,
     start_evolution_campaign,
 )
+from supervisor.message_bus import send_with_budget
+from supervisor.state import (
+    EVOLUTION_BUDGET_RESERVE,
+    QUEUE_SNAPSHOT_PATH,
+    append_jsonl,
+    atomic_write_text,
+    budget_remaining,
+    load_state,
+    reconstruct_task_cost,
+)
 from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exports
-    BUDGET_ROOT_FENCES, apply_budget_root_admission_fence, cancel_task_by_id,
-    clear_acceptance_fence_for_root, record_scheduled_admission,
-    resume_budget_paused_task, restore_queue_fences, transition_acceptance_fence,
+    BUDGET_ROOT_FENCES,
+    REMOTE_ADMISSIONS,
+    apply_budget_root_admission_fence,
+    apply_task_admission_fences_locked,
+    cancel_task_by_id,
+    clear_acceptance_fence_for_root,
+    complete_requested_admission,
+    finish_remote_task_lease,
+    list_requested_admissions,
+    parse_iso_to_ts,
+    record_scheduled_admission,
+    recover_requested_after_snapshot_error,
+    register_requested_admission,
+    requested_admission_ids,
+    requested_admission_snapshot,
+    restore_queue_fences,
+    restore_requested_admissions,
+    restore_requested_admissions_from_results,
+    resume_budget_paused_task,
+    terminalize_pending_after_invalid_acceptance_fences,
+    transition_acceptance_fence,
 )
 
 log = logging.getLogger(__name__)
-
 
 DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
 SOFT_TIMEOUT_SEC: int = 600
@@ -56,8 +78,7 @@ HEARTBEAT_STALE_SEC: int = 120
 QUEUE_MAX_RETRIES: int = 1
 FINALIZATION_GRACE_SEC: int = FINALIZATION_GRACE_DEFAULT_SEC
 SCHEDULED_TASKS_FILE = pathlib.Path("state") / "scheduled_tasks.json"
-# BUG3: pause a campaign whose objective fails to absorb after this many reviewed cycles.
-# Mirrors the consecutive-failures threshold; keyed on the objective fingerprint, not failures.
+# Pause after the consecutive-failure threshold; keyed on the objective fingerprint.
 OBJECTIVE_REPEAT_CAP: int = 3
 _timeout_deprecation_emitted: bool = False
 
@@ -95,6 +116,7 @@ def init(drive_root: pathlib.Path, soft_timeout: int, hard_timeout: int) -> None
     SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC = 600, 1800
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
+    REMOTE_ADMISSIONS.clear()
     _emit_timeout_deprecation_once(legacy_keys)
 
 
@@ -143,7 +165,7 @@ _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
 # module size). Re-export the thin names the enforce path and tests use; monkeypatching
 # these queue-module names still works because the enforce path references them here.
-from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
+from supervisor.task_reaper import (  # noqa: E402,F401,I001 — delayed re-export
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
     reap_timed_out_task as _reap_timed_out_task,
@@ -197,31 +219,10 @@ def enqueue_task(
     t = dict(task)
     attach_task_contract(t)
     with _queue_lock:
-        project_id = str(t.get("project_id") or "").strip()
-        if project_id:
-            try:
-                from ouroboros.projects_registry import get_reserved_project
-
-                project = get_reserved_project(DRIVE_ROOT, project_id)
-                lifecycle = str((project or {}).get("lifecycle") or "active")
-                if project is not None and lifecycle != "active":
-                    t["_admission_blocked"] = "project_routing_fence"
-                    t["_project_lifecycle"] = lifecycle
-                    t["_project_id"] = project_id
-                    return t
-            except Exception:
-                log.warning("Project admission check failed for %s", project_id, exc_info=True)
-                t["_admission_blocked"] = "project_routing_fence_lookup_failed"
-                t["_project_id"] = project_id
-                return t
-        root_id = str(t.get("root_task_id") or "").strip()
-        if root_id and not restoring_snapshot and apply_budget_root_admission_fence(t, root_id):
-            return t
-        fence = ACCEPTANCE_FENCES.get(root_id) if root_id else None
-        if isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "sealed"}:
-            t["_admission_blocked"] = "task_acceptance_fence"
-            t["_acceptance_fence_token"] = str(fence.get("token") or "")
-            t["_acceptance_fence_status"] = str(fence.get("status") or "active")
+        if apply_task_admission_fences_locked(
+            t,
+            restoring_snapshot=restoring_snapshot,
+        ):
             return t
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
@@ -413,7 +414,7 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
 
 # Cron/timezone schedule helpers live in supervisor/schedule_time.py (P7
 # module-size relief); imported under their historical private names.
-from supervisor.schedule_time import (  # noqa: E402
+from supervisor.schedule_time import (  # noqa: E402,I001
     next_cron_time as _next_cron_time,
     parse_schedule_time as _parse_schedule_time,
     schedule_next_run as _schedule_next_run,
@@ -595,7 +596,12 @@ def _kept_service_pids() -> "set[int]":
         return set()
 
 
-def persist_queue_snapshot(reason: str = "") -> None:
+def persist_queue_snapshot(reason: str = "", *, required: bool = False) -> bool:
+    with _queue_lock:
+        return _persist_queue_snapshot_locked(reason, required=required)
+
+
+def _persist_queue_snapshot_locked(reason: str, *, required: bool) -> bool:
     """Persist queue snapshot for restart/recovery diagnostics.
 
     Snapshots PENDING/RUNNING under the queue lock: iterating the live dicts
@@ -610,6 +616,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
         ]
         acceptance_fences = [dict(row) for row in ACCEPTANCE_FENCES.values()]
         budget_root_fences = [dict(row) for row in BUDGET_ROOT_FENCES.values()]
+        requested_admissions = requested_admission_snapshot()
         # Honest worker-pool counts from the ACTUAL pool (not the configured max): the live
         # pool can be smaller (a crash-storm/direct-chat fallback clears WORKERS) and a slot
         # mid-reap is popped from RUNNING but NOT assignable. Surface the real assignable-idle
@@ -684,51 +691,46 @@ def persist_queue_snapshot(reason: str = "") -> None:
         "ts": utc_now_iso(),
         "reason": reason,
         "pending_count": len(pending_items), "running_count": len(running_items),
+        "requested_count": len(requested_admissions),
         "reaping_count": reaping_count,
         "worker_total": worker_total,
         "assignable_idle_workers": assignable_idle_workers,
         "acceptance_fences": acceptance_fences,
         "budget_root_fences": budget_root_fences,
+        "requested_admissions": requested_admissions,
         "pending": pending_rows, "running": running_rows,
     }
     try:
         atomic_write_text(QUEUE_SNAPSHOT_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
     except Exception:
+        if required:
+            raise
         log.warning("Failed to persist queue snapshot (reason=%s)", reason, exc_info=True)
-        pass
-
-
-def parse_iso_to_ts(iso_ts: str) -> Optional[float]:
-    """Parse ISO timestamp to Unix time."""
-    txt = str(iso_ts or "").strip()
-    if not txt:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        log.debug("Failed to parse ISO timestamp: %s", txt, exc_info=True)
-        return None
+        return False
+    return True
 
 
 def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
     """Restore recent pending tasks from queue snapshot."""
-    if PENDING:
-        return 0
     try:
         if not QUEUE_SNAPSHOT_PATH.exists():
+            restore_requested_admissions_from_results()
             return 0
         snap = json.loads(QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         if not isinstance(snap, dict):
+            restore_requested_admissions_from_results()
             return 0
         ts = str(snap.get("ts") or "")
         ts_unix = parse_iso_to_ts(ts)
-        if ts_unix is None:
-            return 0
-        if (time.time() - ts_unix) > max_age_sec:
-            return 0
+        restore_legacy_pending = bool(
+            not PENDING
+            and ts_unix is not None
+            and (time.time() - ts_unix) <= max_age_sec
+        )
         from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, load_task_result
         raw_fences = snap.get("acceptance_fences", [])
         raw_budget_fences = snap.get("budget_root_fences", [])
+        raw_requested_admissions = snap.get("requested_admissions", [])
         snapshot_pending = [
             row.get("task")
             for row in (snap.get("pending") or [])
@@ -736,6 +738,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
         ]
         fenced_roots, malformed_fences, malformed_budget_fences = restore_queue_fences(raw_fences, raw_budget_fences)
         if malformed_budget_fences:
+            recover_requested_after_snapshot_error("invalid_budget_fence_requested_recovery")
             append_jsonl(
                 DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {"ts": utc_now_iso(), "type": "queue_restore_invalid_budget_root_fences",
@@ -743,7 +746,8 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             )
             return 0
         if malformed_fences:
-            affected = [str(task.get("id") or "") for task in snapshot_pending if task.get("id")]
+            recover_requested_after_snapshot_error("invalid_acceptance_fence_requested_recovery")
+            affected = terminalize_pending_after_invalid_acceptance_fences(snapshot_pending)
             append_jsonl(
                 DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
@@ -753,27 +757,16 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "action": "fail_closed_no_restore",
                 },
             )
-            try:
-                from ouroboros.task_results import STATUS_CANCELLED, write_task_result
-
-                for task in snapshot_pending:
-                    task_id = str(task.get("id") or "")
-                    if task_id:
-                        existing = load_task_result(DRIVE_ROOT, task_id) or {}
-                        write_task_result(
-                            DRIVE_ROOT,
-                            task_id,
-                            STATUS_CANCELLED,
-                            **_cancel_result_fields(
-                                task,
-                                existing=existing,
-                                result="Task was not restored because its acceptance-fence snapshot was invalid.",
-                            ),
-                        )
-            except Exception:
-                log.warning("Failed to terminalize tasks from invalid acceptance-fence snapshot", exc_info=True)
             return 0
 
+        restored_requested, _malformed_requested = restore_requested_admissions(
+            raw_requested_admissions,
+        )
+        restored_requested += restore_requested_admissions_from_results()
+        if not restore_legacy_pending:
+            if restored_requested:
+                persist_queue_snapshot(reason="requested_admissions_recovered")
+            return 0
         pending_by_id = {
             str(task.get("id") or ""): task for task in snapshot_pending if str(task.get("id") or "")
         }
@@ -781,10 +774,16 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
         skipped_terminal = 0
         skipped_fenced: list[str] = []
         blocked_restore: list[str] = []
+        restore_conflicts = requested_admission_ids() | {str(item.get("id") or "") for item in PENDING}
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
             if not task.get("id") or chat_id is None or chat_id == "":
                 continue
+            task_id = str(task.get("id") or "")
+            if task_id in restore_conflicts:
+                blocked_restore.append(task_id)
+                continue
+            restore_conflicts.add(task_id)
             fenced = False
             for fenced_root in fenced_roots:
                 if str(task.get("root_task_id") or "") == fenced_root:
@@ -823,18 +822,14 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 except Exception:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
-            # Never resurrect a terminal/cancelled task as a ghost pending entry.
             try:
                 existing = load_task_result(DRIVE_ROOT, str(task.get("id")))
                 existing_status = str(existing.get("status") or "") if existing else ""
-                # Terminal OR cancel-intent — both must not be resurrected as pending.
                 if existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED:
                     skipped_terminal += 1
                     continue
             except Exception:
                 log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
-            # These tasks already existed when the root pause was snapshotted.
-            # Restore them behind the root marker; only new admission is fenced.
             admitted = enqueue_task(task, restoring_snapshot=True)
             if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
                 blocked_restore.append(str(task.get("id") or ""))
@@ -850,22 +845,24 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "root_task_ids": sorted(fenced_roots),
                 },
             )
-        if restored > 0 or skipped_terminal > 0 or blocked_restore:
+        if restored > 0 or restored_requested > 0 or skipped_terminal > 0 or blocked_restore:
             append_jsonl(
                 DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
                     "ts": utc_now_iso(),
                     "type": "queue_restored_from_snapshot",
                     "restored_pending": restored,
+                    "restored_requested": restored_requested,
                     "skipped_terminal": skipped_terminal,
                     "blocked_admission": blocked_restore,
                 },
             )
-        if restored > 0:
+        if restored > 0 or restored_requested > 0:
             persist_queue_snapshot(reason="queue_restored")
         return restored
     except Exception:
         log.warning("Failed to restore pending queue from snapshot", exc_info=True)
+        restore_requested_admissions_from_results()
         return 0
 
 
@@ -905,10 +902,9 @@ def _emit_cancel_task_done(
 
 
 def _is_workspace_task_record(record: Dict[str, Any] | None) -> bool:
-    if not isinstance(record, dict):
-        return False
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    return bool(str(record.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
+    from ouroboros.workspace_ref import has_workspace
+
+    return isinstance(record, dict) and has_workspace(record)
 
 
 def _cancel_result_fields(
@@ -977,6 +973,7 @@ def _cancel_task_by_id_single(task_id: str) -> bool:
             if w.busy_task_id == task_id:
                 meta = RUNNING.pop(task_id, None) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+                finish_remote_task_lease(task, str(task_id))
                 # Reconstruct real cost from durable llm_usage: the worker is about
                 # to be killed without finalizing, so the rollup/task_done would
                 # otherwise record zeros for a cancelled (e.g. evolution) cycle.
@@ -1030,7 +1027,10 @@ def _cancel_task_by_id_single(task_id: str) -> bool:
 
         try:
             from ouroboros.task_results import (
-                STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, load_task_result, write_task_result,
+                STATUS_CANCEL_REQUESTED,
+                STATUS_CANCELLED,
+                load_task_result,
+                write_task_result,
             )
             existing = load_task_result(DRIVE_ROOT, task_id) or {}
             if str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED:

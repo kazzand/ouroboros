@@ -554,6 +554,98 @@ def _verify_and_record(
     )
 
 
+def record_remote_verification_result(
+    ctx: ToolContext,
+    *,
+    envelope: Any,
+    contract_kind: str,
+    criterion_id: str = "",
+    check: Any = None,
+    expected: str = "",
+    expected_match: str = "substring",
+    artifact_paths: Any = None,
+    criterion_source: str = "",
+    criterion_basis: str = "",
+) -> str:
+    """Persist Home's receipt from one typed target-native check result."""
+
+    kind = str(contract_kind or "").strip()
+    match_mode = str(expected_match or "substring").strip().lower() or "substring"
+    if kind not in _RUN_KINDS:
+        return "⚠️ REMOTE_VERIFY_UNSUPPORTED: only run-kind checks execute on the remote target."
+    if match_mode == "bytes_equal":
+        return (
+            "⚠️ REMOTE_VERIFY_UNSUPPORTED: bytes_equal needs a dedicated remote "
+            "two-artifact comparison and was not recorded."
+        )
+    argv = _normalize_check(check)
+    if not argv:
+        return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind={kind} requires `check`."
+    process = getattr(envelope, "process", None)
+    if process is None:
+        return "⚠️ REMOTE_VERIFY_ERROR: target returned no typed process result; no receipt recorded."
+    expected_s = str(expected or "").strip()
+    out = str(getattr(process, "stdout", "") or "")
+    stderr = str(getattr(process, "stderr", "") or "")
+    if stderr:
+        out = f"{out}\n{stderr}" if out else stderr
+    rc = int(getattr(process, "returncode", 1))
+    matched = (not expected_s) or _expected_matches(out, expected_s, match_mode)
+    passed = rc == 0 and matched
+    receipt: dict[str, Any] = {
+        "tool": "verify_and_record",
+        "contract_kind": kind,
+        "expected": expected_s,
+        "expected_match": match_mode,
+        "ts": utc_now_iso(),
+        "criterion_source": (
+            str(criterion_source).strip().lower()
+            if str(criterion_source).strip().lower() in {"task_stated", "agent_defined"}
+            else "agent_defined"
+        ),
+        "status": "pass" if passed else "fail",
+        "returncode": rc,
+        "matched": bool(matched),
+        "check": shlex.join(argv),
+        "check_rendering": CHECK_RENDERING_SHLEX_JOIN,
+        "summary": _bounded(out, _RECEIPT_OUTPUT_CAP),
+        "execution_surface": "remote_target",
+        "execution_trace": dict(getattr(envelope, "trace", {}) or {}),
+    }
+    criterion = str(criterion_id or "").strip()
+    if criterion:
+        receipt["criterion_id"] = criterion[:120]
+    basis = " ".join(str(criterion_basis or "").split()).strip()
+    if basis:
+        receipt["criterion_basis"] = basis[:500]
+    declared = [str(path) for path in (artifact_paths or []) if str(path or "").strip()]
+    if declared:
+        receipt["artifact_lifecycle"] = [
+            {
+                "path": path[:300],
+                "exists_after": None,
+                "check_surface": "remote_target_unprobed",
+            }
+            for path in declared[:20]
+        ]
+    masked, reasons = _check_has_exit_masking(argv)
+    if masked:
+        receipt["check_exit_masking"] = True
+        receipt["check_exit_masking_reasons"] = reasons
+    append_verification_receipt(
+        getattr(ctx, "drive_root", None),
+        str(getattr(ctx, "task_id", "") or ""),
+        receipt,
+    )
+    verdict = "PASS" if passed else "FAIL"
+    exp_note = f" expected={expected_s!r}" if expected_s else ""
+    return (
+        f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}. "
+        "Host-attested remote receipt recorded.\n\n"
+        f"{_bounded(out, _TOOL_OUTPUT_CAP)}"
+    )
+
+
 def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("verify_and_record", {

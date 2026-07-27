@@ -1286,8 +1286,10 @@ def build_goal_section(
 def build_head_snapshot_section(
     repo_dir: Path,
     paths: list[str],
+    *,
+    verified_filesystem_snapshot: bool = False,
 ) -> str:
-    """Build prompt text with HEAD snapshots of touched files."""
+    """Build prompt text with HEAD or verified materialized file snapshots."""
     if not paths:
         return "(no touched files)"
 
@@ -1307,15 +1309,20 @@ def build_head_snapshot_section(
         ext = Path(rel).suffix.lstrip(".")
         lang = ext if ext else ""
         try:
-            # Force English git stderr so new-file detection is locale-stable.
-            _git_env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"}
-            result = subprocess.run(
-                ["git", "show", f"HEAD:{rel}"],
-                cwd=repo_dir,
-                capture_output=True,
-                timeout=10,
-                env=_git_env,
-            )
+            if verified_filesystem_snapshot:
+                from ouroboros.remote_plan_review import verified_snapshot_result
+
+                result = verified_snapshot_result(repo_dir, rel)
+            else:
+                # Force English git stderr so new-file detection is locale-stable.
+                _git_env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"}
+                result = subprocess.run(
+                    ["git", "show", f"HEAD:{rel}"],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    timeout=10,
+                    env=_git_env,
+                )
             if result.returncode == 0 and result.stdout:
                 raw_bytes = result.stdout
                 # Size guard uses raw bytes, not decoded characters.

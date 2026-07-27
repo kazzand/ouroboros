@@ -185,6 +185,48 @@ def test_platform_layer_exports_core_symbols():
     assert sum([IS_WINDOWS, IS_MACOS, IS_LINUX]) <= 1
 
 
+def test_checked_process_group_kill_preserves_custody_result(monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_layer.os, "killpg", lambda _pgid, _sig: None)
+    assert platform_layer.kill_process_group_id(12345, checked=True) is True
+
+    def _gone(_pgid, _sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(platform_layer.os, "killpg", _gone)
+    assert platform_layer.kill_process_group_id(12345, checked=True) is False
+
+    def _denied(_pgid, _sig):
+        raise PermissionError
+
+    monkeypatch.setattr(platform_layer.os, "killpg", _denied)
+    with pytest.raises(PermissionError):
+        platform_layer.kill_process_group_id(12345, checked=True)
+
+
+@pytest.mark.parametrize(
+    "effect,expected",
+    [
+        (None, "alive"),
+        (ProcessLookupError, "gone"),
+        (PermissionError, "unknown"),
+    ],
+)
+def test_process_group_status_is_tri_state(monkeypatch, effect, expected):
+    import ouroboros.platform_layer as platform_layer
+
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", False)
+
+    def _status(_pgid, _signal_number):
+        if effect is not None:
+            raise effect
+
+    monkeypatch.setattr(platform_layer.os, "killpg", _status)
+    assert platform_layer.process_group_status(12345) == expected
+
+
 def test_normalize_repo_path_handles_windows_style_paths():
     """normalize_repo_path must handle Windows-style backslash paths on any OS.
 

@@ -91,6 +91,12 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, GAIA solver, desktop chat) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes
       ├── retention.py         ← Unified GC retention SSOT: clamp/age-cutoff helpers + legacy-key seed picker used by worktree/task-drive/service-log startup pruning
       ├── workspace_preflight.py ← Read-only external-workspace git/manifest/toolchain snapshot used by gateway task creation
+      ├── workspace_ref.py    ← Dependency-light local/SSH Project/task placement contract and fail-loud Home-path boundary
+      ├── workspace_diagnostics.py ← Shared typed local/remote diagnostic, process-result, and execution-envelope authority
+      ├── workspace_native.py ← Restricted dependency-light native filesystem/process/Git/service dispatch kernel shared by Home and execd
+      ├── workspace_native_contract.py / workspace_query_native.py ← Native operation/control/result contracts plus shared search/query/VCS semantics
+      ├── workspace_payload_native.py ← Target-native reviewed skill/extension payload staging/execution and declared output/scratch capture
+      ├── workspace_snapshot_native.py ← Stable native workspace manifest/fingerprint and guarded patch-apply primitives
       ├── project_sources.py   ← (v6.59.0) Project working-folder sources: attach an existing owner folder (resolved-realpath validation — exists/dir/not-home-root/no repo-data overlap; opt-in `init_git` attach-snapshot commit, NEVER auto-init) and server-side `git clone` into the durable projects root (atomic tmp→rename, `GIT_TERMINAL_PROMPT=0` + BatchMode ssh, typed `auth_required`); provenance (attached|cloned|genesis|none) + `clone_url` are recorded on the registry as historical facts, `trusted_at` stamps automatically (notification trust model — attaching IS the owner's grant)
       ├── workspace_admission.py ← (v6.58.0) Workspace-task admission SSOT: the ONE workspace-root validator (git-worktree root, no repo/data overlap) shared by `/api/tasks` and the promote path; `resolve_room_workspace` defaults a project-room task to the room's registered `working_dir` (sentinel `workspace="none"` opts out) and LOUD-FAILS a set-but-broken working_dir (a room task must never silently degrade to a workspace-less self_modification-profile task); `compose_workspace_block` renders the shared [HEADLESS_WORKSPACE] guidance; `bounded_workspace_preflight` hard-caps the promote-path snapshot so the supervisor event-drain thread stays responsive
       ├── local_model.py       ← Local LLM lifecycle (llama-cpp-python)
@@ -132,6 +138,19 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── skill_review_runner.py ← shared lifecycle-backed skill review runner for API + agent tool paths; writes review_job.json + skill_review_* events and routes all executable skills (including self-authored provenance) through tri-model review
       ├── server_auth.py       ← Non-localhost auth gate (OUROBOROS_NETWORK_PASSWORD)
       ├── server_control.py    ← Process-control helpers: restart, panic stop
+      ├── remote_protocol.py   ← Strict canonical JSON + bounded binary framing, prepared-call identity, sequence and lease contracts
+      ├── remote_workspace.py  ← Server-owned project-session broker, worker Pipe proxy, admission, leases, reconciliation and remote blob import
+      ├── remote_ssh.py        ← Minimal-environment live OpenSSH protocol transport, health and reconnect
+      ├── remote_ssh_bootstrap.py ← Bounded manifest/stat/stream verification and atomic immutable execd release installation
+      ├── execd.py / execd_state.py ← Remote restricted entrypoint, operation journal/CAS, workspace identity and independent process custody
+      ├── remote_browser_forward.py ← Task-owned, required-custody OpenSSH loopback forward for admitted remote services
+      ├── remote_file_bridge.py ← Tokenized task-only Home loopback bridge for verified remote file:// browser assets
+      ├── remote_task_files.py ← Exact-manifest attachment staging, validation and task-file cleanup across Home/execd
+      ├── remote_service_leases.py ← Home projection of task/service lease identity used by cancel, teardown and reconnect
+      ├── remote_claude.py     ← Verified SSH snapshot → Home Claude SDK → guarded remote binary-patch bridge
+      ├── remote_finalization.py ← Remote-native patch/deliverable capture plus pre-ACK redacted result/process import into Home task artifacts
+      ├── remote_plan_review.py ← Bounded verified SSH snapshot adapter for existing Home plan/review faculties
+      ├── remote_worker_proxy.py ← Multiprocessing worker request/reply proxy to the server-owned broker
       ├── server_entrypoint.py ← CLI argument parsing, port-binding helpers
       ├── server_runtime.py    ← Server startup/onboarding and WebSocket liveness helpers
       ├── server_web.py        ← Static web file helpers (NoCacheStaticFiles, web dir resolver)
@@ -677,6 +696,7 @@ finalization states.
 │   │   ├── post_task_evolution_counter.json ← Per-drive task counter for the post-task evolution `every_n` cadence
 │   │   ├── scheduled_tasks.json ← Queue-backed cron schedules (5-field cron, timezone, last/next run, task template)
 │   │   ├── projects.json ← Project registry: immutable id/chat identity, optional working folder, lifecycle/routing fence, visible revision, and deletion error; tombstones are durable and never age-pruned
+│   │   ├── remote_connections.json ← Owner-only (0600), locked SSH alias metadata, pinned execd continuity ID/history, and active/retired lifecycle; never SSH keys/passwords/options or live session state
 │   │   ├── project_task_bindings.json ← Task→project bindings (schema v1) with a REQUIRED typed origin: the ingress-captured source-row ref (+`source_text`, the retention-proof full copy, stored only for CROSS-thread origins — i.e. the message that started the project) or a closed-enum `origin_absent` reason. Immutable except ONE-WAY enrichment (a same-project re-bind may fill a missing ref; a valid ref is never changed); one root belongs to at most one Project and tombstoning never removes the binding. The retention-proof invariant is FORWARD-ONLY by owner decision: pre-v6.73.0 bindings (no `source_text`) are not migrated and their start messages remain rotation-vulnerable as before
 │   │   ├── ui_preferences.json ← Owner-local layout preferences and monotonic `project_seen_revision` paint ACKs; legacy `project_last_viewed`/`project_hidden` are one-minor deprecated no-ops
 │   │   ├── queue_snapshot.json
@@ -735,6 +755,33 @@ finalization states.
 ├── Deliverables/      ← (v6.38.0) Visible user-deliverables container: a BARE user_files filename (no directory) lands here instead of the home root (OUROBOROS_DELIVERABLES_ROOT; sibling of projects/, outside repo/ and data/, never GC-pruned)
 └── ouroboros.pid           ← PID lock file (platform lock — auto-released on crash)
 ```
+
+An SSH target has a separate, version-independent user-local state root; remote
+PIDs are never copied into Home's process ledger:
+
+```text
+~/.local/share/ouroboros/execd/
+├── current -> releases/<build>/<archive_sha>/ ← atomically switched verified bundle
+├── releases/<build>/<archive_sha>/bin/ouroboros-execd
+├── manifests/<capability_sha>.json
+└── state/                                  ← mode 0700
+    ├── continuity/host_id.json             ← mode 0600 continuity ID
+    ├── workspaces/<workspace_id>/
+    │   ├── blobs/                           ← content-addressed native/import data
+    │   ├── spool/                           ← retained operation results until ACK
+    │   └── operations/                      ← fsync-before-effect operation journal
+    └── custody/<server_generation>/<workspace_id>.json
+                                                ← remote PGID fingerprints + leases
+```
+
+Remote service output is written inside the admitted worktree at
+`.ouroboros/services/<service>.log`; model/UI access is through bounded,
+redacted service-log results. Final patches, deliverable manifests, imported
+process-output blobs, verification evidence, and support request IDs are
+validated on Home and stored in the ordinary
+`data/task_results/artifacts/<task_id>/` and `data/logs/` surfaces above.
+Connection/trust metadata and journal evidence may survive disconnect,
+retirement, and Panic; live sessions and process groups may not.
 
 ---
 
@@ -990,7 +1037,28 @@ Rationale: logs are UI projections, not the source of truth. The private ledger 
 
 ### Settings
 
-Settings has Providers, Secrets, Models, Behavior, Advanced, and About. It handles provider keys, model routing, review settings, runtime mode, external skills repo, ClawHub registry URL, MCP servers, source control metadata, local model runtime, extension settings, timeouts, and reset. Hot-reload policy: total budget, timeouts, and GitHub metadata apply immediately; per-task cost threshold, models, API keys, effort, and review settings apply next task; local runtime, worker count, base URLs, provider runtime parameters, and runtime-mode changes require restart. Context mode hot-applies through the dedicated owner endpoint without a restart; lowering Max to Low is refused while queued, running, or direct-chat work exists. Runtime mode remains owner-controlled: ordinary `/api/settings` drops it, while `/api/owner/runtime-mode` persists the next-boot value without changing the current boot baseline.
+Settings has Providers, Connections, Secrets, Models, Behavior, Advanced, and
+About. Connections is the sole UI for owner-managed SSH aliases: it lists
+active/retired metadata and derived live state, adds non-secret name/alias
+records, tests transport/identity/capabilities, bootstraps execd, confirms
+retrust, and soft-retires a connection. It is mounted through the existing
+Settings orchestrator, not as a top-level page. Every operation requires the
+existing Network Password even from loopback; the UI stores no SSH key or
+password. Project creation owns the Local/SSH choice and bounded remote
+directory picker, and final admission still requires a Git worktree root.
+
+The remaining panels handle provider keys, model routing, review settings,
+runtime mode, external skills repo, ClawHub registry URL, MCP servers, source
+control metadata, local model runtime, extension settings, timeouts, and reset.
+Hot-reload policy: total budget, timeouts, and GitHub metadata apply
+immediately; per-task cost threshold, models, API keys, effort, and review
+settings apply next task; local runtime, worker count, base URLs, provider
+runtime parameters, and runtime-mode changes require restart. Context mode
+hot-applies through the dedicated owner endpoint without a restart; lowering
+Max to Low is refused while queued, running, or direct-chat work exists.
+Runtime mode remains owner-controlled: ordinary `/api/settings` drops it, while
+`/api/owner/runtime-mode` persists the next-boot value without changing the
+current boot baseline.
 
 ## 4. Server API Endpoints
 
@@ -1056,6 +1124,14 @@ the old pass-through behavior was a root escape.
 | POST | `/api/owner/scope-review-floor` | `gateway.settings.api_owner_scope_review_floor` (DEPRECATED and ENFORCEMENT-INERT since v6.80.0; still mounted, still stores and audits — see below) |
 | POST | `/api/owner/safety-mode` | `gateway.settings.api_owner_safety_mode` |
 | POST | `/api/owner/capability-ack` | `gateway.settings.api_acknowledge_capability` |
+| GET | `/api/owner/connections` | `gateway.connections.api_connections_list` |
+| POST | `/api/owner/connections` | `gateway.connections.api_connections_add` |
+| POST | `/api/owner/connections/{connection_id}/test` | `gateway.connections.api_connection_test` |
+| POST | `/api/owner/connections/{connection_id}/bootstrap` | `gateway.connections.api_connection_bootstrap` |
+| POST | `/api/owner/connections/{connection_id}/reconnect` | `gateway.connections.api_connection_reconnect` |
+| POST | `/api/owner/connections/{connection_id}/retrust` | `gateway.connections.api_connection_retrust` |
+| GET | `/api/owner/connections/{connection_id}/dirs` | `gateway.connections.api_connection_dirs` |
+| DELETE | `/api/owner/connections/{connection_id}` | `gateway.connections.api_connection_retire` |
 | GET | `/api/ui/preferences` | `gateway.ui_preferences.api_ui_preferences_get` |
 | POST | `/api/ui/preferences` | `gateway.ui_preferences.api_ui_preferences_post` |
 | GET | `/api/model-catalog` | `gateway.models.api_model_catalog` |
@@ -1107,6 +1183,16 @@ the old pass-through behavior was a root escape.
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/inject` | `gateway.host_service._api_chat_inject` |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | `gateway.host_service._api_ws_message` |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | `gateway.host_service._ws_events` |
+
+`/api/owner/connections` is an intentionally stronger sub-namespace:
+`server_auth.NetworkAuthGate` checks the configured Network Password and
+authenticated cookie/header before the loopback/no-password bypass and before a
+handler parses a body or looks up metadata. With no configured password, every
+method returns the same fact-free `owner_auth_not_configured`; unauthenticated
+requests return `owner_auth_required`. Agent shell/CLI and browser guards block
+this namespace as defense in depth. The owner CLI reads the password only from
+a controlling terminal and shares these routes; internal Project admission
+uses the sealed server-owned broker directly.
 
 Rationale: `server.py` should own process startup/lifespan/static mounting, while `gateway/*` owns browser-facing HTTP/WS contracts. This keeps UI and runtime coupling explicit and testable.
 
@@ -1267,6 +1353,180 @@ In `runtime_mode=light`, generic writes to cognitive memory and absolute home pa
 `tool_capabilities.py` is the SSOT for core tools, meta-tools, parallel-safe tools, stateful browser tools, untruncated tool results, per-tool result caps, and reviewed mutative tools. `tool_policy.py` decides round-one visibility. `loop_tool_execution.py` handles timeouts, thread pools, live logs, truncation, metadata, and reviewed mutative hard ceilings.
 
 Rationale: tool classification drift caused subtle bugs; every hardcoded set now has one canonical home. Review outputs and cognitive artifacts are exempt from generic truncation because they are process memory, not transport noise.
+
+#### Remote SSH workspace placement
+
+`ouroboros/workspace_ref.py` is the dependency-light placement contract. A
+Project/task workspace is either a native Home git root (`kind=local`) or an
+admitted `(connection_id, remote_root, workspace_id)` (`kind=ssh`). The task
+stores an immutable normalized ref. `ToolContext.workspace_root` continues to
+mean a native Home path only; it is `None` for SSH, while
+`ToolContext.is_workspace_mode()` remains true. Any Home-path consumer that asks
+an SSH ref for `active_repo_dir()` fails with `RemoteWorkspacePathError` instead
+of falling back to the Ouroboros repo.
+
+SSH is an execution placement, not a second agent or tool family. Home retains
+the model loop, identity, memory, policy, safety, review, credentials and
+durable task state. Execd will expose only the restricted native workspace
+kernel. Model-visible names/schemas remain generated once by the existing
+registry. `workspace_diagnostics.py` owns the internal typed diagnostic
+envelope and single process-result type; public result text remains compatible.
+`remote_protocol.py` owns strict bounded framing and prepared-call identity. Its
+bulk flow permits at most one unacknowledged frame, while a separate control
+reader handles cancel/Panic and kills a remote process group before ACK.
+
+Home here is whichever machine runs the Ouroboros server, not necessarily a
+laptop. It remains the sole owner of identity/memory, model and Claude calls,
+MCP/provider credentials, policy/safety, Project serialization, review,
+canonical task state and imported artifacts. Execd has no model client,
+consciousness, scheduler, review authority or self-evolution. A missing
+mandatory native capability blocks SSH admission instead of hiding tools from
+the model.
+
+V1 remote placement is Project-only. Project creation admits a canonical
+remote Git worktree and persists its opaque `workspace_id`; every task inherits
+an immutable ref plus `ExecutorRef(type="ssh_exec")`. Tasks cannot carry raw
+SSH options or override the Project placement, and a Project cannot rebind
+while its task subtree is active. Direct Project-room access uses a private
+read-only lens; mutation begins only after ordinary task promotion.
+
+| Faculty | Placement in an SSH Project task |
+|---|---|
+| Active-workspace file/edit/search/query, VCS, command/script, verification check | Execd with target-native paths, cwd, Git and interpreters |
+| Service start/status/log/stop | Start follows effective cwd; follow-ups use recorded placement |
+| System repo, runtime/task/artifact/user roots, memory, journal, task tree, schedules, review, evolution | Home |
+| Plan/acceptance/scope/code inventory and Claude edit | Verified remote snapshot on Home; guarded fingerprint-bound patch import |
+| Browser | Home browser through a task-owned loopback-only OpenSSH forward |
+| Media | Verified import to Home; bounded large-video frame extraction may run remotely |
+| Skills/extensions | Home unless one reviewed invocation declares `active_workspace` |
+| MCP | Home only |
+
+The staged dispatcher runs non-path Home authority before connecting, obtains
+only the target-native facts needed by an otherwise-authorized call, then binds
+one canonical argument object through Home safety and target execution. SSH
+calls use `PREPARE → CONTINUE|ABORT → RESULT`; a short-lived one-shot hash
+binds build/capability/workspace/task/request/operation identity, canonical
+arguments and native facts. Tamper, expiry, replay or changed workspace
+identity fails before handler start. Arbitrary shell remains an unsandboxed
+process running with the selected remote Unix account's OS permissions; execd
+does not elevate authority.
+
+`remote_workspace.RemoteSessionBroker` is server-owned and keyed by connection,
+Project, workspace and Home server generation. Workers use bounded
+multiprocessing Pipe proxies; blocking OpenSSH/framing stays off gateway and
+supervisor loops, and one healthy Project session is reused across tasks.
+`remote_ssh.py` uses the system OpenSSH client with a minimal child environment,
+fixed noninteractive argv, fresh effective `ssh -G` validation, continuous
+stderr draining and required Home process custody. Bootstrap-only manifest,
+archive and immutable selected-release handling lives in
+`remote_ssh_bootstrap.py`, so a live/reconnected session starts the exact
+attested release path rather than dereferencing mutable `current`.
+
+OpenSSH remains the authentication and transport-trust authority: the owner's
+alias, `known_hosts`, IdentityFile/ProxyJump and local `ssh-agent` are reused
+without copying credentials. Execd's separately pinned `host_id` is a
+version-independent continuity signal, not hardware identity or a replacement
+for `known_hosts`; a change requires owner-confirmed retrust while no task/lease
+is active. Provider, MCP, Network Password and Home-control values are not sent
+to execd. Password/MFA/first-host prompts are completed in a normal terminal.
+The owner `Test` action is a read-only transport/platform probe and neither
+initializes nor changes that continuity pin. Only the first successful
+`Bootstrap` handshake may initialize it. Bootstrap compatibility and fresh
+health are process-local admission evidence, not mutable durable connection
+metadata; after Home restarts the owner runs the fast verified Bootstrap path
+again before the connection is selectable for a new Project.
+
+Bootstrap uploads a verified standalone asset from Home and needs no remote
+Python, internet, `sudo`, systemd or listening port. The supported v1 targets
+are glibc Linux x86_64/aarch64, glibc 2.17 or newer with the declared loader.
+musl/Alpine, macOS, Windows, wrong loader/architecture and older glibc fail
+before upload; there is no system-Python fallback. Installation is
+manifest-allowlisted under `~/.local/share/ouroboros/execd/`, atomically
+switches `current`, and restores the previous pointer if self-smoke fails.
+`scripts/build_execd_bundle.py` is the deterministic dual-architecture archive
+and manifest packager. CI assembles and smoke-tests each architecture on a
+glibc-2.17 baseline, verifies a deterministic rebuild, embeds the resulting
+assets in every desktop package, and attaches the same manifest-bound archives
+to tagged releases.
+
+Protocol v1 uses a nonce-bound bounded preamble, canonical JSON control frames
+(1 MiB maximum), separate 64 KiB hash-verified blob chunks, monotonic sequences
+and one unacknowledged bulk frame. Execd fsync-journals mutation start before
+effects and retains results until ACK. Reconnect reconciles by operation ID and
+request hash: proven `not_started` reads may retry, matching completed work
+returns its stored result, and an unprovable post-start mutation becomes
+`completion_unknown` and is never blindly repeated.
+
+CAS, result-spool, journal and custody state is Project-scoped transport data
+under a connection/workspace, so two Projects admitted to the same Git root
+cannot collect or kill each other's live state. Reference-aware GC preserves
+every non-ACKed journal reference plus staged/in-flight blobs and a bounded
+post-ACK export grace, reclaims orphans by age and oldest-first size/count
+pressure, and reserves one whole maximum snapshot transaction before refusing
+new writes when protected data alone exhausts hard capacity. ACKed journal rows
+have independent age/count bounds.
+Large process stdout/stderr and an externalized result envelope are fetched
+with exact declared size/SHA and one aggregate byte cap before ACK. Home
+redacts and content-addresses the durable task artifacts first, returns only
+bounded model text plus safe `artifact_store` refs, and withholds ACK when
+verification or persistence fails; raw remote blob IDs never become durable
+Home process-output artifact authority.
+
+Diagnostics preserve domain (`transport|protocol|policy|filesystem|process|
+artifact`), stable code, phase, native errno where available, retryability,
+request/operation IDs and completion (`not_started|completed|unknown`);
+stdout/stderr stay separate. This keeps permission, missing/wrong-type path,
+space/read-only filesystem, process, transport and artifact failures
+distinguishable, and prevents a partial search from claiming an authoritative
+empty result.
+
+Home-only source consumers share one verified snapshot path:
+`workspace_snapshot_native.py` records two equal content/git observations
+(HEAD, index, status, regular files, safe symlinks, modes and blob hashes), and
+`workspace_executor.materialize_remote_workspace_snapshot` verifies every blob
+before creating a task-temporary Home mirror. `remote_claude.py` runs the
+existing Claude Agent SDK against that mirror with Home credentials, emits one
+exact binary before→after patch, and asks execd for a source/HEAD/index-guarded
+`git apply --check` plus default `git apply`. The native apply lock verifies the
+expected post-content fingerprint and restores manifest-bound originals on an
+apply/race failure; rollback failure is explicit. Mirrors are removed on every
+exit path. No Claude runtime or credential is installed on the SSH target.
+
+Remote dev-service browsing remains the same `browse_page` faculty.
+`remote_browser_forward.py` owns a separate, required-custody, non-multiplexed
+OpenSSH `-N -T -L` child. It validates fresh `ssh -G` output twice, rejects
+inherited forwards/commands and environment directives capable of forwarding a
+key retained in the minimal child environment; harmless host defaults such as
+`SendEnv LANG LC_*` remain acceptable when those keys were deliberately
+removed. Validation and launch use the same scrubbed environment and fixed
+options. Option-shaped aliases are rejected, an OS-assigned Home loopback port
+gets a bounded bind-race retry, and SOCKS/public binds are never added. The
+browser rewrites only an admitted task's remote loopback origin; its random Home
+origin is allowed while unrelated Home loopback/private/file origins are
+route-blocked. Browser cleanup, task cancel, connection teardown and Panic
+close the forward. Remote `file://` uses
+`remote_file_bridge.py`: the same verified snapshot is exposed through a
+random task-only loopback origin and unguessable path token, with strict
+workspace/symlink confinement, GET/HEAD only, no directory listing/cookies,
+bounded assets, MIME plus `nosniff`, and cleanup of both server and snapshot.
+
+Normal task finalization and task cancel end only that task's lease and
+non-keepalive groups; cancel also closes its forward, while the reusable
+Project session and unrelated services survive. `stop_service` kills the
+selected service, including an explicit keep-alive service, without closing
+the connection. Transport EOF kills reachable groups owned by that session and
+generation; the independent custodian enforces the fixed 15-second
+physical-partition lease ceiling. Retirement is soft and prevents new
+admission while preserving historical Project refs. Panic stops Home reasoning
+and renewals, priority-sends current-generation kills, then closes every
+forward/broker/OpenSSH child without waiting for ACK.
+
+Named v1 exclusions: task handoff/sharing between machines, non-Git or ad-hoc
+remote work, interactive terminal/TUI, remote desktop, persistent daemon
+installation, arbitrary remote environment/login-shell sourcing,
+`network=none`, generic SOCKS/private-network proxying, remote MCP, and remote
+model/Claude credentials. The remote directory browser may inspect ordinary
+folders, but final Project admission requires a canonical Git worktree root.
 
 #### Web access mechanisms (three distinct paths — do not conflate)
 
@@ -1954,15 +2214,20 @@ The panic sequence (in `server.py:_execute_panic_stop()`):
    vs the post-task pipeline (no autonomous re-arm next boot), then
    complete_evolution_campaign(stopped) + drop the queued promotion request
 3. Write ~/Ouroboros/data/state/panic_stop.flag
-4. LocalModelManager.stop_server()   ← kill local model server if running
-5. kill_all_tracked_subprocesses()   ← os.killpg(SIGKILL) every tracked
+4. RemoteSessionBroker.panic_close_all()
+   a. stop every current-generation lease renewal
+   b. priority-send remote process-group kills best-effort
+   c. immediately kill/close forwards, broker and local OpenSSH groups
+      without waiting for a remote ACK
+5. LocalModelManager.stop_server()   ← kill local model server if running
+6. kill_all_tracked_subprocesses()   ← os.killpg(SIGKILL) every tracked
    │                                    foreground subprocess process group
    │                                    (shell commands and ALL their children)
-6. kill_all_foreground(data_dir)     ← stop durable executor-backed foreground
+7. kill_all_foreground(data_dir)     ← stop durable executor-backed foreground
    │                                    local/docker processes
-7. kill_all_services(data_dir)       ← stop service and executor-service groups
-8. kill_workers(force=True)          ← SIGTERM+SIGKILL all multiprocessing workers
-9. os._exit(99)                      ← immediate hard exit, kills daemon threads
+8. kill_all_services(data_dir)       ← stop service and executor-service groups
+9. kill_workers(force=True)          ← SIGTERM+SIGKILL all multiprocessing workers
+10. os._exit(99)                     ← immediate hard exit, kills daemon threads
 ```
 
 Launcher handles exit code 99:
@@ -2047,9 +2312,14 @@ success and failure.
    restarts preserve the local branch tip; explicit Update Now is the only
    path that resets the active branch to a user-approved official SHA.
 8. **Zero orphans on close**: shutdown MUST kill all child processes (see Section 9)
-9. **Panic MUST kill everything**: all processes (workers, subprocesses, subprocess
-   trees, consciousness, evolution) are killed and the application exits completely.
-   No agent code may prevent or delay panic. See BIBLE.md Emergency Stop Invariant.
+9. **Panic MUST kill everything**: Home immediately kills all local processes,
+   stops reasoning/renewals and closes broker/OpenSSH custody without waiting
+   for an ACK. Every reachable current-generation remote process group is
+   killed immediately; only a physical partition may defer remote effect, and
+   an independent custodian enforces the BIBLE's maximum 15-second lost-lease
+   bound. Durable connection/trust/evidence may survive, but no live process
+   does once signalling or lease expiry is possible. See BIBLE.md Emergency
+   Stop Invariant.
 10. **Architecture documentation**: `docs/ARCHITECTURE.md` must be kept in sync with
     the codebase. Every structural change (new module, new API endpoint, new data file,
     new UI page) must be reflected here. This is the single source of truth for how

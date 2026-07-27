@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -571,6 +572,141 @@ def _non_executable_review_message(prefix: str, skill_name: str, status: str, *,
         f"⚠️ {prefix}: skill {skill_name!r} review status is {normalized_status!r}{stale_note}, "
         f"not executable ({gate['blocking_reason']}). A fresh executable review is required. {gate['summary']}"
     )
+
+
+def build_remote_reviewed_payload(
+    ctx: ToolContext,
+    *,
+    skill_name: str,
+    script_rel: str = "",
+    surface: str = "",
+    registered_surface: str = "",
+    call_args: Any = None,
+    repo_path: str | None = None,
+) -> tuple[str, Dict[str, Any] | None, Dict[str, bytes]]:
+    """Build the exact fresh-reviewed package for target-native execution."""
+
+    from ouroboros.skill_loader import _iter_payload_files
+    from ouroboros.workspace_native_contract import (
+        REVIEWED_PAYLOAD_FILE_BYTES,
+        REVIEWED_PAYLOAD_FILE_CAP,
+        REVIEWED_PAYLOAD_TOTAL_BYTES,
+    )
+
+    loaded = find_skill(pathlib.Path(ctx.drive_root), skill_name, repo_path=repo_path)
+    if loaded is None or loaded.load_error:
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: skill {skill_name!r} is unavailable.", None, {}
+    kind = "extension_tool" if surface else "script"
+    if kind == "script" and not loaded.manifest.is_script():
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: skill {skill_name!r} is not a script skill.", None, {}
+    if kind == "extension_tool" and not loaded.manifest.is_extension():
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: skill {skill_name!r} is not an extension.", None, {}
+    if not loaded.enabled:
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: skill {skill_name!r} is disabled.", None, {}
+    try:
+        content_hash = compute_content_hash(
+            loaded.skill_dir,
+            manifest_entry=loaded.manifest.entry,
+            manifest_scripts=loaded.manifest.scripts,
+        )
+    except SkillPayloadUnreadable as exc:
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: reviewed payload is unreadable ({exc}).", None, {}
+    gate = skill_review_gate(
+        loaded.review.status,
+        stale=loaded.review.is_stale_for(content_hash),
+    )
+    if not gate["executable_review"]:
+        return _non_executable_review_message(
+            "REMOTE_PAYLOAD_BLOCKED",
+            skill_name,
+            loaded.review.status,
+            stale=loaded.review.is_stale_for(content_hash),
+        ), None, {}
+    if loaded.manifest.env_from_settings:
+        return (
+            "⚠️ REMOTE_PAYLOAD_CAPABILITY_UNAVAILABLE: active_workspace payloads "
+            "cannot receive Home settings or credential values."
+        ), None, {}
+    invocation: Dict[str, Any]
+    if kind == "script":
+        selected = None
+        entry_rel = ""
+        for item in loaded.manifest.scripts or []:
+            if not isinstance(item, dict):
+                continue
+            declared = str(item.get("name") or "").strip()
+            canonical = declared if "/" in declared else f"scripts/{declared}"
+            if script_rel.strip() in {declared, canonical}:
+                selected, entry_rel = item, canonical
+                break
+        if selected is None:
+            return f"⚠️ REMOTE_PAYLOAD_BLOCKED: script {script_rel!r} is not declared.", None, {}
+        if str(selected.get("execution_affinity") or "home") != "active_workspace":
+            return "", None, {}
+        extra = call_args if isinstance(call_args, list) else []
+        if call_args is not None and not isinstance(call_args, list):
+            return "⚠️ REMOTE_PAYLOAD_BLOCKED: script args must be an array.", None, {}
+        if any(
+            not isinstance(item, (str, int, float)) or isinstance(item, bool)
+            for item in extra
+        ):
+            return "⚠️ REMOTE_PAYLOAD_BLOCKED: script args must be scalar values.", None, {}
+        invocation = {
+            "entry": entry_rel,
+            "argv": [str(item) for item in extra],
+            "timeout_sec": _bound_timeout(loaded.manifest.timeout_sec),
+        }
+    else:
+        if (
+            loaded.manifest.tool_execution_affinity.get(surface)
+            != "active_workspace"
+        ):
+            return "", None, {}
+        invocation = {
+            "surface": registered_surface or surface,
+            "args": dict(call_args or {}),
+            "timeout_sec": max(1, min(300, int(loaded.manifest.timeout_sec or 60))),
+        }
+    files: list[dict[str, Any]] = []
+    blobs: Dict[str, bytes] = {}
+    total = 0
+    try:
+        payload_files = _iter_payload_files(
+            loaded.skill_dir,
+            manifest_entry=loaded.manifest.entry,
+            manifest_scripts=loaded.manifest.scripts,
+        )
+        if not payload_files or len(payload_files) > REVIEWED_PAYLOAD_FILE_CAP:
+            raise ValueError("payload file count exceeds the remote limit")
+        for path in payload_files:
+            raw = path.read_bytes()
+            if len(raw) > REVIEWED_PAYLOAD_FILE_BYTES:
+                raise ValueError(f"payload file is too large: {path.name}")
+            total += len(raw)
+            if total > REVIEWED_PAYLOAD_TOTAL_BYTES:
+                raise ValueError("payload exceeds the remote aggregate limit")
+            digest = hashlib.sha256(raw).hexdigest()
+            rel = path.relative_to(loaded.skill_dir).as_posix()
+            mode = 0o700 if path.stat().st_mode & 0o111 else 0o600
+            files.append(
+                {"path": rel, "sha256": digest, "size": len(raw), "mode": mode}
+            )
+            blobs[digest] = raw
+    except (OSError, ValueError) as exc:
+        return f"⚠️ REMOTE_PAYLOAD_BLOCKED: {exc}.", None, {}
+    package = {
+        "schema_version": 1,
+        "kind": kind,
+        "payload": {
+            "skill_name": loaded.name,
+            "content_hash": content_hash,
+            "entry": loaded.manifest.entry,
+            "runtime": loaded.manifest.runtime,
+            "files": files,
+        },
+        "invocation": invocation,
+    }
+    return "", package, blobs
 
 
 def _handle_skill_exec(

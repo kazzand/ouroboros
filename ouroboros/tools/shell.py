@@ -11,7 +11,6 @@ import pathlib
 import re
 import shutil
 import shlex
-import signal
 import stat
 import subprocess
 import sys
@@ -21,7 +20,13 @@ import uuid
 from typing import Any, Dict, List
 
 from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch
-from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
+from ouroboros.platform_layer import (
+    bootstrap_process_path,
+    kill_process_tree,
+    scrub_agent_child_env,
+    scrub_repo_from_pythonpath,
+    subprocess_new_group_kwargs,
+)
 from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
@@ -53,8 +58,16 @@ from ouroboros.contracts.skill_payload_policy import (
 )
 from ouroboros.workspace_executor import execute as executor_execute
 from ouroboros.workspace_executor import executor_ref_from_ctx
+from ouroboros.workspace_executor import _trace as executor_trace
 from ouroboros.workspace_executor import map_backend_path as executor_map_backend_path
 from ouroboros.workspace_executor import map_host_path as executor_map_host_path
+from ouroboros.workspace_native import (
+    _describe_returncode,
+    _format_process_output,
+    _is_search_no_match,
+    _maybe_autocorrect_grep_backslash_pipe,
+    _run_process as _run_native_process,
+)
 
 log = logging.getLogger(__name__)
 # Tracked process groups let panic kill descendant trees too.
@@ -106,26 +119,27 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
-def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> "dict | None":
+def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> dict[str, str]:
     """For a command whose cwd is OUTSIDE the Ouroboros system repo (an external
     workspace / target project, e.g. SWE-bench dig-direct ``/app``), return an
     env copy with the repo dir scrubbed from ``PYTHONPATH`` so the target cannot
-    shadow-import Ouroboros's own modules (R2). ``ctx.repo_dir`` stays pinned to
-    the Ouroboros repo even in workspace mode, so this is the authoritative
-    in-repo test. Returns ``None`` for commands inside the system repo (Ouroboros
-    tooling legitimately imports itself) so they inherit ``os.environ``."""
+    shadow-import Ouroboros's own modules (R2). Every agent-controlled command,
+    including one inside the system repo, receives the owner-credential scrub.
+    ``ctx.repo_dir`` stays pinned to the Ouroboros repo even in workspace mode,
+    so this is the authoritative in-repo test."""
+    env = scrub_agent_child_env(dict(os.environ))
     try:
         system_repo = pathlib.Path(getattr(ctx, "repo_dir")).resolve(strict=False)
         wd = pathlib.Path(work_dir).resolve(strict=False)
     except Exception:
-        return None
+        return env
     try:
         in_repo = wd == system_repo or wd.is_relative_to(system_repo)
     except AttributeError:  # pragma: no cover - py<3.9
         in_repo = str(wd) == str(system_repo) or str(wd).startswith(str(system_repo) + os.sep)
     if in_repo:
-        return None
-    return scrub_repo_from_pythonpath(dict(os.environ), system_repo)
+        return env
+    return scrub_repo_from_pythonpath(env, system_repo)
 
 
 def _resolve_effective_timeout(
@@ -191,37 +205,6 @@ def _resolve_effective_timeout(
 
     # 4. Floor at 1s.
     return max(1, int(effective))
-
-
-def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = None) -> str:
-    """Render a return code with signal details when applicable."""
-    suffix: list[str] = []
-    if int(returncode) < 0:
-        signal_num = abs(int(returncode))
-        try:
-            signal_name = signal.Signals(signal_num).name
-        except ValueError:
-            signal_name = f"SIG{signal_num}"
-        suffix.append(f"signal={signal_name}")
-    if cwd is not None:
-        suffix.append(f"cwd={pathlib.Path(cwd).resolve(strict=False)}")
-    rendered_suffix = f" ({', '.join(suffix)})" if suffix else ""
-    return f"exit_code={returncode}{rendered_suffix}"
-
-
-def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> str:
-    """Render bounded stdout/stderr sections."""
-    stdout_text = str(stdout or "")
-    stderr_text = str(stderr or "")
-    parts: List[str] = []
-    if stdout_text.strip():
-        parts.append(f"STDOUT:\n{stdout_text}")
-    if stderr_text.strip():
-        parts.append(f"STDERR:\n{stderr_text}")
-    rendered = "\n\n".join(parts) if parts else "STDOUT:\n(empty)"
-    if len(rendered) > limit:
-        rendered = rendered[: limit // 2] + "\n...(truncated)...\n" + rendered[-limit // 2 :]
-    return rendered
 
 
 def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: str = "") -> list[tuple[str, pathlib.Path]]:
@@ -580,6 +563,55 @@ def _executor_can_run_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> bool:
         return False
 
 
+def _execute_home_native_process(
+    ctx: ToolContext,
+    cmd: List[str],
+    work_dir: pathlib.Path,
+    timeout_sec: int,
+):
+    """Use the shared target kernel for a native Home workspace process."""
+
+    executor = executor_ref_from_ctx(ctx)
+    if getattr(_tracked_subprocess_run, "__module__", "") != __name__:
+        # Preserve the established subprocess seam used by unit tests and
+        # embedders; production's unpatched path uses the shared native kernel.
+        return None
+    try:
+        active_root = active_repo_dir_for(ctx).resolve(strict=False)
+    except Exception:
+        return None
+    if (
+        not path_is_relative_to(work_dir, active_root)
+        or (executor is not None and executor.kind != "local")
+    ):
+        return None
+    native = _run_native_process(
+        active_root,
+        {"cwd": str(work_dir), "timeout_sec": timeout_sec},
+        cmd=cmd,
+        control=None,
+        env=_shell_env_for_cwd(ctx, work_dir),
+        process_registry=(_active_subprocesses, _subprocess_lock),
+        backend="local",
+    )
+    result = native.envelope.process
+    if result is None:
+        raise RuntimeError("native process kernel omitted process evidence")
+    if executor is None:
+        # Placement-transparent Home execution never exposed a backend trace.
+        result.backend_trace = {}
+    else:
+        duration = float(result.backend_trace.get("duration_ms") or 0) / 1000
+        result.backend_trace = executor_trace(
+            executor,
+            str(work_dir),
+            list(result.args or cmd),
+            result.returncode,
+            time.time() - duration,
+        )
+    return result
+
+
 def _resolve_git_root(path: pathlib.Path) -> pathlib.Path | None:
     try:
         from ouroboros.review_state import discover_repo_root
@@ -596,12 +628,6 @@ def _resolve_git_root(path: pathlib.Path) -> pathlib.Path | None:
         return root if probe.returncode == 0 and probe.stdout.strip() == "true" else None
     except Exception:
         return None
-
-
-def _status_snapshot(repo_dir: pathlib.Path | None) -> list[str]:
-    if repo_dir is None:
-        return []
-    return sorted(_get_changed_files(repo_dir))
 
 
 def _shallow_listing(work_dir: pathlib.Path, cap: int = 5000) -> dict:
@@ -883,67 +909,6 @@ _USER_FILE_REDIRECT_RE = re.compile(
 _OUTPUT_STAT_SLACK_SEC = 2.0
 
 # Portable grep fix: GNU basic-regex "\|" fails on BSD grep in argv mode.
-_GREP_TOOLS = frozenset(("grep", "egrep", "fgrep"))
-_GREP_REGEX_MODE_FLAGS = frozenset((
-    "-E", "--extended-regexp",
-    "-P", "--perl-regexp",
-    "-F", "--fixed-strings",
-    "-G", "--basic-regexp",
-))
-_GREP_BACKSLASH_PIPE_PATTERN = re.compile(r'\\\|')
-_NO_MATCH_EXIT_TOOLS = frozenset(("grep", "egrep", "fgrep", "rg", "ag", "ack"))
-
-
-def _is_search_no_match(res: subprocess.CompletedProcess) -> bool:
-    tool = pathlib.Path(str(res.args[0] if res.args else "")).name.lower()
-    return (
-        int(res.returncode) == 1
-        and tool in _NO_MATCH_EXIT_TOOLS
-        and not str(res.stderr or "").strip()
-    )
-
-
-def _grep_has_explicit_regex_mode(cmd: List[str]) -> bool:
-    """Return whether grep argv already chooses regex/string flavor."""
-    if not cmd:
-        return False
-    tool = pathlib.Path(cmd[0]).name.lower()
-    if tool in ("egrep", "fgrep"):
-        return True
-    for arg in cmd[1:]:
-        if not isinstance(arg, str):
-            continue
-        if arg in _GREP_REGEX_MODE_FLAGS:
-            return True
-        if arg.startswith("--"):
-            continue
-        # Short options may be clustered, e.g. `grep -rnE pattern path`.
-        if arg.startswith("-") and any(flag in arg[1:] for flag in ("E", "P", "F", "G")):
-            return True
-    return False
-
-
-def _maybe_autocorrect_grep_backslash_pipe(cmd: List[str]) -> tuple[List[str], str]:
-    if not cmd or pathlib.Path(cmd[0]).name.lower() not in _GREP_TOOLS:
-        return cmd, ""
-    if _grep_has_explicit_regex_mode(cmd):
-        return cmd, ""
-    corrected = list(cmd)
-    changed_args: list[str] = []
-    for idx, arg in enumerate(corrected[1:], start=1):
-        if isinstance(arg, str) and _GREP_BACKSLASH_PIPE_PATTERN.search(arg):
-            corrected[idx] = _GREP_BACKSLASH_PIPE_PATTERN.sub("|", arg)
-            changed_args.append(arg)
-    if not changed_args:
-        return cmd, ""
-    corrected.insert(1, "-E")
-    return corrected, (
-        "⚠️ SHELL_REGEX_AUTO_CORRECTED: converted grep backslash-escaped "
-        "alternation (\\|) to extended regex mode (`grep -E`) and rewrote "
-        f"{changed_args!r} to use `|`.\n"
-    )
-
-
 def _resolve_scratch_abs(scratch: List[str] | None, work_dir) -> list[pathlib.Path]:
     """Resolve declared ephemeral `scratch=[...]` paths to absolute host paths (relative ones
     against the command cwd). Blank entries dropped. (v6.52.2)"""
@@ -1225,15 +1190,13 @@ def _run_shell(
                 'Use ["sh", "-c", "your command with redirects"] for redirection.'
             )
 
-    active_repo_dir = active_repo_dir_for(ctx)
-    active_root = pathlib.Path(active_repo_dir).resolve(strict=False)
     try:
         work_dir, cwd_root, allowed_roots = resolve_shell_cwd(ctx, cwd)
     except (OSError, ValueError) as exc:
         try:
             _, _, allowed_roots = resolve_shell_cwd(ctx, "")
         except Exception:
-            allowed_roots = [("active_workspace", active_root)]
+            allowed_roots = []
         roots = ", ".join(f"{name}={pathlib.Path(root).resolve(strict=False)}" for name, root in allowed_roots)
         return (
             f"⚠️ SHELL_CWD_BLOCKED: cwd escapes allowed roots: {exc}. "
@@ -1261,7 +1224,7 @@ def _run_shell(
                 'The Ouroboros system repo needs an explicit cwd.]\n\n'
             )
     repo_root = _resolve_git_root(pathlib.Path(work_dir))
-    before_changed = _status_snapshot(repo_root)
+    before_changed = sorted(_get_changed_files(repo_root)) if repo_root else []
     # R5: for a non-git user_files cwd, take a bounded shallow snapshot so the
     # artifact-audit nudge can be effect-based (only when the command actually
     # produced a top-level deliverable), not fired on every read-only command.
@@ -1293,15 +1256,21 @@ def _run_shell(
     bootstrap_process_path()
     _command_start_ts = time.time()
     try:
-        if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
+        res = _execute_home_native_process(
+            ctx,
+            cmd,
+            pathlib.Path(work_dir),
+            timeout_sec,
+        )
+        if res is None and _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec)
-        else:
+        elif res is None:
             run_env = _shell_env_for_cwd(ctx, pathlib.Path(work_dir))
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=timeout_sec,
-                **({"env": run_env} if run_env is not None else {}),
+                env=run_env,
             )
         # Record scratch FINGERPRINTS (sha256 of declared scratch files that exist AFTER the command)
         # so workspace patch capture excludes a file ONLY while it still matches — a later real file at
@@ -1318,7 +1287,7 @@ def _run_shell(
                     f"{executor_note}"
                 )
             return autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
-        after_changed = _status_snapshot(repo_root)
+        after_changed = sorted(_get_changed_files(repo_root)) if repo_root else []
         if after_changed != before_changed:
             # Kept (nonstandard case): repo_root here is the RESOLVED cwd root,
             # which may be a workspace/skill repo the central live-repo
@@ -1518,7 +1487,92 @@ def _room_default_cwd_edit_block(ctx: ToolContext, cwd: str) -> str:
     )
 
 
-def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: float = 5.0, validate: bool = False, bucket: str = "", skill_name: str = "", outputs: List[str] | None = None) -> str:
+def _claude_code_edit_remote(
+    ctx: ToolContext,
+    *,
+    prompt: str,
+    cwd: str,
+    budget: float,
+    validate: bool,
+    bucket: str,
+    skill_name: str,
+    outputs: List[str] | None,
+) -> str:
+    if str(cwd or "").strip() not in {"", ".", "./", "active_workspace"}:
+        return (
+            "⚠️ CLAUDE_CODE_ERROR: an SSH workspace has no Home cwd path; "
+            "use the admitted active workspace root."
+        )
+    if str(bucket or "").strip() or str(skill_name or "").strip():
+        return (
+            "⚠️ CLAUDE_CODE_ERROR: skill payload short-form is unavailable "
+            "for an SSH workspace."
+        )
+    try:
+        from ouroboros.gateways.claude_code import resolve_claude_code_model
+        from ouroboros.remote_claude import run_remote_claude_edit
+
+        ctx.emit_progress_fn("Delegating the verified remote snapshot to Claude Agent SDK...")
+        outcome = run_remote_claude_edit(
+            ctx,
+            prompt=prompt,
+            budget=budget,
+            validate=validate,
+            system_prompt=(
+                "STRICT: Modify only the provided remote-workspace mirror. "
+                "Do NOT commit or push. Ouroboros will apply one guarded patch "
+                "only if the remote source fingerprint is unchanged.\n\n"
+                + _load_project_context(pathlib.Path(ctx.repo_dir))
+            ),
+        )
+        result = outcome.result
+        result.changed_files = list(outcome.changed_files)
+        result.diff_stat = outcome.diff_stat
+        result.validation_summary = outcome.validation_summary
+        if result.cost_usd > 0:
+            ctx.pending_events.append({
+                "type": "llm_usage",
+                "provider": "claude_agent_sdk",
+                "model": resolve_claude_code_model(),
+                "api_key_type": "anthropic",
+                "model_category": "claude_code",
+                "usage": result.usage or {"cost": result.cost_usd},
+                "cost": result.cost_usd,
+                "source": "claude_code_edit",
+                "ts": utc_now_iso(),
+                "category": "task",
+            })
+        if not result.success:
+            return f"⚠️ CLAUDE_CODE_ERROR: {result.error}\n\n{result.result_text}"
+        output = result.to_tool_output()
+        output += (
+            "\n\nREMOTE_APPLY:\n"
+            + json.dumps(
+                {
+                    "source_fingerprint": outcome.source_fingerprint,
+                    "completion": outcome.apply_trace.get("completion"),
+                    "changed_files": list(outcome.changed_files),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        if outputs:
+            output += (
+                "\n\nREMOTE_OUTPUTS: declared outputs stay on the admitted "
+                "workspace and are imported by task artifact finalization."
+            )
+        return output
+    except ImportError:
+        return (
+            "⚠️ CLAUDE_CODE_UNAVAILABLE: claude-agent-sdk not installed. "
+            "Install: pip install 'ouroboros[claude-sdk]'"
+        )
+    except Exception as e:
+        return f"⚠️ CLAUDE_CODE_FAILED: {type(e).__name__}: {e}"
+
+
+def _claude_code_edit_local(ctx: ToolContext, prompt: str, cwd: str = "", budget: float = 5.0, validate: bool = False, bucket: str = "", skill_name: str = "", outputs: List[str] | None = None) -> str:
     """Delegate SDK edits with cwd and protected-path safety hooks."""
     from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
 
@@ -1629,7 +1683,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
     repo_mode = target_repo_root is not None
     if target_repo_root is None:
         target_repo_root = work_dir_path
-    before_changed = _status_snapshot(target_repo_root)
+    before_changed = sorted(_get_changed_files(target_repo_root))
     before_outputs = _snapshot_declared_outputs(ctx, outputs, work_dir_path, cwd_root=work_dir_root, changed_paths=set(before_changed or []))
     system_repo_mode = repo_mode and pathlib.Path(target_repo_root).resolve(strict=False) == system_repo_root
     runtime_mode = get_runtime_mode()
@@ -1647,11 +1701,11 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
     invalidate_if_changed = lambda: (
         _invalidate_advisory(
             ctx,
-            changed_paths=_status_snapshot(target_repo_root) or before_changed,
+            changed_paths=sorted(_get_changed_files(target_repo_root)) or before_changed,
             mutation_root=target_repo_root,
             source_tool="claude_code_edit",
         )
-        if repo_mode and _status_snapshot(target_repo_root) != before_changed
+        if repo_mode and sorted(_get_changed_files(target_repo_root)) != before_changed
         else None
     )
 
@@ -1747,7 +1801,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
                         + ". Switch to pro mode only after an explicit reviewed plan."
                     )
 
-            after_changed = _status_snapshot(target_repo_root)
+            after_changed = sorted(_get_changed_files(target_repo_root))
             if repo_mode and after_changed != before_changed:
                 # Kept (nonstandard case): target_repo_root may be a skill
                 # payload/workspace repo outside the central live-repo check,
@@ -1820,6 +1874,39 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
             _release_git_lock(lock)
 
 
+def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: float = 5.0, validate: bool = False, bucket: str = "", skill_name: str = "", outputs: List[str] | None = None) -> str:
+    """Select the native Home path or the fingerprint-guarded SSH mirror."""
+
+    from ouroboros.workspace_ref import workspace_ref_for
+
+    workspace_ref = workspace_ref_for(ctx)
+    if workspace_ref is not None and workspace_ref["kind"] == "ssh":
+        if not os.environ.get("ANTHROPIC_API_KEY", ""):
+            return "⚠️ CLAUDE_CODE_UNAVAILABLE: ANTHROPIC_API_KEY not set."
+        if (_room_block := _room_default_cwd_edit_block(ctx, cwd)):
+            return _room_block
+        return _claude_code_edit_remote(
+            ctx,
+            prompt=prompt,
+            cwd=cwd,
+            budget=budget,
+            validate=validate,
+            bucket=bucket,
+            skill_name=skill_name,
+            outputs=outputs,
+        )
+    return _claude_code_edit_local(
+        ctx,
+        prompt,
+        cwd,
+        budget,
+        validate,
+        bucket,
+        skill_name,
+        outputs,
+    )
+
+
 def _run_script(
     ctx: ToolContext,
     script: str,
@@ -1867,8 +1954,6 @@ def _run_script(
             _audit_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
         except Exception:
             _audit_cwd = ""
-    _scratch_abs_body = _resolve_scratch_abs(scratch, _audit_cwd or active_repo_dir_for(ctx))
-    _body_start_ts = time.time()
     try:
         workdir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
         resolved_workdir = pathlib.Path(workdir).resolve(strict=False)
@@ -1876,6 +1961,11 @@ def _run_script(
         if executor_ref_from_ctx(ctx) is not None:
             return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not resolve mapped cwd {cwd!r}."
         resolved_workdir = pathlib.Path("")
+    _scratch_abs_body = _resolve_scratch_abs(
+        scratch,
+        _audit_cwd or resolved_workdir,
+    )
+    _body_start_ts = time.time()
     executor_active = _executor_can_run_cwd(ctx, resolved_workdir) if str(resolved_workdir) else False
     workspace_backed_script = False
     if executor_active:

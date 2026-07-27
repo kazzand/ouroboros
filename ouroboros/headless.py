@@ -24,6 +24,7 @@ from ouroboros.task_results import (
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.workspace_ref import has_workspace, is_remote_workspace, workspace_ref_for
 
 log = logging.getLogger(__name__)
 
@@ -425,7 +426,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
         and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
     )
-    workspace_task = _workspace_root_from_task(task) is not None and not readonly_subagent
+    workspace_task = has_workspace(task) and not readonly_subagent
     child_status = str(child_result.get("status") or "completed")
     existing = canonical_existing if workspace_task and child_status in _FINAL_STATUSES else {}
     existing_artifact_status = str((existing or {}).get("artifact_status") or "").strip().lower()
@@ -560,77 +561,14 @@ def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
 
 
 _DELIVERABLE_MANIFEST_FILE_CAP = 10000
-_DELIVERABLE_MANIFEST_HASH_CHUNK = 1024 * 1024  # 1 MiB streaming chunks (bounded memory)
-# Files larger than this are recorded by size only (hash skipped) so a single huge
-# binary/media/build artifact cannot wedge or OOM genesis finalization.
-_DELIVERABLE_MANIFEST_HASH_BYTE_CAP = 64 * 1024 * 1024  # 64 MiB
 
 
 def _build_deliverable_manifest(
     workspace_root: pathlib.Path, task_id: str, project_id: str
 ) -> Dict[str, Any]:
-    """Typed content listing of a from-scratch (genesis) project's deliverables
-    (deferral 3): rel path + size + sha256 per file, surfaced on the artifact axis so a
-    genesis project's OUTPUT (not just its patch diff) is inspectable. Excludes VCS and
-    virtualenv junk. P1 fail-loud: if the tree exceeds the file cap, ``truncated`` is set
-    instead of silently dropping files. Hashing STREAMS in fixed chunks (never loads a
-    whole file into memory) and skips the hash for files over the byte cap, so a large
-    artifact can neither OOM nor wedge finalization."""
-    import hashlib
+    from ouroboros.remote_finalization import build_deliverable_manifest
 
-    contents: List[Dict[str, Any]] = []
-    count = 0
-    truncated = False
-    for root, dirs, files in os.walk(workspace_root):
-        dirs[:] = [d for d in dirs if d not in _TOP_LEVEL_EXCLUDE_DIRS and d != ".git"]
-        for fname in sorted(files):
-            if count >= _DELIVERABLE_MANIFEST_FILE_CAP:
-                truncated = True
-                break
-            fpath = pathlib.Path(root) / fname
-            if fpath.is_symlink():
-                # SECURITY: never follow a symlink out of the project — a genesis child
-                # could point one at an owner/runtime file outside workspace_root, and
-                # stat()/open() would then read/hash bytes outside the deliverable tree.
-                # Record it as a symlink WITHOUT reading the target.
-                contents.append({
-                    "rel": str(fpath.relative_to(workspace_root)),
-                    "symlink": True,
-                    "sha256": "",
-                })
-                count += 1
-                continue
-            try:
-                size = fpath.stat().st_size
-            except OSError:
-                continue
-            entry: Dict[str, Any] = {"rel": str(fpath.relative_to(workspace_root)), "size": size}
-            if size > _DELIVERABLE_MANIFEST_HASH_BYTE_CAP:
-                entry["sha256"] = ""
-                entry["hash_skipped"] = "size_over_cap"
-            else:
-                try:
-                    h = hashlib.sha256()
-                    with open(fpath, "rb") as fh:
-                        for chunk in iter(lambda: fh.read(_DELIVERABLE_MANIFEST_HASH_CHUNK), b""):
-                            h.update(chunk)
-                    entry["sha256"] = h.hexdigest()
-                except Exception:
-                    continue
-            contents.append(entry)
-            count += 1
-        if truncated:
-            break
-    return {
-        "schema_version": 1,
-        "task_id": task_id,
-        "project_id": project_id,
-        "project_root": str(workspace_root),
-        "created_at": utc_now_iso(),
-        "file_count": count,
-        "truncated": truncated,
-        "contents": contents,
-    }
+    return build_deliverable_manifest(workspace_root, task_id, project_id)
 
 
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -647,10 +585,12 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
         return artifacts
     artifact_dir = task_artifacts_dir(parent_drive_root, task_id)
     workspace_root = _workspace_root_from_task(task)
+    remote_workspace = is_remote_workspace(task)
+    workspace_present = workspace_root is not None or remote_workspace
     status = str(existing.get("status") or "completed")
     artifact_status = ARTIFACT_STATUS_READY
     artifact_error = ""
-    if workspace_root is not None:
+    if workspace_present:
         write_task_result(
             parent_drive_root,
             task_id,
@@ -658,11 +598,18 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
             artifact_status=ARTIFACT_STATUS_FINALIZING,
         )
         try:
-            patch_artifacts, manifest = write_workspace_patch_artifacts(
-                workspace_root,
-                artifact_dir,
-                task=task,
-            )
+            if remote_workspace:
+                patch_artifacts, manifest = write_remote_workspace_patch_artifacts(
+                    task,
+                    artifact_dir,
+                )
+            else:
+                assert workspace_root is not None
+                patch_artifacts, manifest = write_workspace_patch_artifacts(
+                    workspace_root,
+                    artifact_dir,
+                    task=task,
+                )
             artifacts.extend(patch_artifacts)
             artifact_status = str(manifest.get("status") or ARTIFACT_STATUS_READY_WITH_CHANGES)
             if manifest.get("status") == ARTIFACT_STATUS_FAILED:
@@ -672,11 +619,17 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
             artifact_status = ARTIFACT_STATUS_FAILED
             artifact_error = f"{type(exc).__name__}: {exc}"
             manifest_path = artifact_dir / "workspace_patch.json"
+            if remote_workspace:
+                workspace_ref = workspace_ref_for(task) or {}
+                display_root = str(workspace_ref.get("remote_root") or "")
+            else:
+                display_root = str(workspace_root or "")
             manifest = _empty_patch_manifest(
-                workspace_root,
+                pathlib.Path(display_root or "."),
                 status=ARTIFACT_STATUS_FAILED,
                 errors=[{"type": "exception", "message": artifact_error}],
             )
+            manifest["workspace_root"] = display_root
             atomic_write_json(
                 manifest_path,
                 manifest,
@@ -687,7 +640,7 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
                 "name": "workspace_patch.json",
                 "path": str(manifest_path),
                 "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "workspace_root": str(workspace_root),
+                "workspace_root": display_root,
             })
 
     child_drive = _child_drive_from_task(task)
@@ -703,7 +656,7 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
                 "memory_mode": str(task.get("memory_mode") or ""),
             })
         except Exception as exc:
-            if workspace_root is not None:
+            if workspace_present:
                 artifact_status = ARTIFACT_STATUS_FAILED
             message = f"{type(exc).__name__}: {exc}"
             artifact_error = f"{artifact_error}; {message}" if artifact_error else message
@@ -712,25 +665,22 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
     # the artifact axis, so its OUTPUT files (not only the patch diff) are inspectable.
     tc = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else \
         (existing.get("task_constraint") if isinstance(existing.get("task_constraint"), dict) else {})
-    if (
-        workspace_root is not None
-        and str((tc or {}).get("surface") or "") == "genesis"
-        and workspace_root.is_dir()
-    ):
+    if workspace_present and str((tc or {}).get("surface") or "") == "genesis":
         try:
-            manifest_path = artifact_dir / "deliverable_manifest.json"
-            dm = _build_deliverable_manifest(workspace_root, task_id, str(task.get("project_id") or ""))
-            atomic_write_json(manifest_path, dm, trailing_newline=True)
-            artifacts.append({
-                "kind": "deliverable_manifest",
-                "name": "deliverable_manifest.json",
-                "path": str(manifest_path),
-                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
-                "file_count": int(dm.get("file_count") or 0),
-                "truncated": bool(dm.get("truncated")),
-                "workspace_root": str(workspace_root),
-            })
-            if dm.get("truncated"):
+            from ouroboros.remote_finalization import (
+                write_deliverable_manifest_artifact,
+            )
+
+            deliverable, truncated = write_deliverable_manifest_artifact(
+                task=task,
+                task_id=task_id,
+                artifact_dir=artifact_dir,
+                workspace_root=workspace_root,
+                remote=remote_workspace,
+                build_manifest=_build_deliverable_manifest,
+            )
+            artifacts.append(deliverable)
+            if truncated:
                 log.warning(
                     "deliverable_manifest truncated at cap %d for task %s",
                     _DELIVERABLE_MANIFEST_FILE_CAP, task_id,
@@ -738,13 +688,13 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
         except Exception as exc:
             log.debug("deliverable_manifest build failed for %s: %s", task_id, exc, exc_info=True)
 
-    if artifacts or workspace_root is not None:
+    if artifacts or workspace_present:
         existing = load_task_result(parent_drive_root, task_id) or {}
-        drop_kinds = {"workspace_patch"} if workspace_root is not None and artifact_status == ARTIFACT_STATUS_FAILED else set()
+        drop_kinds = {"workspace_patch"} if workspace_present and artifact_status == ARTIFACT_STATUS_FAILED else set()
         merged = _merge_artifacts(list(existing.get("artifacts") or []), artifacts, drop_kinds=drop_kinds)
         fields: Dict[str, Any] = {
             "artifacts": merged,
-            "artifact_status": artifact_status if workspace_root is not None else str(existing.get("artifact_status") or ""),
+            "artifact_status": artifact_status if workspace_present else str(existing.get("artifact_status") or ""),
             "artifact_finalized_at": utc_now_iso(),
         }
         if artifact_error:
@@ -818,6 +768,17 @@ def build_workspace_patch(workspace_root: pathlib.Path) -> str:
                 path = pathlib.Path(str(artifact.get("path") or ""))
                 return path.read_text(encoding="utf-8") if path.is_file() else ""
     return ""
+
+
+def write_remote_workspace_patch_artifacts(
+    task: Dict[str, Any],
+    artifact_dir: pathlib.Path,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from ouroboros.remote_finalization import (
+        write_remote_workspace_patch_artifacts as _write_remote,
+    )
+
+    return _write_remote(task, artifact_dir)
 
 
 def write_workspace_patch_artifacts(
@@ -1594,6 +1555,7 @@ __all__ = [
     "prune_task_drives",
     "task_artifacts_dir",
     "task_state_dir",
+    "write_remote_workspace_patch_artifacts",
     "write_workspace_patch_artifacts",
     "write_workspace_preflight_artifact",
 ]

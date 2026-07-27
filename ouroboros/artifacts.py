@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 import pathlib
 import shutil
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Union
 
-from ouroboros.utils import atomic_write_json, read_json_dict
 from ouroboros.headless import ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.task_results import validate_task_id
+from ouroboros.utils import atomic_write_json, read_json_dict
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ _MAX_SCRATCH_PATHS = 1000
 _ATTACHMENTS_SUBDIR = "attachments"
 _MAX_STAGED_ATTACHMENTS = 25
 _MAX_STAGED_ATTACHMENT_BYTES = 50 * 1024 * 1024  # ~50 MB per file
+_ARTIFACT_WRITE_LOCK = threading.RLock()
 
 
 def _safe_attachment_name(raw_name: str) -> str:
@@ -62,6 +65,8 @@ def stage_task_attachments(
     drive_root: Union[pathlib.Path, str],
     task_id: str,
     attachments: Any,
+    *,
+    diagnostics: List[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     """Stage input attachments into the task artifact store and return a manifest.
 
@@ -91,6 +96,28 @@ def stage_task_attachments(
                 items.append({"path": path, "label": label})
     if not items:
         return []
+
+    omitted_total = 0
+
+    def _omit(reason: str, item: Dict[str, Any], index: int) -> None:
+        nonlocal omitted_total
+        omitted_total += 1
+        if diagnostics is None or len(diagnostics) >= _MAX_STAGED_ATTACHMENTS:
+            return
+        raw_label = str(item.get("label") or "").strip()
+        safe_label = (
+            " ".join(
+                "".join(c for c in raw_label if c.isprintable()).split()
+            )[:120]
+            or f"attachment {index + 1}"
+        )
+        diagnostics.append(
+            {
+                "label": safe_label,
+                "stage_status": "omitted",
+                "reason": reason,
+            }
+        )
 
     # SSOT secret detection: reuse the user_files secret blocklist so a credential
     # SOURCE (e.g. ~/.ssh/id_rsa, credentials.json, *.pem) is never copied in.
@@ -128,22 +155,31 @@ def stage_task_attachments(
 
     manifest: List[Dict[str, Any]] = []
     staged = 0
-    for item in items:
+    for index, item in enumerate(items):
         if staged >= _MAX_STAGED_ATTACHMENTS:
             log.info("stage_task_attachments: hit max staged attachments (%d); skipping rest", _MAX_STAGED_ATTACHMENTS)
+            for omitted_index, omitted in enumerate(
+                items[index:],
+                start=index,
+            ):
+                _omit("count_limit", omitted, omitted_index)
             break
         try:
             source = pathlib.Path(item["path"]).expanduser().resolve(strict=False)
             if not source.is_file():
+                _omit("not_readable_file", item, index)
                 continue
             if _is_secret_source(source):
                 log.info("stage_task_attachments: skipped secret source %s", source.name)
+                _omit("secret_source", item, index)
                 continue
             try:
                 if source.stat().st_size > _MAX_STAGED_ATTACHMENT_BYTES:
                     log.info("stage_task_attachments: skipped oversized source %s", source.name)
+                    _omit("size_limit", item, index)
                     continue
             except OSError:
+                _omit("not_readable_file", item, index)
                 continue
             attach_dir.mkdir(parents=True, exist_ok=True)
             # The stored filename derives from the SOURCE basename (it carries the
@@ -159,12 +195,15 @@ def stage_task_attachments(
             if dest.resolve(strict=False) != source.resolve(strict=False):
                 shutil.copy2(source, dest)
             mime = mimetypes.guess_type(str(dest))[0] or "application/octet-stream"
+            size = dest.stat().st_size
+            digest = sha256(dest.read_bytes()).hexdigest()
             # Sanitize the label rendered verbatim into the [ATTACHMENTS] manifest line / image
             # caption: drop control chars + collapse whitespace (incl. newlines) + bound, so a
             # crafted filename cannot inject extra prompt lines or break the rendered read_file line.
             _raw_label = str(item.get("label") or "").strip() or source.name
             label = " ".join("".join(c for c in _raw_label if c.isprintable()).split())[:120] or "attachment"
             manifest.append({
+                "attachment_id": uuid.uuid4().hex,
                 "label": label,
                 "root": "artifact_store",
                 "relpath": f"{_ATTACHMENTS_SUBDIR}/{dest.name}",
@@ -175,14 +214,67 @@ def stage_task_attachments(
                 # inside the task's own artifact_store, so scripts reach it under
                 # every runtime mode.
                 "abs_path": str(dest),
+                "execution_path": str(dest),
                 "mime": mime,
                 "is_image": mime.startswith("image/"),
+                "size": size,
+                "sha256": digest,
+                "stage_status": "ready",
             })
             staged += 1
         except Exception:
             log.debug("stage_task_attachments: skipped a file on error", exc_info=True)
+            _omit("staging_error", item, index)
             continue
+    if (
+        diagnostics is not None
+        and omitted_total > len(diagnostics)
+        and len(diagnostics) < _MAX_STAGED_ATTACHMENTS + 1
+    ):
+        diagnostics.append(
+            {
+                "stage_status": "omitted",
+                "reason": "additional_omissions",
+                "omitted_count": omitted_total - len(diagnostics),
+            }
+        )
     return manifest
+
+
+def render_task_attachment_lines(attachments: Any) -> str:
+    """Render the canonical manifest without assuming Home execution placement."""
+
+    if not isinstance(attachments, list):
+        return ""
+    lines: List[str] = []
+    for item in attachments:
+        if not isinstance(item, dict) or str(
+            item.get("stage_status") or "ready"
+        ) != "ready":
+            continue
+        relpath = str(item.get("relpath") or "").strip()
+        root = str(item.get("root") or "artifact_store").strip() or "artifact_store"
+        label = str(item.get("label") or pathlib.Path(relpath).name).strip()
+        if not relpath:
+            continue
+        kind = (
+            "image"
+            if item.get("is_image")
+            else (str(item.get("mime") or "").strip() or "file")
+        )
+        execution_path = str(
+            item.get("execution_path") or item.get("abs_path") or ""
+        ).strip()
+        process_hint = (
+            f" | script/process path: {execution_path}"
+            if execution_path
+            else ""
+        )
+        lines.append(
+            f"- {label} ({kind}): read_file(root='{root}', path='{relpath}')"
+            f"{process_hint}"
+        )
+    return "\n".join(lines)
 
 
 def artifact_store_path_block_reason(path: pathlib.Path) -> str:
@@ -286,6 +378,90 @@ def artifact_record(path: pathlib.Path, *, kind: str = "task_artifact", source_p
     if source_path:
         record["source_path"] = source_path
     return record
+
+
+def write_task_artifact_bytes(
+    drive_root: Union[pathlib.Path, str],
+    task_id: str,
+    name: str,
+    content: bytes,
+    *,
+    kind: str,
+    metadata: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Atomically publish host-owned bytes and register one task artifact."""
+
+    safe_name = pathlib.Path(str(name or "")).name
+    if (
+        not safe_name
+        or safe_name in {".", ".."}
+        or safe_name.startswith(".")
+        or safe_name != str(name)
+    ):
+        raise ValueError("task artifact name must be one safe visible basename")
+    with _ARTIFACT_WRITE_LOCK:
+        artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
+        destination = artifact_dir / safe_name
+        temporary = destination.with_name(
+            f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        descriptor = os.open(
+            str(temporary),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(bytes(content))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        record = artifact_record(destination, kind=kind)
+        for key, value in dict(metadata or {}).items():
+            if key not in {"path", "name", "size", "sha256", "status", "errors"}:
+                record[str(key)] = value
+        data = read_json_dict(artifact_dir / _ARTIFACT_MANIFEST) or {}
+        raw_manifest = (
+            data.get("artifacts")
+            if isinstance(data.get("artifacts"), dict)
+            else {}
+        )
+        manifest = {
+            str(key): dict(value)
+            for key, value in raw_manifest.items()
+            if isinstance(value, dict)
+        }
+        manifest[safe_name] = dict(record)
+        atomic_write_json(
+            artifact_dir / _ARTIFACT_MANIFEST,
+            {"schema_version": 1, "artifacts": manifest},
+            trailing_newline=True,
+            fsync=True,
+        )
+        return record
+
+
+def write_task_artifact_text(
+    drive_root: Union[pathlib.Path, str],
+    task_id: str,
+    name: str,
+    content: str,
+    *,
+    kind: str,
+    metadata: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Atomically publish host-owned text and register it as one task artifact."""
+
+    return write_task_artifact_bytes(
+        drive_root,
+        task_id,
+        name,
+        str(content).encode("utf-8"),
+        kind=kind,
+        metadata=metadata,
+    )
 
 
 def _artifact_versions_dir(drive_root: pathlib.Path, task_id: str, artifact_name: str) -> pathlib.Path:
