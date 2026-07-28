@@ -416,6 +416,15 @@ def write_task_artifact_bytes(
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
+            if os.name != "nt":
+                directory_fd = os.open(
+                    str(artifact_dir),
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
         record = artifact_record(destination, kind=kind)
@@ -439,6 +448,7 @@ def write_task_artifact_bytes(
             {"schema_version": 1, "artifacts": manifest},
             trailing_newline=True,
             fsync=True,
+            fsync_directory=True,
         )
         return record
 

@@ -331,7 +331,14 @@ def write_call_manifest(
         "call_id": safe_call,
         **dict(manifest or {}),
     }
-    atomic_write_json(path, payload, trailing_newline=True)
+    atomic_write_json(
+        path,
+        payload,
+        trailing_newline=True,
+        fsync=True,
+        mode=_PRIVATE_FILE_MODE,
+        fsync_directory=True,
+    )
     _chmod_private(path)
     try:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()

@@ -36,30 +36,14 @@ from ouroboros.remote_worker_proxy import (
     RemoteWorkspacePipeProxy,
     capability_projection as _capability_projection,
     envelope_from_dict as _envelope_from_dict,
-)
-from ouroboros.remote_worker_proxy import (
     error_dict as _error_dict,
-)
-from ouroboros.remote_worker_proxy import (
     execution_wait_timeout as _execution_wait_timeout,
-)
-from ouroboros.remote_worker_proxy import (
     json_copy as _json_copy,
-)
-from ouroboros.remote_worker_proxy import (
     opaque as _opaque,
-)
-from ouroboros.remote_worker_proxy import (
     optional_opaque as _optional_opaque,
-)
-from ouroboros.remote_worker_proxy import (
     prepared_from_dict as _prepared_from_dict,
-)
-from ouroboros.remote_worker_proxy import reconnect_failure as _reconnect_failure
-from ouroboros.remote_worker_proxy import (
+    reconnect_failure as _reconnect_failure,
     validated_envelope_dict as _validated_envelope_dict,
-)
-from ouroboros.remote_worker_proxy import (
     validated_prepared as _validated_prepared,
 )
 from ouroboros.workspace_diagnostics import (
@@ -437,7 +421,6 @@ class RemoteSessionBroker:
             return dict(list_directories(remote_root=remote_root, timeout_sec=timeout_sec))
         finally:
             transport.close()
-
     def admit_workspace(
         self,
         connection: Mapping[str, Any],
@@ -483,7 +466,6 @@ class RemoteSessionBroker:
                 with self._state_lock:
                     self._admission_cancels.pop(task_id, None)
                     self._admission_transports.pop(task_id, None)
-
     def prepare(
         self,
         workspace_ref: Mapping[str, Any],
@@ -495,6 +477,7 @@ class RemoteSessionBroker:
         blobs: Mapping[str, bytes] | None = None,
         deadline_ms: int | None = None,
         task_id: str = "",
+        parent_task_id: str = "", project_id: str = "",
     ) -> PreparedRemoteCall:
         result = self._submit(
             "prepare",
@@ -507,11 +490,11 @@ class RemoteSessionBroker:
                 "blobs": dict(blobs or {}),
                 "deadline_ms": deadline_ms,
                 "task_id": task_id,
+                "parent_task_id": parent_task_id, "project_id": project_id,
             },
             priority=10,
         )
         return _prepared_from_dict(result)
-
     def execute_prepared(
         self,
         workspace_ref: Mapping[str, Any],
@@ -535,7 +518,6 @@ class RemoteSessionBroker:
                 timeout_sec=_execution_wait_timeout(canonical_args, timeout_sec),
             )
         )
-
     def abort_prepared(
         self,
         workspace_ref: Mapping[str, Any],
@@ -556,13 +538,13 @@ class RemoteSessionBroker:
                 priority=0,
             )
         )
-
     def fetch_blob(
         self,
         workspace_ref: Mapping[str, Any],
         blob_id: str,
         *,
         max_bytes: int,
+        task_id: str,
     ) -> bytes:
         return bytes(
             self._submit(
@@ -571,11 +553,11 @@ class RemoteSessionBroker:
                     "workspace_ref": dict(workspace_ref),
                     "blob_id": blob_id,
                     "max_bytes": int(max_bytes),
+                    "task_id": task_id,
                 },
                 priority=20,
             )
         )
-
     def open_browser_forward(
         self,
         workspace_ref: Mapping[str, Any],
@@ -591,10 +573,8 @@ class RemoteSessionBroker:
                 task_id=task_id,
             )
         )
-
     def close_browser_forward(self, forward_id: str) -> bool:
         return self._browser_forwards.close(str(forward_id))
-
     def cancel(
         self,
         workspace_ref: Mapping[str, Any],
@@ -623,7 +603,6 @@ class RemoteSessionBroker:
                 self._task_sessions.pop(task_id, None)
             self._browser_forwards.close_task(task_id)
         return cancelled
-
     def cancel_admission(self, task_id: str) -> bool:
         task_id = _opaque(task_id, "task_id")
         with self._state_lock:
@@ -644,7 +623,6 @@ class RemoteSessionBroker:
                 pass
         self._browser_forwards.close_task(task_id)
         return True
-
     def finish_task(
         self,
         workspace_ref: Mapping[str, Any],
@@ -685,7 +663,6 @@ class RemoteSessionBroker:
                 if self._task_sessions.get(task_id) == key:
                     self._task_sessions.pop(task_id, None)
             self._browser_forwards.close_task(task_id)
-
     def close_project_session(
         self,
         workspace_ref: Mapping[str, Any],
@@ -699,7 +676,6 @@ class RemoteSessionBroker:
             "project_id": _opaque(project_id, "project_id"),
         }
         return bool(self._submit("close_project_session", payload, priority=0))
-
     def cancel_connection(self, connection_id: str) -> int:
         return int(
             self._submit(
@@ -708,7 +684,6 @@ class RemoteSessionBroker:
                 priority=0,
             )
         )
-
     def has_active_lease(self, connection_id: str) -> bool:
         connection_id = _opaque(connection_id, "connection_id")
         with self._state_lock:
@@ -719,7 +694,6 @@ class RemoteSessionBroker:
             return True
         self._refresh_service_leases(connection_id)
         return self._service_leases.active_for_connection(connection_id)
-
     def panic(self) -> None:
         self._stop.set()
         panic_forwards = getattr(self._browser_forwards, "panic_close_all", None)
@@ -747,7 +721,6 @@ class RemoteSessionBroker:
                 transport.panic()
             except Exception:
                 pass
-
     @classmethod
     def panic_close_all(cls) -> None:
         for broker in list(_LIVE_BROKERS):
@@ -776,7 +749,6 @@ class RemoteSessionBroker:
         self._started = False
         self._io_executor.shutdown(wait=False, cancel_futures=True)
         _LIVE_BROKERS.discard(self)
-
     def _detach_after_fork_child(self) -> None:
         """Drop inherited broker/SSH descriptors without signalling the parent."""
 
@@ -803,7 +775,6 @@ class RemoteSessionBroker:
         self._panic_events = []
         self._thread = None
         self._started = False
-
     def _submit(
         self,
         method: str,
@@ -842,7 +813,6 @@ class RemoteSessionBroker:
                 completion="unknown",
                 retryable=True,
             ) from exc
-
     def _new_transport(self, request: SessionOpenRequest) -> RemoteTransport:
         transport = self._transport_factory(request)
         self._panic_transports.append(transport)
@@ -850,7 +820,6 @@ class RemoteSessionBroker:
             self.panic()
             raise RemoteWorkspaceError("broker_closed", "Remote workspace broker is closed.", phase="stream")
         return transport
-
     def _run(self) -> None:
         while not self._stop.is_set():
             self._poll_worker_endpoints()
@@ -878,7 +847,6 @@ class RemoteSessionBroker:
             submitted.add_done_callback(
                 lambda completed, target=request.future: self._complete_request(target, completed)
             )
-
     def _poll_worker_endpoints(self) -> None:
         with self._state_lock:
             endpoints = list(self._worker_endpoints)
@@ -923,7 +891,6 @@ class RemoteSessionBroker:
                     endpoint.close()
                 except (OSError, EOFError):
                     pass
-
     def _complete_request(
         self,
         target: concurrent.futures.Future[Any],
@@ -936,7 +903,6 @@ class RemoteSessionBroker:
             target.set_result(completed.result())
         except BaseException as exc:
             target.set_exception(exc)
-
     def _complete_pipe(
         self,
         endpoint: Connection,
@@ -960,7 +926,6 @@ class RemoteSessionBroker:
                 endpoint.send(response)
         except (EOFError, OSError):
             return
-
     def _dispatch_pipe_message(self, message: Any) -> dict[str, Any]:
         correlation_id = str(message.get("correlation_id") or "") if isinstance(message, dict) else ""
         try:
@@ -980,7 +945,6 @@ class RemoteSessionBroker:
                 "ok": False,
                 "error": _error_dict(exc),
             }
-
     def _dispatch(self, method: str, payload: dict[str, Any]) -> Any:
         handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
             "prepare": self._prepare_on_broker,
@@ -1000,7 +964,6 @@ class RemoteSessionBroker:
         if handler is None:
             raise ValueError(f"unsupported broker method: {method}")
         return handler(payload)
-
     def _open_browser_forward_on_broker(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.open_browser_forward(
             payload["workspace_ref"],
@@ -1010,7 +973,6 @@ class RemoteSessionBroker:
 
     def _close_browser_forward_on_broker(self, payload: dict[str, Any]) -> bool:
         return self.close_browser_forward(str(payload.get("forward_id") or ""))
-
     def _session_request(
         self,
         connection: Mapping[str, Any],
@@ -1035,7 +997,6 @@ class RemoteSessionBroker:
             bundle_dir=self.bundle_dir,
             ssh_binary=self.ssh_binary,
         )
-
     def _admit_on_broker(self, payload: dict[str, Any]) -> dict[str, Any]:
         connection = payload.get("connection")
         connection = connection if isinstance(connection, Mapping) else {}
@@ -1239,6 +1200,7 @@ class RemoteSessionBroker:
         raw_ref: Mapping[str, Any],
         *,
         task_id: str = "",
+        parent_task_id: str = "", project_id: str = "",
     ) -> _Session:
         ref = normalize_workspace_ref(dict(raw_ref))
         if ref.get("kind") != "ssh":
@@ -1247,17 +1209,30 @@ class RemoteSessionBroker:
         workspace_id = str(ref["workspace_id"])
         with self._state_lock:
             key = self._task_sessions.get(task_id) if task_id else None
-            if key is not None and (key[0], key[2]) != (connection_id, workspace_id):
+            if key is None and task_id and parent_task_id:
+                key = self._task_sessions.get(parent_task_id)
+            if key is None and task_id and project_id:
+                key = (
+                    connection_id,
+                    project_id,
+                    workspace_id,
+                    self.server_generation,
+                )
+            if key is None and task_id:
+                raise RemoteWorkspaceError(
+                    "task_session_unbound",
+                    "Task is not bound to a remote workspace session.",
+                    phase="authorize",
+                )
+            if key is not None and ((key[0], key[2]) != (connection_id, workspace_id)
+                                    or (project_id and key[1] != project_id)):
                 raise RemoteWorkspaceError(
                     "task_session_mismatch",
                     "Task is bound to another remote workspace session.",
                     phase="authorize",
                 )
-            candidates = [
-                candidate
-                for candidate in self._sessions
-                if (candidate[0], candidate[2]) == (connection_id, workspace_id)
-            ]
+            candidates = [candidate for candidate in self._sessions
+                          if (candidate[0], candidate[2]) == (connection_id, workspace_id)]
             if key is None:
                 if len(candidates) > 1:
                     raise RemoteWorkspaceError(
@@ -1267,6 +1242,8 @@ class RemoteSessionBroker:
                     )
                 key = candidates[0] if candidates else None
             session = self._sessions.get(key) if key is not None else None
+            if session is not None and task_id:
+                self._task_sessions.setdefault(task_id, key)
         if session is None:
             raise RemoteWorkspaceError(
                 "remote_session_disconnected",
@@ -1280,7 +1257,12 @@ class RemoteSessionBroker:
 
     def _prepare_on_broker(self, payload: dict[str, Any]) -> dict[str, Any]:
         task_id = _optional_opaque(payload.get("task_id"), "task_id")
-        session = self._session_for_ref(payload["workspace_ref"], task_id=task_id)
+        parent_task_id = _optional_opaque(payload.get("parent_task_id"), "parent_task_id")
+        project_id = _optional_opaque(payload.get("project_id"), "project_id")
+        session = self._session_for_ref(
+            payload["workspace_ref"], task_id=task_id,
+            parent_task_id=parent_task_id, project_id=project_id,
+        )
         request_id = _opaque(payload.get("request_id"), "request_id")
         operation_id = _opaque(payload.get("operation_id"), "operation_id")
         tool = str(payload.get("tool") or "")
@@ -1366,7 +1348,10 @@ class RemoteSessionBroker:
         )
 
     def _fetch_blob_on_broker(self, payload: dict[str, Any]) -> bytes:
-        session = self._session_for_ref(payload["workspace_ref"])
+        session = self._session_for_ref(
+            payload["workspace_ref"],
+            task_id=_opaque(payload.get("task_id"), "task_id"),
+        )
         blob_id = _opaque(payload.get("blob_id"), "blob_id")
         max_bytes = int(payload.get("max_bytes") or 0)
         if max_bytes <= 0:

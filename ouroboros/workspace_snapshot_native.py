@@ -38,13 +38,15 @@ _ROOT_LOCKS: dict[str, threading.Lock] = {}
 
 def snapshot_workspace(
     root: pathlib.Path,
+    *,
+    protected_paths: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     """Return blobs only after two exact content/git manifest observations."""
 
     previous: dict[str, Any] | None = None
     previous_blobs: dict[str, bytes] = {}
     for attempt in range(2):
-        manifest, blobs = _snapshot_once(root)
+        manifest, blobs = _snapshot_once(root, protected_paths=protected_paths)
         manifest["attempt"] = attempt + 1
         if previous is not None and previous["fingerprint"] == manifest["fingerprint"]:
             return manifest, blobs
@@ -55,10 +57,14 @@ def snapshot_workspace(
     return previous, previous_blobs
 
 
-def snapshot_operation(root: pathlib.Path) -> NativeOperationResult:
+def snapshot_operation(
+    root: pathlib.Path,
+    *,
+    protected_paths: tuple[str, ...] = (),
+) -> NativeOperationResult:
     """Project a stable snapshot into the native operation wire contract."""
 
-    manifest, blobs = snapshot_workspace(root)
+    manifest, blobs = snapshot_workspace(root, protected_paths=protected_paths)
     state = "complete" if manifest["complete"] else "partial"
     return NativeOperationResult(
         ToolExecutionEnvelope(
@@ -160,20 +166,43 @@ def guarded_patch_apply(
 
 def _snapshot_once(
     root: pathlib.Path,
+    *,
+    protected_paths: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     entries: list[dict[str, Any]] = []
     blobs: dict[str, bytes] = {}
     excluded: list[dict[str, str]] = []
     total = 0
     complete = True
-    untracked = _untracked_paths(root)
+    protected = tuple(
+        sorted(
+            {
+                pathlib.PurePosixPath(str(item).replace("\\", "/")).as_posix().strip("/")
+                for item in protected_paths
+                if str(item or "").strip() not in {"", "."}
+                and ".." not in pathlib.PurePosixPath(
+                    str(item).replace("\\", "/")
+                ).parts
+            }
+        )
+    )
+    protected_inodes: set[tuple[int, int]] = set()
+    for rel in protected:
+        try:
+            target_stat = (root / rel).stat()
+            protected_inodes.add((target_stat.st_dev, target_stat.st_ino))
+        except OSError:
+            pass
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         current = pathlib.Path(dirpath)
         kept_dirs: list[str] = []
         for name in sorted(dirnames):
             path = current / name
             rel = path.relative_to(root).as_posix()
-            if name in _EXCLUDED_DIRS:
+            if any(rel == item or rel.startswith(item + "/") for item in protected):
+                excluded.append({"path": rel, "reason": "protected_artifact"})
+                complete = False
+            elif name in _EXCLUDED_DIRS:
                 excluded.append({"path": rel, "reason": "excluded_directory"})
             elif path.is_symlink():
                 filenames.append(name)
@@ -188,13 +217,29 @@ def _snapshot_once(
             rel = path.relative_to(root).as_posix()
             parts = [part.casefold() for part in rel.split("/") if part]
             folded_name = parts[-1]
-            if rel in untracked and (
+            if (
                 folded_name in _SENSITIVE_NAMES
                 or folded_name.startswith(".env.")
                 or folded_name.startswith(("id_rsa", "id_ed25519"))
                 or any(part in {".ssh", ".aws", ".gnupg"} for part in parts)
             ):
-                excluded.append({"path": rel, "reason": "sensitive_untracked"})
+                excluded.append({"path": rel, "reason": "sensitive_file"})
+                complete = False
+                continue
+            protected_match = any(
+                rel == item or rel.startswith(item + "/") for item in protected
+            )
+            if not protected_match and protected_inodes:
+                try:
+                    candidate_stat = path.stat()
+                    protected_match = (
+                        candidate_stat.st_dev,
+                        candidate_stat.st_ino,
+                    ) in protected_inodes
+                except OSError:
+                    pass
+            if protected_match:
+                excluded.append({"path": rel, "reason": "protected_artifact"})
                 complete = False
                 continue
             try:
@@ -312,16 +357,6 @@ def _git_facts(root: pathlib.Path) -> dict[str, str]:
         "index_sha256": hashlib.sha256(index).hexdigest(),
         "status_sha256": hashlib.sha256(status).hexdigest(),
     }
-
-
-def _untracked_paths(root: pathlib.Path) -> set[str]:
-    raw = _git_bytes(
-        root,
-        ["ls-files", "-z", "--others", "--exclude-standard"],
-        allow_failure=True,
-    )
-    return {item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item}
-
 
 def _validated_changes(
     raw: Any,

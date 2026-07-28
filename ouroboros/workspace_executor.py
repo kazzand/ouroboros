@@ -249,6 +249,13 @@ def execute_remote_system_operation(
             f"remote workspace broker is unavailable: {exc}"
         ) from exc
     task_id = _subject_task_id(subject)
+    metadata = ((subject.get("task_metadata") or subject.get("metadata") or {})
+                if isinstance(subject, dict) else getattr(subject, "task_metadata", {}))
+    metadata = metadata if isinstance(metadata, dict) else {}
+    project_id = str((subject.get("project_id") if isinstance(subject, dict)
+                      else getattr(subject, "project_id", "")) or metadata.get("project_id") or "")
+    parent_task_id = str((subject.get("parent_task_id") if isinstance(subject, dict)
+                          else getattr(subject, "parent_task_id", "")) or metadata.get("parent_task_id") or "")
     request_id = uuid.uuid4().hex
     operation_id = uuid.uuid4().hex
     prepared = None
@@ -261,6 +268,8 @@ def execute_remote_system_operation(
             args=dict(args),
             blobs=dict(blobs or {}),
             task_id=task_id,
+            parent_task_id=parent_task_id,
+            project_id=project_id,
         )
         diagnostic = getattr(prepared, "diagnostic", None)
         if diagnostic is not None:
@@ -323,10 +332,34 @@ def materialize_remote_workspace_snapshot(
     from ouroboros.remote_workspace import get_remote_workspace_service
     from ouroboros.workspace_ref import workspace_ref_for
 
+    from ouroboros.protected_artifacts import (
+        block_reason_for_path,
+        protected_artifact_paths,
+    )
+
+    workspace_ref = workspace_ref_for(subject)
+    if workspace_ref is None or workspace_ref["kind"] != "ssh":
+        raise ValueError("remote snapshot requires a sealed SSH workspace")
+    remote_root = pathlib.Path(str(workspace_ref["remote_root"])).resolve(strict=False)
+    protected_rows: set[str] = set()
+    for protected in protected_artifact_paths(subject, remote_root=str(remote_root)):
+        if not block_reason_for_path(
+            subject,
+            protected,
+            "read_bytes",
+            remote_root=str(remote_root),
+        ):
+            continue
+        try:
+            relative = protected.resolve(strict=False).relative_to(remote_root)
+        except (OSError, ValueError):
+            continue
+        if str(relative) not in {"", "."}:
+            protected_rows.add(relative.as_posix())
     envelope = execute_remote_system_operation(
         subject,
         "snapshot_manifest_and_blob_export",
-        {},
+        {"_protected_paths": sorted(protected_rows)},
     )
     trace = getattr(envelope, "trace", {})
     manifest = trace.get("snapshot") if isinstance(trace, dict) else None
@@ -345,8 +378,6 @@ def materialize_remote_workspace_snapshot(
     if declared_total > max(1, int(max_bytes)):
         raise RemoteWorkspaceOperationError("remote snapshot exceeds the byte limit")
 
-    workspace_ref = workspace_ref_for(subject)
-    assert workspace_ref is not None and workspace_ref["kind"] == "ssh"
     service = get_remote_workspace_service()
     if service is None:
         raise RemoteWorkspaceOperationError("remote workspace broker is unavailable")
@@ -378,6 +409,7 @@ def materialize_remote_workspace_snapshot(
                 workspace_ref,
                 digest,
                 max_bytes=size,
+                task_id=_subject_task_id(subject),
             )
             if not isinstance(data, bytes) or len(data) != size:
                 raise RemoteWorkspaceOperationError("remote snapshot blob size mismatch")

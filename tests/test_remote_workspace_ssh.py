@@ -1209,6 +1209,7 @@ def test_rws_108_default_broker_bootstrap_admit_read_cancel_and_panic(
             tool="read_file",
             args={"path": "README.md"},
             task_id="task-after-cancel",
+            project_id="project-real",
         )
         assert "remote-only" in broker.execute_prepared(
             workspace_ref,

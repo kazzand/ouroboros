@@ -206,6 +206,8 @@ def reconcile_remote_operations(
                             "envelope": terminal,
                         },
                         fsync=True,
+                        mode=0o600,
+                        fsync_directory=True,
                     )
                     os.chmod(path, 0o600)
                     retained = sorted(
@@ -745,30 +747,14 @@ def import_remote_result_to_home(
         trace["externalized_artifacts_omitted"] = omitted_artifacts
         if full_envelope_ref:
             trace["externalized_artifacts_full_ref"] = dict(full_envelope_ref)
-    if imported_refs:
-        process_imports = [
-            item
-            for item in imported_refs
-            if str(item.get("name") or "") in _REMOTE_PROCESS_STREAM_NAMES
-        ]
-        manifest_ref = write_call_manifest(
-            drive_root,
-            task_id=task_id,
-            call_id=f"remote_result_{operation_id}",
-            manifest={
-                "call_type": "remote_result_import",
-                "operation_id": operation_id,
-                "full_payload_redacted": True,
-                "artifacts": imported_refs,
-            },
-        )
-        if process_imports:
-            trace["remote_process_outputs"] = process_imports
-        trace["observability_ref"] = {
-            "call_id": manifest_ref["call_id"],
-            "sha256": manifest_ref["sha256"],
-        }
-    return {
+    process_imports = [
+        item
+        for item in imported_refs
+        if str(item.get("name") or "") in _REMOTE_PROCESS_STREAM_NAMES
+    ]
+    if process_imports:
+        trace["remote_process_outputs"] = process_imports
+    result = {
         "text": text,
         "diagnostic": (
             dict(source["diagnostic"])
@@ -783,6 +769,23 @@ def import_remote_result_to_home(
         "artifacts": artifacts,
         "trace": trace,
     }
+    manifest_ref = write_call_manifest(
+        drive_root,
+        task_id=task_id,
+        call_id=f"remote_result_{operation_id}",
+        manifest={
+            "call_type": "remote_result_import",
+            "operation_id": operation_id,
+            "full_payload_redacted": True,
+            "artifacts": imported_refs,
+            "result": result,
+        },
+    )
+    trace["observability_ref"] = {
+        "call_id": manifest_ref["call_id"],
+        "sha256": manifest_ref["sha256"],
+    }
+    return result
 
 
 def build_deliverable_manifest(
@@ -965,6 +968,7 @@ def write_remote_workspace_patch_artifacts(
             workspace_ref,
             digest,
             max_bytes=size,
+            task_id=str(task.get("id") or task.get("task_id") or ""),
         )
         if len(data) != size or sha256(data).hexdigest() != digest:
             raise RuntimeError("remote patch blob failed Home integrity verification")
@@ -981,7 +985,7 @@ def write_remote_workspace_patch_artifacts(
         "manifest_name": "workspace_patch.json",
         "base_ref": str(export.get("base_ref") or ""),
         "base_head": str(export.get("base_head") or ""),
-        "base_is_empty_tree": False,
+        "base_is_empty_tree": bool(export.get("base_is_empty_tree")),
         "current_head": str(export.get("current_head") or ""),
         "patch_size": size if status == ARTIFACT_STATUS_READY_WITH_CHANGES else 0,
         "sha256": digest if status == ARTIFACT_STATUS_READY_WITH_CHANGES else "",

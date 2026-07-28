@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 import pathlib
 import re
-from typing import Any, Dict, Iterable, List
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List, Mapping
 
 from ouroboros.shell_parse import (
     is_absolute_path_text,
@@ -138,8 +139,20 @@ _CANONICAL_WORKSPACE_BACKEND_ROOT = "/workspace"
 
 
 def _task_contract(ctx: Any) -> Dict[str, Any]:
+    if isinstance(ctx, Mapping):
+        metadata = ctx.get("task_metadata")
+        if not isinstance(metadata, dict):
+            metadata = ctx.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        contract = metadata.get("task_contract")
+        if not isinstance(contract, dict):
+            contract = ctx.get("task_contract")
+        return dict(contract) if isinstance(contract, dict) else {}
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
+    if not contract and isinstance(getattr(ctx, "metadata", None), dict):
+        metadata = getattr(ctx, "metadata")
+        contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
     if not contract and isinstance(getattr(ctx, "task_contract", None), dict):
         contract = getattr(ctx, "task_contract")
     return dict(contract) if isinstance(contract, dict) else {}
@@ -247,6 +260,14 @@ def protected_artifact_paths(
 ) -> List[pathlib.Path]:
     if remote_root:
         ctx = copy.copy(ctx)
+        if isinstance(ctx, Mapping):
+            ctx = SimpleNamespace(
+                **{
+                    str(key): value
+                    for key, value in ctx.items()
+                    if str(key).isidentifier()
+                }
+            )
         root = pathlib.Path(remote_root)
         ctx.workspace_root = root
         ctx.repo_dir = root
@@ -341,6 +362,14 @@ def block_reason_for_path(
 ) -> str:
     if remote_root:
         ctx = copy.copy(ctx)
+        if isinstance(ctx, Mapping):
+            ctx = SimpleNamespace(
+                **{
+                    str(key): value
+                    for key, value in ctx.items()
+                    if str(key).isidentifier()
+                }
+            )
         root = pathlib.Path(remote_root)
         ctx.workspace_root = root
         ctx.repo_dir = root

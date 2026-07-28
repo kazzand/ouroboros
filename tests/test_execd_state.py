@@ -668,6 +668,8 @@ def test_bootstrap_reuses_only_exact_verified_content_addressed_release(tmp_path
     source = inspect.getsource(OpenSSHExecdTransport._start_session)
     assert '--project-id "$5"' in source
     assert "self.request.project_id" in source
+    assert "select.select" not in source
+    assert "process.stdout.read" in source
 
 
 def _journal(tmp_path: pathlib.Path) -> OperationJournal:

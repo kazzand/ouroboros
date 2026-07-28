@@ -1429,6 +1429,9 @@ does not elevate authority.
 Project, workspace and Home server generation. Workers use bounded
 multiprocessing Pipe proxies; blocking OpenSSH/framing stays off gateway and
 supervisor loops, and one healthy Project session is reused across tasks.
+An inherited task binds lazily only at `PREPARE` from Home-owned parent/Project
+identity; execute, abort and blob fetch then use that task binding and never
+reselect a session from a bare connection/workspace pair.
 `remote_ssh.py` uses the system OpenSSH client with a minimal child environment,
 fixed noninteractive argv, fresh effective `ssh -G` validation, continuous
 stderr draining and required Home process custody. Bootstrap-only manifest,

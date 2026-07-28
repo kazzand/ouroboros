@@ -1921,6 +1921,56 @@ class ToolRegistry:
         )
         if artifact_block:
             return artifact_block
+        from ouroboros.gateway.connections import (
+            connection_store_path,
+            is_connection_store_path,
+        )
+
+        connection_path = connection_store_path().resolve(strict=False)
+        command_text = (
+            " ".join(str(item) for item in raw_cmd)
+            if isinstance(raw_cmd, list)
+            else str(raw_cmd)
+        )
+        normalized_command = command_text.replace("\\", "/")
+        if connection_path.as_posix() in normalized_command:
+            return (
+                "⚠️ OWNER_CONNECTION_STATE_READ_BLOCKED: remote connection "
+                "metadata is owner-only; use Settings → Connections or the "
+                "controlling-terminal CLI."
+            )
+        state_candidates = list(shell_argv_with_path_tokens(raw_cmd))
+        state_candidates.extend(shell_argv(raw_cmd)[1:])
+        for raw_candidate in state_candidates:
+            candidate_text = str(raw_candidate or "").strip("'\"")
+            if "=" in candidate_text and candidate_text.split("=", 1)[0] in {
+                "if", "in", "input", "src", "source",
+            }:
+                candidate_text = candidate_text.split("=", 1)[1]
+            if not candidate_text or any(mark in candidate_text for mark in "\r\n\0"):
+                continue
+            candidate_text = os.path.expandvars(candidate_text)
+            try:
+                candidate = pathlib.Path(candidate_text).expanduser()
+                candidate = (
+                    candidate.resolve(strict=False)
+                    if candidate.is_absolute()
+                    else (work_dir / candidate).resolve(strict=False)
+                )
+                contains_store = candidate.is_dir() and connection_path.is_relative_to(
+                    candidate
+                )
+            except (OSError, TypeError, ValueError):
+                continue
+            if contains_store or is_connection_store_path(
+                candidate,
+                store_path=connection_path,
+            ):
+                return (
+                    "⚠️ OWNER_CONNECTION_STATE_READ_BLOCKED: remote connection "
+                    "metadata is owner-only; use Settings → Connections or the "
+                    "controlling-terminal CLI."
+                )
         if not writeish:
             return ""
         return workspace_executor_state_write_block(
@@ -2847,10 +2897,10 @@ class ToolRegistry:
                 )
                 request_args.pop("timeout", None)
             deadline_ms = None
+            metadata = getattr(self._ctx, "task_metadata", {})
             try:
                 from ouroboros.deadline_utils import parse_deadline_ts
 
-                metadata = getattr(self._ctx, "task_metadata", {})
                 parsed_deadline = parse_deadline_ts(
                     metadata.get("deadline_at")
                     if isinstance(metadata, dict)
@@ -2869,6 +2919,10 @@ class ToolRegistry:
                 blobs=dict(blobs or {}),
                 deadline_ms=deadline_ms,
                 task_id=task_id,
+                parent_task_id=str(metadata.get("parent_task_id") or "")
+                if isinstance(metadata, dict)
+                else "",
+                project_id=str(getattr(self._ctx, "project_id", "") or ""),
             )
             diagnostic = getattr(prepared, "diagnostic", None)
             if diagnostic is not None:
@@ -3222,17 +3276,17 @@ class ToolRegistry:
                         "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands "
                         "may not target absolute paths outside the active remote workspace."
                     )
-        git_words = [str(item).lower() for item in argv]
-        if git_words and pathlib.PurePosixPath(git_words[0]).name == "git":
-            mutating_refs = {
-                "commit", "tag", "reset", "checkout", "switch", "branch",
-                "merge", "rebase", "cherry-pick",
-            }
-            if any(word in mutating_refs for word in git_words[1:2]):
-                return (
-                    "⚠️ WORKSPACE_GIT_BLOCKED: remote workspace tasks must leave "
-                    "changes as files/patch artifacts, not commits or ref changes."
-                )
+        from ouroboros.git_shell_policy import external_workspace_git_violation
+
+        git_violation = external_workspace_git_violation(
+            raw_cmd,
+            active_root=pathlib.Path(remote_root or "/"),
+            allow_network=_resource_allowed(self._ctx, "network"),
+        )
+        if git_violation:
+            if git_violation.startswith("task_contract.allowed_resources"):
+                return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
+            return f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}."
         return ""
 
     def _execute_remote_direct(
@@ -3652,6 +3706,7 @@ class ToolRegistry:
                 dict(workspace_ref),
                 blob_id,
                 max_bytes=size,
+                task_id=str(getattr(self._ctx, "task_id", "") or ""),
             )
             if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
                 return "⚠️ REMOTE_MEDIA_ERROR: imported frame failed integrity verification."
@@ -3766,6 +3821,7 @@ class ToolRegistry:
             dict(workspace_ref),
             blob_id,
             max_bytes=max(1, size),
+            task_id=str(getattr(self._ctx, "task_id", "") or ""),
         )
         if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
             return "⚠️ REMOTE_MEDIA_ERROR: imported file failed integrity verification."

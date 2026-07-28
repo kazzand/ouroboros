@@ -1525,7 +1525,7 @@ def execute_native_operation(
                 git_workspace(root, args, subcommand)
             )
         if operation == "snapshot_manifest_and_blob_export":
-            return snapshot_operation(root)
+            return snapshot_operation(root, protected_paths=tuple(native_facts.get("protected_paths") or ()))
         if operation == "guarded_patch_apply":
             return NativeOperationResult(
                 _guarded_patch_apply(root, args, supplied_blobs)

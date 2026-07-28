@@ -275,6 +275,45 @@ def test_remote_shell_allows_only_exact_manifest_bound_cache_path(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("command", "network", "blocked"),
+    [
+        (["git", "commit", "-m", "task work"], True, False),
+        (["git", "branch", "feature"], True, False),
+        (["git", "checkout", "-b", "feature"], True, False),
+        (["git", "push", "origin", "HEAD"], False, True),
+        (["git", "fetch", "origin"], False, True),
+        (["git", "ls-remote", "origin"], False, True),
+        (["git", "push", "origin", "HEAD"], True, False),
+    ],
+)
+def test_remote_shell_matches_external_workspace_git_policy(
+    tmp_path,
+    command,
+    network,
+    blocked,
+):
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry.set_context(
+        ToolContext(
+            repo_dir=tmp_path / "repo",
+            drive_root=tmp_path / "data",
+            workspace_mode="external",
+            task_metadata={
+                "task_contract": {"allowed_resources": {"network": network}},
+            },
+        )
+    )
+
+    result = registry._remote_shell_safety_check(
+        "run_command",
+        {"cmd": command},
+        runtime_mode="advanced",
+        remote_root="/srv/project",
+    )
+    assert ("RESOURCE_CONSTRAINT_BLOCKED" in result) is blocked
+
+
 class _MediaService:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
@@ -313,7 +352,8 @@ class _MediaService:
     def abort_prepared(self, *_args, **_kwargs):
         return True
 
-    def fetch_blob(self, _ref, blob_id, *, max_bytes):
+    def fetch_blob(self, _ref, blob_id, *, max_bytes, **identity):
+        del identity
         assert blob_id == self.digest
         assert len(self.payload) <= max_bytes
         return self.payload

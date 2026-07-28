@@ -591,6 +591,46 @@ def test_agent_shell_blocks_owner_connections_http_and_cli_but_allows_source_rea
         ), command
 
 
+def test_agent_shell_blocks_direct_owner_connection_state_reads_and_aliases(
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros import config
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "data"
+    repo.mkdir()
+    drive.mkdir()
+    store = repo / "state" / "remote_connections.json"
+    add_connection(name="Host", ssh_alias="host", path=store)
+    monkeypatch.setattr(config, "REMOTE_CONNECTIONS_PATH", store)
+    hardlink = repo / "connection-state-alias.json"
+    symlink = repo / "connection-state-link.json"
+    os.link(store, hardlink)
+    symlink.symlink_to(store)
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry.set_context(ToolContext(repo_dir=repo, drive_root=drive))
+
+    blocked = (
+        ["cat", str(store)],
+        ["cat", "state/remote_connections.json"],
+        ["cp", str(store), "copy.json"],
+        ["cat", str(hardlink)],
+        ["cat", str(symlink)],
+        ["rg", "Host", str(store.parent)],
+        ["python", "-c", f"print(open({str(store)!r}).read())"],
+    )
+    for command in blocked:
+        result = registry._run_shell_safety_check({"cmd": command}, "advanced")
+        assert "OWNER_CONNECTION_STATE_READ_BLOCKED" in (result or ""), command
+
+    assert registry._run_shell_safety_check(
+        {"cmd": ["rg", "remote_connections.json", "ouroboros"]},
+        "advanced",
+    ) is None
+
+
 def test_owner_connection_namespace_requires_auth_even_on_loopback(monkeypatch):
     import ouroboros.server_auth as server_auth
 

@@ -1,5 +1,8 @@
 import hashlib
 import json
+import os
+import stat
+import threading
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -312,6 +315,99 @@ def test_remote_blob_integrity_failure_prevents_ack():
     assert "ack" not in events
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is POSIX-only")
+def test_artifact_directory_fsync_failure_prevents_ack(tmp_path, monkeypatch):
+    from ouroboros import artifacts
+
+    stdout = b"x" * 70_001
+    stderr = b"y" * 70_002
+    result = _process_result(stdout, stderr)
+    events: list[str] = []
+    transport = _transport_for_result(
+        result,
+        {_digest(stdout): stdout, _digest(stderr): stderr},
+        events,
+    )
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected directory durability failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(artifacts.os, "fsync", fail_directory_fsync)
+    with pytest.raises(Exception) as caught:
+        transport.execute_prepared(
+            {
+                "request_id": "request-durable",
+                "operation_id": "operation-durable",
+                "prepared_hash": "a" * 64,
+                "prepared_token": "prepared-durable",
+                "task_id": "task-durable",
+                "_home_completion_validator": (
+                    lambda _result, envelope, fetched: import_remote_result_to_home(
+                        tmp_path,
+                        "task-durable",
+                        "operation-durable",
+                        envelope,
+                        fetched,
+                    )
+                ),
+            }
+        )
+    assert caught.value.code == "remote_result_import_failed"
+    assert caught.value.completion == "completed"
+    assert "ack" not in events
+
+
+def test_no_artifact_result_manifest_failure_prevents_ack(tmp_path, monkeypatch):
+    from ouroboros import observability
+
+    result = {
+        "completion": "completed",
+        "prepared_hash": "a" * 64,
+        "envelope": {
+            "text": "ok",
+            "diagnostic": None,
+            "process": None,
+            "artifacts": [],
+            "trace": {"completion": "complete"},
+        },
+        "output_blobs": {},
+    }
+    events: list[str] = []
+    transport = _transport_for_result(result, {}, events)
+    monkeypatch.setattr(
+        observability,
+        "write_call_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("injected observability durability failure")
+        ),
+    )
+    with pytest.raises(Exception) as caught:
+        transport.execute_prepared(
+            {
+                "request_id": "request-observability",
+                "operation_id": "operation-observability",
+                "prepared_hash": "a" * 64,
+                "prepared_token": "prepared-observability",
+                "task_id": "task-observability",
+                "_home_completion_validator": (
+                    lambda _result, envelope, fetched: import_remote_result_to_home(
+                        tmp_path,
+                        "task-observability",
+                        "operation-observability",
+                        envelope,
+                        fetched,
+                    )
+                ),
+            }
+        )
+    assert caught.value.code == "remote_result_import_failed"
+    assert caught.value.completion == "completed"
+    assert "ack" not in events
+
+
 def test_broker_home_completion_keeps_artifacts_wire_canonical(tmp_path):
     from ouroboros.remote_workspace import RemoteSessionBroker
 
@@ -360,6 +456,107 @@ def test_broker_home_completion_keeps_artifacts_wire_canonical(tmp_path):
     )
 
     assert response["artifacts"] == []
+
+
+def test_broker_binds_inherited_tasks_before_execute_and_blob_fetch():
+    from ouroboros.remote_workspace import (
+        RemoteSessionBroker,
+        RemoteWorkspaceError,
+    )
+
+    class Transport:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def prepare(self, message, _blobs):
+            return {
+                "request_id": message["request_id"],
+                "operation_id": message["operation_id"],
+                "tool": message["tool"],
+                "prepared_token": f"prepared-{self.marker}",
+                "prepared_hash": self.marker * 64,
+                "expires_at_ms": 4_102_444_800_000,
+                "execution_args": message["args"],
+                "native_facts": {},
+            }
+
+        def fetch_blob(self, _blob_id, _max_bytes):
+            return self.marker.encode()
+
+    broker = object.__new__(RemoteSessionBroker)
+    broker.server_generation = "generation"
+    broker._state_lock = threading.RLock()
+    key_a = ("connection", "project-a", "workspace", "generation")
+    key_b = ("connection", "project-b", "workspace", "generation")
+    session_a = SimpleNamespace(
+        key=key_a,
+        transport=Transport("a"),
+        last_used_at=0.0,
+    )
+    session_b = SimpleNamespace(
+        key=key_b,
+        transport=Transport("b"),
+        last_used_at=0.0,
+    )
+    broker._sessions = {key_a: session_a, key_b: session_b}
+    broker._task_sessions = {"parent-a": key_a}
+    workspace_ref = {
+        "kind": "ssh",
+        "connection_id": "connection",
+        "remote_root": "/srv/project",
+        "workspace_id": "workspace",
+    }
+
+    def prepare(task_id, *, parent_task_id="", project_id=""):
+        return broker._prepare_on_broker(
+            {
+                "workspace_ref": workspace_ref,
+                "request_id": f"request-{task_id}",
+                "operation_id": f"operation-{task_id}",
+                "tool": "read_file",
+                "args": {"path": "README.md"},
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "project_id": project_id,
+            }
+        )
+
+    assert prepare(
+        "child-a",
+        parent_task_id="parent-a",
+        project_id="project-a",
+    )["prepared_token"] == "prepared-a"
+    assert broker._task_sessions["child-a"] == key_a
+    assert prepare(
+        "child-b",
+        parent_task_id="finished-parent",
+        project_id="project-b",
+    )["prepared_token"] == "prepared-b"
+    assert broker._task_sessions["child-b"] == key_b
+    with pytest.raises(RemoteWorkspaceError, match="another remote workspace"):
+        prepare(
+            "mismatched-child",
+            parent_task_id="parent-a",
+            project_id="project-b",
+        )
+    assert "mismatched-child" not in broker._task_sessions
+    assert broker._fetch_blob_on_broker(
+        {
+            "workspace_ref": workspace_ref,
+            "task_id": "child-b",
+            "blob_id": "b" * 64,
+            "max_bytes": 1,
+        }
+    ) == b"b"
+    with pytest.raises(RemoteWorkspaceError, match="not bound"):
+        broker._fetch_blob_on_broker(
+            {
+                "workspace_ref": workspace_ref,
+                "task_id": "unknown-child",
+                "blob_id": "a" * 64,
+                "max_bytes": 1,
+            }
+        )
 
 
 def test_every_completed_result_requires_home_validation_before_ack():

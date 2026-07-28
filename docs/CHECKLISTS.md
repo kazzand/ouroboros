@@ -472,7 +472,7 @@ native launcher-seeded skills.
 
 ### Output contract
 
-Reviewers return a JSON array covering every item below (16 items total).
+Reviewers return a JSON array covering every item below (17 items total).
 Each entry carries `item`, `verdict` (`PASS`/`FAIL`), `severity`
 (`critical`/`advisory`), and `reason`. If one item has multiple distinct
 concrete problems, reviewers may return multiple `FAIL` entries for that

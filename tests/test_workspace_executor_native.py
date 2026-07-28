@@ -66,8 +66,9 @@ class _FakeRemoteService:
         blobs=None,
         deadline_ms=None,
         task_id="",
+        **identity,
     ):
-        del workspace_ref, deadline_ms
+        del workspace_ref, deadline_ms, identity
         prepared_native = prepare_native_operation(
             self.target_root,
             tool,
@@ -123,8 +124,8 @@ class _FakeRemoteService:
         self.aborted.append(f"{prepared.prepared_token}:{reason}")
         return True
 
-    def fetch_blob(self, workspace_ref, blob_id, *, max_bytes):
-        del workspace_ref
+    def fetch_blob(self, workspace_ref, blob_id, *, max_bytes, **identity):
+        del workspace_ref, identity
         data = self.blobs[blob_id]
         assert len(data) <= max_bytes
         return data
@@ -777,6 +778,53 @@ def test_remote_patch_export_imports_verified_blob_to_home(tmp_path):
     assert "-before" in patch and "+after" in patch
     assert "new.txt" in patch
     assert any(item["kind"] == "workspace_patch" for item in artifacts)
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_remote_patch_export_uses_target_empty_tree_for_unborn_git(
+    tmp_path,
+    object_format,
+):
+    from ouroboros.headless import write_remote_workspace_patch_artifacts
+
+    target = tmp_path / "actual-remote"
+    target.mkdir()
+    init = subprocess.run(
+        ["git", "init", "-q", f"--object-format={object_format}"],
+        cwd=target,
+        capture_output=True,
+        text=True,
+    )
+    if init.returncode:
+        pytest.skip(f"Git does not support {object_format}: {init.stderr}")
+    (target / "new.txt").write_text("new unborn content\n")
+    registry, _fake = _remote_registry(tmp_path, target)
+    artifact_dir = tmp_path / "artifacts"
+    task = {
+        "id": "remote-task",
+        "project_id": "project",
+        "metadata": registry._ctx.task_metadata,
+    }
+    try:
+        _artifacts, manifest = write_remote_workspace_patch_artifacts(
+            task,
+            artifact_dir,
+        )
+    finally:
+        set_remote_workspace_service(None)
+
+    empty_tree = subprocess.run(
+        ["git", "hash-object", "-t", "tree", "--stdin"],
+        cwd=target,
+        input=b"",
+        capture_output=True,
+        check=True,
+    ).stdout.decode().strip()
+    assert manifest["status"] == "ready_with_changes"
+    assert manifest["base_is_empty_tree"] is True
+    assert manifest["base_ref"] == empty_tree
+    assert len(empty_tree) == (64 if object_format == "sha256" else 40)
+    assert "new.txt" in (artifact_dir / "workspace.patch").read_text()
 
 
 def test_remote_patch_export_rejects_head_drift_after_admission(tmp_path):

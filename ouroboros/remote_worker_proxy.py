@@ -162,6 +162,7 @@ class RemoteWorkspacePipeProxy:
         blob_id: str,
         *,
         max_bytes: int,
+        task_id: str,
     ) -> bytes:
         result = self._call(
             "fetch_blob",
@@ -169,6 +170,7 @@ class RemoteWorkspacePipeProxy:
                 "workspace_ref": dict(workspace_ref),
                 "blob_id": blob_id,
                 "max_bytes": max_bytes,
+                "task_id": task_id,
             },
         )
         if not isinstance(result, bytes):

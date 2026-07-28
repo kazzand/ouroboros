@@ -153,6 +153,7 @@ _SKILL_REVIEW_ITEMS = (
     "integration_preflight",
     "bug_hunting",
     "completion_notification",
+    "execution_affinity",
 )
 _CRITICAL_ITEMS = CRITICAL_ITEMS
 

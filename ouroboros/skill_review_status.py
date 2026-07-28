@@ -44,6 +44,7 @@ HARD_CRITICAL_ITEMS = frozenset({
     "inject_chat_minimization",
     "event_subscription_minimization",
     "host_token_handling",
+    "execution_affinity",
 })
 
 SEVERITY_DRIVEN_ITEMS = frozenset({

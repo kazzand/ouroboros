@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import fnmatch
+import concurrent.futures
 import hashlib
 import logging
 import os
 import pathlib
 import re
-import select
 import shlex
 import shutil
 import subprocess
@@ -1032,52 +1032,65 @@ class OpenSSHExecdTransport:
         self._stderr_reader.start()
         prefix = bytearray()
         deadline = time.monotonic() + timeout_sec
-        while len(prefix) < MAX_PREAMBLE_BYTES:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _error(
-                    "execd_preamble_timeout",
-                    "Execd did not return its authenticated preamble.",
-                    phase="bootstrap",
-                    details={"stderr": self._stderr_text()},
-                )
-            readable, _writable, _errors = select.select([process.stdout.fileno()], [], [], remaining)
-            if not readable:
-                continue
-            chunk = os.read(process.stdout.fileno(), 1)
-            if not chunk:
-                raise _error(
-                    "execd_start_failed",
-                    "SSH closed before execd returned its preamble.",
-                    phase="bootstrap",
-                    details={"stderr": self._stderr_text()},
-                )
-            prefix.extend(chunk)
-            if PREAMBLE_MAGIC not in prefix:
-                continue
-            magic_at = prefix.find(PREAMBLE_MAGIC)
-            authenticated_prefix_size = magic_at + len(PREAMBLE_MAGIC) + len(self._nonce.hex()) + 1
-            if len(prefix) < authenticated_prefix_size:
-                continue
-            try:
-                consumed, _major, _minor = parse_session_preamble(prefix, self._nonce)
-            except ProtocolError as exc:
-                if "exceeds the bounded prefix" in str(exc):
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="execd-preamble",
+        ) as preamble_reader:
+            while len(prefix) < MAX_PREAMBLE_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _error(
+                        "execd_preamble_timeout",
+                        "Execd did not return its authenticated preamble.",
+                        phase="bootstrap",
+                        details={"stderr": self._stderr_text()},
+                    )
+                try:
+                    chunk = preamble_reader.submit(
+                        process.stdout.read,
+                        1,
+                    ).result(timeout=remaining)
+                except concurrent.futures.TimeoutError as exc:
+                    self._discard_process(process)
+                    raise _error(
+                        "execd_preamble_timeout",
+                        "Execd did not return its authenticated preamble.",
+                        phase="bootstrap",
+                        details={"stderr": self._stderr_text()},
+                    ) from exc
+                if not chunk:
+                    raise _error(
+                        "execd_start_failed",
+                        "SSH closed before execd returned its preamble.",
+                        phase="bootstrap",
+                        details={"stderr": self._stderr_text()},
+                    )
+                prefix.extend(chunk)
+                if PREAMBLE_MAGIC not in prefix:
                     continue
+                magic_at = prefix.find(PREAMBLE_MAGIC)
+                authenticated_prefix_size = magic_at + len(PREAMBLE_MAGIC) + len(self._nonce.hex()) + 1
+                if len(prefix) < authenticated_prefix_size:
+                    continue
+                try:
+                    consumed, _major, _minor = parse_session_preamble(prefix, self._nonce)
+                except ProtocolError as exc:
+                    if "exceeds the bounded prefix" in str(exc):
+                        continue
+                    raise _error(
+                        "execd_preamble_invalid",
+                        "Execd returned a malformed or unauthenticated preamble.",
+                        phase="bootstrap",
+                        details={"reason": _safe_text(exc)},
+                    ) from exc
+                if consumed == len(prefix):
+                    break
+            else:
                 raise _error(
                     "execd_preamble_invalid",
-                    "Execd returned a malformed or unauthenticated preamble.",
+                    "Execd preamble exceeded its strict bound.",
                     phase="bootstrap",
-                    details={"reason": _safe_text(exc)},
-                ) from exc
-            if consumed == len(prefix):
-                break
-        else:
-            raise _error(
-                "execd_preamble_invalid",
-                "Execd preamble exceeded its strict bound.",
-                phase="bootstrap",
-            )
+                )
         self._reader = threading.Thread(
             target=self._read_loop,
             args=(process,),

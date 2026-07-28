@@ -471,12 +471,14 @@ def _git_bytes(
     argv: list[str],
     *,
     allow: frozenset[int] = frozenset({0}),
+    input_bytes: bytes | None = None,
 ) -> bytes:
     proc = subprocess.run(
         ["git", *argv],
         cwd=str(root),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        input=input_bytes,
         timeout=60,
     )
     if proc.returncode not in allow:
@@ -525,11 +527,14 @@ def export_workspace_patch(
         raise RuntimeError(
             f"workspace HEAD changed: expected=<unborn>, current={current_head}"
         )
-    base_ref = str(
-        args.get("base_ref")
-        or expected_head
-        or "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-    )
+    base_is_empty_tree = not bool(args.get("base_ref") or expected_head)
+    base_ref = str(args.get("base_ref") or expected_head)
+    if base_is_empty_tree:
+        base_ref = _git_bytes(
+            root,
+            ["hash-object", "-t", "tree", "--stdin"],
+            input_bytes=b"",
+        ).decode().strip()
     tracked = [
         item.decode("utf-8", errors="replace")
         for item in _git_bytes(
@@ -632,6 +637,7 @@ def export_workspace_patch(
         "status": status,
         "base_ref": base_ref,
         "base_head": current_head,
+        "base_is_empty_tree": base_is_empty_tree,
         "current_head": current_head,
         "tracked_changed": tracked,
         "untracked_included": untracked,

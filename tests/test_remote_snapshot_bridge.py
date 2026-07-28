@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 
@@ -20,6 +21,7 @@ from ouroboros.workspace_native import execute_native_operation, prepare_native_
 class _Context:
     def __init__(self, root: pathlib.Path):
         self.task_id = "remote-claude-task"
+        self.project_id = "project"
         self.repo_dir = root
         self.drive_root = root / "data"
         self.task_metadata = {
@@ -84,8 +86,8 @@ class _FakeRemote:
         del workspace_ref, prepared, kwargs
         return True
 
-    def fetch_blob(self, workspace_ref, blob_id, *, max_bytes):
-        del workspace_ref
+    def fetch_blob(self, workspace_ref, blob_id, *, max_bytes, **identity):
+        del workspace_ref, identity
         data = self.blobs[blob_id]
         assert len(data) <= max_bytes
         return data
@@ -151,6 +153,45 @@ def test_snapshot_refuses_partial_sensitive_or_escaping_symlink_view(
         set_remote_workspace_service(None)
 
 
+def test_snapshot_never_exports_tracked_secrets_or_protected_artifacts(
+    tmp_path,
+    remote_repo,
+):
+    secret = b"TRACKED_SECRET=must-stay-remote\n"
+    protected = b"\x00protected-black-box\xff"
+    (remote_repo / ".env").write_bytes(secret)
+    (remote_repo / "reference.bin").write_bytes(protected)
+    _git(remote_repo, "add", ".env", "reference.bin")
+    _git(remote_repo, "commit", "-qm", "tracked protected inputs")
+    os.link(remote_repo / "reference.bin", remote_repo / "reference-hardlink.bin")
+    ctx = _Context(tmp_path)
+    ctx.task_metadata["task_contract"] = {
+        "resource_policy": {
+            "protected_artifacts": [
+                {
+                    "role": "black_box_reference",
+                    "paths": ["/remote/project/reference.bin"],
+                }
+            ]
+        }
+    }
+    subject = {
+        "id": ctx.task_id,
+        "project_id": ctx.project_id,
+        "metadata": ctx.task_metadata,
+    }
+    fake = _FakeRemote(remote_repo)
+    set_remote_workspace_service(fake)
+    try:
+        with pytest.raises(RemoteWorkspaceOperationError, match="partial"):
+            materialize_remote_workspace_snapshot(subject)
+    finally:
+        set_remote_workspace_service(None)
+
+    assert hashlib.sha256(secret).hexdigest() not in fake.blobs
+    assert hashlib.sha256(protected).hexdigest() not in fake.blobs
+
+
 def test_continuous_snapshot_mutation_never_materializes_stale_blobs(
     tmp_path,
     remote_repo,
@@ -161,9 +202,9 @@ def test_continuous_snapshot_mutation_never_materializes_stale_blobs(
     original = native._snapshot_once
     counter = 0
 
-    def _mutating_snapshot(root):
+    def _mutating_snapshot(root, **kwargs):
         nonlocal counter
-        manifest, blobs = original(root)
+        manifest, blobs = original(root, **kwargs)
         counter += 1
         pathlib.Path(root, "tracked.txt").write_text(f"mutation {counter}\n")
         return manifest, blobs

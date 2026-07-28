@@ -120,6 +120,7 @@ _NEW_SKILL_REVIEW_PASS_ITEMS = [
     {"item": "integration_preflight", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
     {"item": "bug_hunting", "verdict": "PASS", "severity": "critical", "reason": "ok"},
     {"item": "completion_notification", "verdict": "PASS", "severity": "advisory", "reason": "Not applicable"},
+    {"item": "execution_affinity", "verdict": "PASS", "severity": "critical", "reason": "Not applicable"},
 ]
 
 
@@ -302,7 +303,7 @@ def test_extract_actor_findings_reads_flat_text_field():
         ]
     }
     findings, responded = _extract_actor_findings(result_json)
-    assert len(findings) == 32
+    assert len(findings) == 34
     assert responded == [
         "openai/gpt-5.5#1",
         "google/gemini-3.5-flash#2",
@@ -367,7 +368,7 @@ def test_extract_actor_findings_counts_duplicate_models_by_slot():
 
     findings, responded = _extract_actor_findings(result_json)
 
-    assert len(findings) == 32
+    assert len(findings) == 34
     assert responded == [
         "anthropic/claude-opus-4.6#1",
         "anthropic/claude-opus-4.6#2",
@@ -400,6 +401,22 @@ def test_aggregate_status_blockers_on_critical_item_even_if_mislabeled(monkeypat
         {"item": "no_repo_mutation", "verdict": "FAIL", "severity": "advisory", "reason": "writes to repo"},
     ]
     assert _aggregate_status(findings, skill_type="script") == "blockers"
+
+
+def test_execution_affinity_failure_is_always_a_blocker():
+    findings = [
+        {
+            "item": "execution_affinity",
+            "verdict": "FAIL",
+            "severity": "advisory",
+            "reason": "unknown extension tool requested active_workspace",
+        },
+    ]
+    assert _aggregate_status(
+        findings,
+        skill_type="extension",
+        review_profile="official_hub",
+    ) == "blockers"
 
 
 def test_aggregate_status_warnings_on_soft_fail(monkeypatch):
