@@ -5,7 +5,12 @@ from __future__ import annotations
 import pathlib
 import posixpath
 from collections.abc import Mapping
-from typing import Any, Literal, NotRequired, Required, TypedDict
+from typing import Any
+
+try:
+    from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
+except ImportError:  # Python 3.10
+    from typing_extensions import Literal, NotRequired, Required, TypedDict  # type: ignore[assignment]
 
 
 class LocalWorkspaceRef(TypedDict):
