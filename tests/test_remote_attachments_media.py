@@ -417,6 +417,7 @@ def test_relative_remote_media_never_borrows_home_name_collision(tmp_path):
 )
 def test_remote_media_bridge_calls_existing_home_handler_and_cleans(
     tmp_path,
+    monkeypatch,
     tool_name,
     arguments,
     path_key,
@@ -455,6 +456,14 @@ def test_remote_media_bridge_calls_existing_home_handler_and_cleans(
     entry.handler = home_handler
     service = _MediaService(payload)
     set_remote_workspace_service(service)
+    safety_calls = []
+    monkeypatch.setattr(
+        "ouroboros.safety.check_safety",
+        lambda name, args, **_kwargs: (
+            safety_calls.append((name, dict(args))) is None,
+            "",
+        ),
+    )
     try:
         result = registry.execute(tool_name, dict(arguments))
     finally:
@@ -462,6 +471,7 @@ def test_remote_media_bridge_calls_existing_home_handler_and_cleans(
         set_remote_workspace_service(None)
 
     assert result == f"home-handler:{tool_name}"
+    assert safety_calls == [(tool_name, arguments)]
     assert service.prepare_calls == 1
     assert observed and not observed[0].exists()
     assert not (

@@ -26,8 +26,10 @@ from typing import Any
 
 from ouroboros.platform_layer import (
     kill_process_group_id,
+    kill_process_tree,
     process_group_id,
     process_group_status,
+    subprocess_new_group_kwargs,
     terminate_process_group_id,
 )
 from ouroboros.workspace_diagnostics import (
@@ -666,11 +668,11 @@ def _run_process(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        start_new_session=True,
         env=dict(env) if env is not None else None,
+        **subprocess_new_group_kwargs(),
     )
-    if (pgid := process_group_id(proc.pid)) <= 0:
-        proc.kill()
+    if (pgid := process_group_id(proc.pid)) <= 0 and control is not None:
+        kill_process_tree(proc)
         raise RuntimeError("could not resolve child process group")
     if control is not None:
         try:
@@ -726,7 +728,8 @@ def _run_process(
             _kill_process_group(proc)
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)
-        _stop_residual_process_group(pgid)
+        if pgid > 0:
+            _stop_residual_process_group(pgid)
         if control is not None:
             release = getattr(control, "release_process", None)
             if callable(release):
@@ -861,7 +864,7 @@ def _run_process(
 def _kill_process_group(proc: subprocess.Popen[Any]) -> None:
     pgid = process_group_id(proc.pid)
     if pgid <= 0:
-        proc.kill()
+        kill_process_tree(proc)
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -959,13 +962,13 @@ def _start_service(
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
+                **subprocess_new_group_kwargs(),
             )
         finally:
             log_handle.close()
         service_id = uuid.uuid4().hex
-        if (pgid := process_group_id(proc.pid)) <= 0:
-            proc.kill()
+        if (pgid := process_group_id(proc.pid)) <= 0 and control is not None:
+            kill_process_tree(proc)
             raise RuntimeError("could not resolve service process group")
         if control is not None:
             try:
@@ -985,7 +988,7 @@ def _start_service(
             cwd=cwd,
             command=cmd,
             started_at_ms=int(time.time() * 1000),
-            pgid=pgid,
+            pgid=pgid if pgid > 0 else proc.pid,
             control=control,
             readiness=readiness,
             outputs=tuple(str(item) for item in args.get("outputs") or []),
@@ -1376,10 +1379,10 @@ def _extract_video_frames(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
+                **subprocess_new_group_kwargs(),
             )
-            if (pgid := process_group_id(proc.pid)) <= 0:
-                proc.kill()
+            if (pgid := process_group_id(proc.pid)) <= 0 and control is not None:
+                kill_process_tree(proc)
                 raise RuntimeError("could not resolve ffmpeg process group")
             registered = False
             try:

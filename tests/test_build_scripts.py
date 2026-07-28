@@ -1052,6 +1052,31 @@ def test_ci_release_publishes_only_named_execd_assets():
     assert "release-artifacts/*" not in files
 
 
+def test_ci_execd_bundle_runs_only_for_manual_or_tag_builds():
+    workflow = _ci_workflow()
+
+    stage_header = workflow.split("\n  execd-stage:\n", 1)[1].split(
+        "\n    strategy:", 1
+    )[0]
+    bundle_header = workflow.split("\n  execd-bundle:\n", 1)[1].split(
+        "\n    needs:", 1
+    )[0]
+    for header in (stage_header, bundle_header):
+        assert "github.event_name == 'workflow_dispatch'" in header
+        assert "startsWith(github.ref, 'refs/tags/v')" in header
+
+
+def test_ci_ssh_smoke_covers_target_and_stable_pushes():
+    workflow = _ci_workflow()
+    smoke_header = workflow.split("\n  ssh-executor-smoke:\n", 1)[1].split(
+        "\n    runs-on:", 1
+    )[0]
+
+    assert "refs/heads/ouroboros')" in smoke_header
+    assert "refs/heads/ouroboros-stable')" in smoke_header
+    assert "startsWith(github.ref, 'refs/tags/v')" in smoke_header
+
+
 def test_ci_build_job_exports_release_tag_and_fetches_full_history():
     workflow = _ci_workflow()
 

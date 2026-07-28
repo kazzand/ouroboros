@@ -106,6 +106,8 @@ def write_text_atomic(
     content: str,
     *,
     fsync: bool = False,
+    mode: int | None = None,
+    fsync_directory: bool = False,
 ) -> None:
     """Atomically overwrite ``path`` with ``content`` via a sibling temp file + os.replace.
 
@@ -117,7 +119,9 @@ def write_text_atomic(
 
     The existing file's permission bits are PRESERVED across the replace (os.replace
     creates a new inode, so without this a tracked executable script would lose its +x);
-    a brand-new file defaults to the platform mode (0644 minus umask).
+    a brand-new file defaults to the platform mode (0644 minus umask), unless
+    ``mode`` explicitly requests a tighter contract. ``fsync_directory`` also
+    persists the rename on POSIX when the caller needs that durability tier.
 
     Note: a symlink at ``path`` is REPLACED with a regular file (os.replace acts on the
     link, not its target). This is intentional and confinement-preserving — writing
@@ -130,13 +134,18 @@ def write_text_atomic(
         existing_mode = os.stat(path).st_mode & 0o7777
     except OSError:
         existing_mode = None  # new file -> keep the platform default
+    target_mode = (int(mode) & 0o7777) if mode is not None else existing_mode
     tmp_name = (
         f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
     )
     tmp = path.with_name(tmp_name)
     try:
         if fsync:
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                target_mode if target_mode is not None else 0o644,
+            )
             try:
                 os.write(fd, content.encode("utf-8"))
                 os.fsync(fd)
@@ -144,12 +153,21 @@ def write_text_atomic(
                 os.close(fd)
         else:
             tmp.write_text(content, encoding="utf-8")
-        if existing_mode is not None:
+        if target_mode is not None:
             try:
-                os.chmod(tmp, existing_mode)
+                os.chmod(tmp, target_mode)
             except OSError:
                 pass
         os.replace(tmp, path)
+        if fsync_directory and os.name != "nt":
+            directory_fd = os.open(
+                str(path.parent),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except Exception:
         try:
             tmp.unlink()
@@ -164,12 +182,20 @@ def atomic_write_json(
     *,
     trailing_newline: bool = False,
     fsync: bool = False,
+    mode: int | None = None,
+    fsync_directory: bool = False,
 ) -> None:
     """Atomically persist a JSON value (object or list) via a sibling temp file."""
     content = json.dumps(payload, ensure_ascii=False, indent=2)
     if trailing_newline:
         content += "\n"
-    write_text_atomic(pathlib.Path(path), content, fsync=fsync)
+    write_text_atomic(
+        pathlib.Path(path),
+        content,
+        fsync=fsync,
+        mode=mode,
+        fsync_directory=fsync_directory,
+    )
 
 
 def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0) -> int:
@@ -979,4 +1005,3 @@ def truncate_review_artifact(text: str | None, limit: int = 4000) -> str:
     if len(text) - limit <= len(marker):
         return text
     return text[:limit] + marker
-

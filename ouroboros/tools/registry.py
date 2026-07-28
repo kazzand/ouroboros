@@ -3574,6 +3574,13 @@ class ToolRegistry:
         from ouroboros.remote_task_files import MEDIA_EXPORT_OPERATION
         from ouroboros.remote_workspace import get_remote_workspace_service
 
+        safety_block, safety_message = self._stage_home_policy_and_safety(
+            name,
+            args,
+            None,
+        )
+        if safety_block:
+            return safety_block
         max_bytes = 25 * 1024 * 1024 if name == "ocr_pdf" else 20 * 1024 * 1024
         native_args = {
             key: source[key]
@@ -3643,7 +3650,11 @@ class ToolRegistry:
         local_args[str(source["arg_key"])] = str(target)
         try:
             inspect.signature(entry.handler).bind(self._ctx, **local_args)
-            return str(entry.handler(self._ctx, **local_args))
+            return _compose_execute_result(
+                str(entry.handler(self._ctx, **local_args)),
+                "",
+                safety_message,
+            )
         except TypeError:
             return _format_tool_arg_error(entry)
         except Exception as exc:

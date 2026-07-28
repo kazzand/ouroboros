@@ -190,6 +190,7 @@ def acquire_exclusive_file_lock(
     stale_sec: float = 90.0,
     metadata: str = "",
     poll_sec: float = 0.05,
+    mode: int = 0o644,
 ) -> Optional[int]:
     """Acquire a portable lockfile using O_EXCL and return its file descriptor."""
     lock_path = pathlib.Path(lock_path)
@@ -197,7 +198,11 @@ def acquire_exclusive_file_lock(
     started = time.time()
     while (time.time() - started) < timeout_sec:
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(
+                str(lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                int(mode) & 0o7777,
+            )
             try:
                 text = metadata or f"pid={os.getpid()} ts={time.time()}\n"
                 os.write(fd, text.encode("utf-8"))

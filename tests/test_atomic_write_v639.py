@@ -62,3 +62,21 @@ def test_atomic_write_json_still_works(tmp_path):
     atomic_write_json(target, {"a": 1, "b": [2, 3]})
     import json
     assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "b": [2, 3]}
+
+
+@pytest.mark.skipif(__import__("sys").platform.startswith("win"),
+                    reason="POSIX permission bits are not reported on Windows")
+def test_atomic_write_json_can_enforce_owner_only_mode(tmp_path):
+    target = tmp_path / "owner.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o644)
+
+    atomic_write_json(
+        target,
+        {"secret": False},
+        fsync=True,
+        mode=0o600,
+        fsync_directory=True,
+    )
+
+    assert target.stat().st_mode & 0o777 == 0o600

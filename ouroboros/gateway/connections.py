@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import os
 import pathlib
 import secrets
 import threading
 import time
-import uuid
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Iterator
@@ -18,7 +16,11 @@ from typing import Any, Callable, Iterator
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ouroboros.utils import utc_now_iso
+from ouroboros.platform_layer import (
+    acquire_exclusive_file_lock,
+    release_exclusive_file_lock,
+)
+from ouroboros.utils import atomic_write_json, utc_now_iso
 
 CONNECTION_STORE_SCHEMA_VERSION = 1
 CONNECTION_LIFECYCLES = frozenset({"active", "retired"})
@@ -154,34 +156,21 @@ def _clean_text(value: Any, field: str, *, maximum: int) -> str:
 
 @contextmanager
 def _owner_store_lock(path: pathlib.Path) -> Iterator[None]:
-    """Portable O_EXCL lock whose inode is owner-only from creation."""
+    """Serialize owner-store updates with the shared owner-only lock primitive."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    started = time.monotonic()
-    fd: int | None = None
-    while time.monotonic() - started < _LOCK_TIMEOUT_SEC:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock_path.stat().st_mtime > _LOCK_STALE_SEC:
-                    lock_path.unlink()
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.05)
+    fd = acquire_exclusive_file_lock(
+        lock_path,
+        timeout_sec=_LOCK_TIMEOUT_SEC,
+        stale_sec=_LOCK_STALE_SEC,
+        mode=0o600,
+    )
     if fd is None:
         raise TimeoutError(f"could not lock remote connection store {path}")
     try:
         yield
     finally:
-        os.close(fd)
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        release_exclusive_file_lock(lock_path, fd)
 
 
 def _read_store(path: pathlib.Path) -> dict[str, Any]:
@@ -205,37 +194,13 @@ def _read_store(path: pathlib.Path) -> dict[str, Any]:
 
 
 def _write_store(path: pathlib.Path, payload: dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    temp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            view = memoryview(data)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("short write to remote connection store")
-                view = view[written:]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(temp, path)
-        os.chmod(path, 0o600)
-        if os.name != "nt":
-            directory_fd = os.open(
-                str(path.parent),
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    except Exception:
-        try:
-            temp.unlink()
-        except OSError:
-            pass
-        raise
+    atomic_write_json(
+        path,
+        payload,
+        fsync=True,
+        mode=0o600,
+        fsync_directory=True,
+    )
 
 
 def _mutate_store(

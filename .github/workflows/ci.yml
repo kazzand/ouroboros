@@ -124,6 +124,9 @@ jobs:
   # exclusively from the checked-in SHA-256 lock, then exercised at the exact
   # supported glibc floor with the container's system Python removed.
   execd-stage:
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +218,9 @@ jobs:
           if-no-files-found: error
 
   execd-bundle:
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || startsWith(github.ref, 'refs/tags/v')
     needs: execd-stage
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -445,6 +451,7 @@ jobs:
     if: |
       (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
       || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
+      || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros-stable')
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04

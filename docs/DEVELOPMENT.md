@@ -1234,7 +1234,9 @@ them over a bare `Path.write_text` for any full-file overwrite. Appends are
 intentionally NOT atomic (they extend in place). Lockfile acquisition should go through
 `platform_layer.acquire_exclusive_file_lock` /
 `release_exclusive_file_lock` rather than reimplementing `O_CREAT|O_EXCL`
-loops in feature modules.
+loops in feature modules. Owner-only state may pass `mode=0o600`; callers that
+need rename durability may additionally pass `fsync=True,
+fsync_directory=True` rather than reimplementing the atomic-write sequence.
 
 Narrow exceptions are allowed only when the file's contract is not JSON-object
 state or intentionally has extra durability semantics: `supervisor/state.py`
@@ -1264,8 +1266,11 @@ settings state.
   - Top-level imports of platform-specific modules (`fcntl`, `msvcrt`, `winreg`, `resource`)
   - Direct `os.kill`, `os.killpg`, `os.setsid`, `os.getpgid` attribute access
   - Direct `signal.SIGKILL`, `signal.SIGTERM` attribute access
-  
-  Not scanned by the AST guard: `launcher.py` (immutable outer shell, intentionally excluded) and subprocess flag patterns (`creationflags`, `start_new_session`). For subprocess isolation, use `subprocess_new_group_kwargs()` and `subprocess_hidden_kwargs()` from `platform_layer.py` — enforced by code review and the `cross_platform` checklist item.
+  - Direct subprocess flag keywords (`creationflags`, `start_new_session`)
+
+  `launcher.py` remains intentionally excluded as the immutable outer shell.
+  For subprocess isolation, use `subprocess_new_group_kwargs()` and
+  `subprocess_hidden_kwargs()` from `platform_layer.py`.
 - **Pre-commit review**: checklist item `cross_platform` (#15) catches violations during code review.
 - **CI matrix**: tests run on Ubuntu, Windows, and macOS to catch runtime failures.
 

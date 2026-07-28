@@ -59,6 +59,7 @@ from ouroboros.remote_task_files import (
     RemoteTaskFileError,
     attachment_blob_map,
 )
+from ouroboros.platform_layer import subprocess_new_group_kwargs
 from ouroboros.workspace_diagnostics import ExecutionDiagnostic, ToolExecutionEnvelope
 from ouroboros.workspace_native import (
     MANDATORY_REMOTE_NATIVE_OPERATIONS,
@@ -761,7 +762,7 @@ class ExecdService:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                **subprocess_new_group_kwargs(),
             )
         except BaseException:
             self.custody.request_custodian_close(custodian_id)

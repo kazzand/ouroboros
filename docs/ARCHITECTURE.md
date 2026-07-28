@@ -197,6 +197,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
+      │   ├── connections.py   ← Owner-authenticated SSH alias/trust/bootstrap lifecycle and owner-only connection metadata store
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
       │   └── _helpers.py      ← shared HTTP request root helpers, coercion, and JSON error envelope
       ├── tools/               ← Auto-discovered tool plugins
@@ -254,6 +255,9 @@ build.sh                      ← macOS build (PyInstaller → .dmg)
 build_linux.sh                ← Linux build (PyInstaller → .tar.gz)
 build_windows.ps1             ← Windows build (PyInstaller → .zip)
 scripts/build_repo_bundle.py  ← Builds `repo.bundle` + `repo_bundle_manifest.json` for packaged releases
+scripts/assemble_execd_stage.py ← Assembles one pinned architecture-native standalone execd stage
+scripts/smoke_execd_stage.py  ← Runs a complete staged execd without repository or system Python dependencies
+scripts/build_execd_bundle.py ← Packs verified x86_64/aarch64 stages into deterministic release assets and manifest
 scripts/run_external_review.py ← dual-lane non-committing review wrapper. The default operator lane reviews the staged tree through the production advisory→triad→scope cycle with resolved production policy. `--contributor` reviews an exact committed target-base..head proposal in a detached target-base checkout, forces shipped target-base triad/scope models and efforts through OpenRouter with blocking enforcement, excludes Claude advisory, forbids contributor VERSION allocation, and emits a redacted SHA-bound `review-evidence.json`/`review-packet.zip`. Contributor `READY_FOR_INTEGRATION` is triage evidence, never merge authority: final version carriers and production review belong to the maintainer squash landing. Both lanes use the production triad/scope substrate and fresh non-live observability roots.
 scripts/run_plan_review.py ← v6.43.0 operator plan-review tool: invokes the reviewer-panel portion of `ouroboros.tools.plan_review` from outside the runtime, loading BIBLE/DEVELOPMENT/ARCHITECTURE/CHECKLISTS, the proposed plan, optional touched-file snapshots, and optional generated Atlas context. Inputs: `--plan`, explicit `--context-level`, optional `--files-to-touch`/`--extra-context`/`--drive-root`. Output: full raw reviewer responses plus coordinated plan-review output to stdout (and optional `--output PATH`), with no truncation. It deliberately skips the live planning-scout swarm because that requires a running worker/supervisor environment. Not part of the runtime gate; review-exempt dev tool.
 scripts/cleanup_test_pollution.py ← Dry-run-first cleanup utility for local test-pollution artifacts: known test skill state dirs, stale `__extension_imports`, and accidental `MagicMock`-named repo-root files. Use `--apply` only after inspecting planned removals.
@@ -970,6 +974,10 @@ A left `#primary-sidebar` of ROWS (`.nav-row`, not an icon rail): Chat (Main), a
 - `web/modules/page_icons.js` is the nav/header icon SSOT.
 - `web/modules/api_client.js` is the frontend API boundary.
 - `web/modules/api_types.js` mirrors browser-facing envelopes with JSDoc.
+- `web/modules/connections_ui.js` owns the Settings Connections lifecycle and
+  Project SSH workspace selector over the owner-authenticated gateway surface.
+- `web/modules/remote_task_state.js` owns the shared degraded/reconnecting
+  remote-task projection used by Chat and Activity.
 - `web/modules/ui_helpers.js` centralizes tone badges, age labels, inline status, host-bridge downloads, and the safe field renderer/value collector shared by Widgets and Settings (Settings retains its narrow route/component contract).
 - `web/modules/skill_card_renderer.js` renders installed Skills cards from shared lifecycle/review/grant state.
 - `web/modules/update_status.js` (v6.41.0) renders the main-screen Update pill + the staged auto/assisted/manual dialog; `web/modules/activity.js` (v6.41.0) renders the Dashboard Activity subtab (cron schedules, running/queued tasks, background consciousness) with direct mechanical controls. Both use the shared `.btn` button system.
@@ -1198,7 +1206,13 @@ Rationale: `server.py` should own process startup/lifespan/static mounting, whil
 
 ### WebSocket protocol
 
-Browser messages and backend broadcasts use typed envelopes from `gateway/contracts.py`. Extension WS messages are namespaced by `extension_loader.extension_surface_name()` so skills cannot shadow built-in message types. Reviewed transport skills can inject chat/photo/typing through the loopback Host Service rather than bypassing the browser protocol.
+Browser messages and backend broadcasts use typed envelopes from
+`gateway/contracts.py`. The additive `connection_state` broadcast carries
+task-scoped remote connection degradation/recovery without changing
+model-visible tool contracts. Extension WS messages are namespaced by
+`extension_loader.extension_surface_name()` so skills cannot shadow built-in
+message types. Reviewed transport skills can inject chat/photo/typing through
+the loopback Host Service rather than bypassing the browser protocol.
 
 Server-side broadcast hardening (v6.34.0, WS4): `gateway/ws.py::broadcast_ws` fans out to all connected clients concurrently (`asyncio.gather(..., return_exceptions=True)`) so one slow or half-open client cannot head-of-line-block delivery to the others; the heartbeat path stays critical and is never dropped. `gateway/history.py::make_chat_history_endpoint` offloads the synchronous `iter_jsonl_objects` chat + progress parsing for `/api/chat/history` onto `asyncio.to_thread` so a large history read does not stall the event loop.
 

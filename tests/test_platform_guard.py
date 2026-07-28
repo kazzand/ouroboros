@@ -7,11 +7,9 @@ for direct use of the following forbidden patterns:
   - Direct attribute access: os.kill, os.killpg, os.setsid, os.getpgid
   - Direct attribute access: signal.SIGKILL, signal.SIGTERM
 
-Note: subprocess flags (creationflags, start_new_session) and launcher.py
-are NOT covered by this guard — platform_layer.py provides
-subprocess_new_group_kwargs() and subprocess_hidden_kwargs() helpers,
-and caller code uses them (checked by code review, not by this AST guard).
-launcher.py is the immutable outer shell and is intentionally excluded.
+Subprocess flags (creationflags, start_new_session) are also rejected outside
+platform_layer.py. launcher.py is the immutable outer shell and is
+intentionally excluded.
 
 Runs on every `make test` on all platforms.
 """
@@ -63,6 +61,11 @@ FORBIDDEN_OS_ATTRS: Set[str] = {
 FORBIDDEN_SIGNAL_ATTRS: Set[str] = {
     "SIGKILL",
     "SIGTERM",
+}
+
+FORBIDDEN_SUBPROCESS_KEYWORDS: Set[str] = {
+    "creationflags",
+    "start_new_session",
 }
 
 
@@ -125,6 +128,14 @@ def _scan_file(filepath: pathlib.Path) -> List[str]:
                     f"{rel_path}:{node.lineno}: "
                     f"Direct use of platform-specific signal.{node.attr}"
                 )
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg in FORBIDDEN_SUBPROCESS_KEYWORDS:
+                    violations.append(
+                        f"{rel_path}:{keyword.value.lineno}: "
+                        "Direct use of platform-specific subprocess keyword "
+                        f"'{keyword.arg}'"
+                    )
 
     # Check ImportFrom for direct imports like `from os import kill`
     for node in ast.walk(tree):
