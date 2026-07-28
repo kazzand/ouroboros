@@ -396,16 +396,12 @@ def _verify_and_record(
     if match_mode not in _EXPECTED_MATCH_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
     if match_mode == "bytes_equal" and kind not in _RUN_KINDS:
-        # Silently accepting-and-ignoring the comparison would fake a stronger
-        # verification than actually ran (adversarial r1 soft finding).
         return (
             "⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match=bytes_equal only applies to "
             f"run-kind checks ({', '.join(_RUN_KINDS)}) — with contract_kind={kind} no comparison "
             "would run. Use a run kind (check may be as simple as ['true'])."
         )
     if match_mode == "bytes_equal" and str(expected or "").strip():
-        # Receipt honesty (scope r6): `expected` is never consulted in bytes_equal
-        # mode — recording it beside matched=true would read as a checked substring.
         return (
             "⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match=bytes_equal takes NO `expected` "
             "string — the verdict is the byte-parity of artifact_paths=[a, b]. Drop `expected`, "
@@ -436,7 +432,9 @@ def _verify_and_record(
                 f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind={kind} requires `check` "
                 "(the verification command as argv list or a shell one-liner string)."
             )
-        if match_mode == "bytes_equal" and len([p for p in (artifact_paths or []) if str(p or "").strip()]) != 2:
+        if match_mode == "bytes_equal" and len(
+            [path for path in (artifact_paths or []) if str(path or "").strip()]
+        ) != 2:
             return (
                 "⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match=bytes_equal requires "
                 "artifact_paths=[<file_a>, <file_b>] — exactly two files to compare byte-for-byte "
@@ -573,11 +571,23 @@ def record_remote_verification_result(
     match_mode = str(expected_match or "substring").strip().lower() or "substring"
     if kind not in _RUN_KINDS:
         return "⚠️ REMOTE_VERIFY_UNSUPPORTED: only run-kind checks execute on the remote target."
-    if match_mode == "bytes_equal":
-        return (
-            "⚠️ REMOTE_VERIFY_UNSUPPORTED: bytes_equal needs a dedicated remote "
-            "two-artifact comparison and was not recorded."
+    if match_mode not in _EXPECTED_MATCH_KINDS:
+        return f"⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
+    if (
+        match_mode == "bytes_equal"
+        and (
+            str(expected or "").strip()
+            or len(
+                [
+                    path
+                    for path in (artifact_paths or [])
+                    if str(path or "").strip()
+                ]
+            )
+            != 2
         )
+    ):
+        return "⚠️ TOOL_ARG_ERROR (verify_and_record): invalid bytes_equal arguments."
     argv = _normalize_check(check)
     if not argv:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind={kind} requires `check`."
@@ -590,7 +600,30 @@ def record_remote_verification_result(
     if stderr:
         out = f"{out}\n{stderr}" if out else stderr
     rc = int(getattr(process, "returncode", 1))
-    matched = (not expected_s) or _expected_matches(out, expected_s, match_mode)
+    verification = (
+        envelope.trace.get("verification")
+        if isinstance(getattr(envelope, "trace", None), dict)
+        else None
+    )
+    verification = verification if isinstance(verification, dict) else {}
+    if match_mode == "bytes_equal":
+        comparison = verification.get("bytes_equal")
+        if not isinstance(comparison, dict) or not isinstance(
+            comparison.get("matched"), bool
+        ):
+            return (
+                "⚠️ REMOTE_VERIFY_ERROR: target returned no typed bytes_equal "
+                "fact; no receipt recorded."
+            )
+        matched = bool(comparison["matched"])
+        detail = str(comparison.get("detail") or "")
+        out = (out + "\n\n[bytes_equal] " + detail).strip()
+    else:
+        matched = (not expected_s) or _expected_matches(
+            out,
+            expected_s,
+            match_mode,
+        )
     passed = rc == 0 and matched
     receipt: dict[str, Any] = {
         "tool": "verify_and_record",
@@ -618,15 +651,15 @@ def record_remote_verification_result(
     basis = " ".join(str(criterion_basis or "").split()).strip()
     if basis:
         receipt["criterion_basis"] = basis[:500]
-    declared = [str(path) for path in (artifact_paths or []) if str(path or "").strip()]
-    if declared:
+    lifecycle = verification.get("artifact_lifecycle")
+    if isinstance(lifecycle, list) and lifecycle:
         receipt["artifact_lifecycle"] = [
-            {
-                "path": path[:300],
-                "exists_after": None,
-                "check_surface": "remote_target_unprobed",
-            }
-            for path in declared[:20]
+            dict(row) for row in lifecycle[:20] if isinstance(row, dict)
+        ]
+    missing_after = verification.get("artifacts_missing_after")
+    if isinstance(missing_after, list) and missing_after:
+        receipt["artifacts_missing_after"] = [
+            str(path)[:300] for path in missing_after[:20]
         ]
     masked, reasons = _check_has_exit_masking(argv)
     if masked:

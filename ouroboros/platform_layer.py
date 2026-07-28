@@ -183,6 +183,30 @@ def scrub_agent_child_env(env: dict[str, str]) -> dict[str, str]:
     }
 
 
+def best_effort_nonblocking_pipe_write(stream_or_fd: Any, payload: bytes) -> bool:
+    """Attempt a panic/control write without ever falling back to a blocking write.
+
+    ``os.set_blocking`` did not support Windows pipes before Python 3.12.  Panic
+    must still continue to transport teardown on every supported Python, so an
+    unavailable or failed non-blocking primitive is reported as ``False`` rather
+    than escaping into the caller.
+    """
+
+    try:
+        fd = (
+            int(stream_or_fd)
+            if isinstance(stream_or_fd, int)
+            else int(stream_or_fd.fileno())
+        )
+        set_blocking = getattr(os, "set_blocking", None)
+        if not callable(set_blocking):
+            return False
+        set_blocking(fd, False)
+        return os.write(fd, bytes(payload)) == len(payload)
+    except Exception:
+        return False
+
+
 def acquire_exclusive_file_lock(
     lock_path: pathlib.Path,
     *,

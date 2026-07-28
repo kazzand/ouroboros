@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from typing import Any, Protocol, runtime_checkable
 
+from ouroboros.config import get_ssh_timeout_sec
 from ouroboros.remote_protocol import canonical_json
 from ouroboros.remote_service_leases import RemoteServiceLeaseBook
 from ouroboros.remote_ssh import OpenSSHExecdTransport
@@ -33,11 +34,7 @@ from ouroboros.remote_task_files import (
 )
 from ouroboros.remote_worker_proxy import (
     RemoteWorkspacePipeProxy,
-)
-from ouroboros.remote_worker_proxy import (
     capability_projection as _capability_projection,
-)
-from ouroboros.remote_worker_proxy import (
     envelope_from_dict as _envelope_from_dict,
 )
 from ouroboros.remote_worker_proxy import (
@@ -475,8 +472,12 @@ class RemoteSessionBroker:
                     "attachment_blobs": dict(attachment_blobs or {}),
                 },
                 priority=5,
+                timeout_sec=float(get_ssh_timeout_sec("admission")),
             )
             return dict(result)
+        except BaseException:
+            owned_cancel.set()
+            raise
         finally:
             if task_id:
                 with self._state_lock:
@@ -1583,7 +1584,6 @@ class RemoteSessionBroker:
             "sessions": recovered,
             "reconciliation": reconciliation,
         }
-
 
 RemoteWorkspaceBroker = RemoteSessionBroker
 

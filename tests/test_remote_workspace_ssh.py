@@ -1181,6 +1181,20 @@ def test_rws_108_default_broker_bootstrap_admit_read_cancel_and_panic(
 
         assert "remote-only" in read.text
         assert broker.has_active_lease("connection-real") is True
+        assert docker_ssh_host.ssh(
+            "pgrep",
+            "-f",
+            "[B]ROKER_PANIC_SENTINEL",
+            check=False,
+        ).returncode == 0
+        reconnected = broker.reconnect_connection(connection, timeout_sec=20)
+        assert reconnected["status"] == "ready"
+        assert docker_ssh_host.ssh(
+            "pgrep",
+            "-f",
+            "[B]ROKER_PANIC_SENTINEL",
+            check=False,
+        ).returncode == 0
         assert broker.cancel(
             workspace_ref,
             task_id=task_id,

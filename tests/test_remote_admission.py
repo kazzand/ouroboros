@@ -681,6 +681,7 @@ def test_project_create_admits_ssh_ref_and_rebind_refuses_live_tasks(
     class Service:
         def __init__(self):
             self.calls = []
+            self.closed = []
             self.host_id = "host-continuity-1"
 
         def admit_workspace(self, conn, **kwargs):
@@ -695,6 +696,10 @@ def test_project_create_admits_ssh_ref_and_rebind_refuses_live_tasks(
                 },
                 "admission_evidence": {"host_id": self.host_id},
             }
+
+        def close_project_session(self, workspace_ref, *, project_id):
+            self.closed.append((dict(workspace_ref), project_id))
+            return True
 
     service = Service()
     app = Starlette(routes=[
@@ -746,6 +751,8 @@ def test_project_create_admits_ssh_ref_and_rebind_refuses_live_tasks(
     assert changed.status_code == 409
     assert changed.json()["error_code"] == "host_identity_changed"
     assert changed.json()["action"] == "retrust"
+    assert len(service.closed) == 1
+    assert service.closed[0][0]["remote_root"] == "/srv/other-project"
 
     register_requested_admission(
         _task(
@@ -861,6 +868,282 @@ def test_remote_rebind_late_task_race_closes_only_provisional_session(
     assert get_project(isolated_queue, project["id"])["workspace_ref"]["workspace_id"] == (
         "workspace-old"
     )
+
+
+def test_successful_project_rebind_closes_only_the_superseded_session(
+    isolated_queue,
+    tmp_path,
+):
+    from ouroboros.gateway import projects as projects_gateway
+    from ouroboros.gateway.connections import add_connection
+    from ouroboros.projects_registry import create_project
+
+    connection_path = tmp_path / "rebind-connections.json"
+    connection = add_connection(
+        name="Remote",
+        ssh_alias="remote",
+        path=connection_path,
+    )
+    project = create_project(
+        isolated_queue,
+        "rebind-project",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": connection["id"],
+            "remote_root": "/srv/old",
+            "workspace_id": "workspace-old",
+        },
+    )
+
+    class Service:
+        def __init__(self):
+            self.closed = []
+
+        def admit_workspace(self, conn, **kwargs):
+            return {
+                "ok": True,
+                "workspace_ref": {
+                    "kind": "ssh",
+                    "connection_id": conn["id"],
+                    "remote_root": kwargs["remote_root"],
+                    "workspace_id": "workspace-new",
+                },
+                "admission_evidence": {"host_id": "host-rebind"},
+            }
+
+        def close_project_session(self, workspace_ref, *, project_id):
+            self.closed.append((dict(workspace_ref), project_id))
+            return True
+
+    service = Service()
+    app = Starlette(
+        routes=[
+            Route(
+                "/api/projects/{project_id}/update",
+                projects_gateway.api_project_update,
+                methods=["POST"],
+            )
+        ]
+    )
+    app.state.drive_root = isolated_queue
+    app.state.remote_connections_path = connection_path
+    app.state.remote_workspace_service = service
+    client = TestClient(app)
+
+    rebound = client.post(
+        f"/api/projects/{project['id']}/update",
+        json={
+            "workspace_ref": {
+                "kind": "ssh",
+                "connection_id": connection["id"],
+                "remote_root": "/srv/new",
+            }
+        },
+    )
+    localized = client.post(
+        f"/api/projects/{project['id']}/update",
+        json={"workspace_ref": None},
+    )
+
+    assert rebound.status_code == 200, rebound.text
+    assert localized.status_code == 200, localized.text
+    assert [
+        row[0]["workspace_id"] for row in service.closed
+    ] == ["workspace-old", "workspace-new"]
+    assert all(row[1] == project["id"] for row in service.closed)
+
+
+def test_concurrent_remote_rebinds_serialize_admission_commit_and_cleanup(
+    isolated_queue,
+    tmp_path,
+):
+    import concurrent.futures
+
+    from ouroboros.gateway import projects as projects_gateway
+    from ouroboros.gateway.connections import add_connection
+    from ouroboros.projects_registry import create_project, get_project
+
+    connection_path = tmp_path / "serialized-rebind-connections.json"
+    connection = add_connection(
+        name="Remote",
+        ssh_alias="remote",
+        path=connection_path,
+    )
+    project = create_project(
+        isolated_queue,
+        "serialized-rebind-project",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": connection["id"],
+            "remote_root": "/srv/old",
+            "workspace_id": "workspace-old",
+        },
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class Service:
+        def __init__(self):
+            self.calls = []
+            self.closed = []
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def admit_workspace(self, conn, **kwargs):
+            with self.lock:
+                self.calls.append(kwargs["remote_root"])
+                call_number = len(self.calls)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if call_number == 1:
+                    first_started.set()
+                    assert release_first.wait(5)
+                suffix = kwargs["remote_root"].rsplit("/", 1)[-1]
+                return {
+                    "ok": True,
+                    "workspace_ref": {
+                        "kind": "ssh",
+                        "connection_id": conn["id"],
+                        "remote_root": kwargs["remote_root"],
+                        "workspace_id": f"workspace-{suffix}",
+                    },
+                    "admission_evidence": {"host_id": "host-serialized"},
+                }
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+        def close_project_session(self, workspace_ref, *, project_id):
+            self.closed.append((dict(workspace_ref), project_id))
+            return True
+
+    service = Service()
+    app = Starlette(
+        routes=[
+            Route(
+                "/api/projects/{project_id}/update",
+                projects_gateway.api_project_update,
+                methods=["POST"],
+            )
+        ]
+    )
+    app.state.drive_root = isolated_queue
+    app.state.remote_connections_path = connection_path
+    app.state.remote_workspace_service = service
+
+    with TestClient(app) as client, concurrent.futures.ThreadPoolExecutor(
+        max_workers=2
+    ) as pool:
+        first = pool.submit(
+            client.post,
+            f"/api/projects/{project['id']}/update",
+            json={
+                "workspace_ref": {
+                    "kind": "ssh",
+                    "connection_id": connection["id"],
+                    "remote_root": "/srv/first",
+                }
+            },
+        )
+        assert first_started.wait(2)
+        second = pool.submit(
+            client.post,
+            f"/api/projects/{project['id']}/update",
+            json={
+                "workspace_ref": {
+                    "kind": "ssh",
+                    "connection_id": connection["id"],
+                    "remote_root": "/srv/second",
+                }
+            },
+        )
+        time.sleep(0.05)
+        assert service.calls == ["/srv/first"]
+        release_first.set()
+        first_response = first.result(timeout=5)
+        second_response = second.result(timeout=5)
+
+    assert first_response.status_code == 200, first_response.text
+    assert second_response.status_code == 200, second_response.text
+    assert service.max_active == 1
+    assert get_project(
+        isolated_queue, project["id"]
+    )["workspace_ref"]["workspace_id"] == "workspace-second"
+    assert [row[0]["workspace_id"] for row in service.closed] == [
+        "workspace-old",
+        "workspace-first",
+    ]
+
+
+def test_project_admission_timeout_cancels_and_closes_late_transport(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.remote_workspace as remote_workspace
+    from ouroboros.workspace_native import MANDATORY_REMOTE_NATIVE_OPERATIONS
+
+    entered = threading.Event()
+    released = threading.Event()
+    closed = threading.Event()
+
+    class Transport:
+        def __init__(self, request):
+            self.request = request
+
+        def handshake(self):
+            entered.set()
+            assert released.wait(5)
+            return {}
+
+        def close(self):
+            closed.set()
+
+        panic = close
+
+    manifest = {
+        "schema_version": 1,
+        "manifest_sha256": "a" * 64,
+        "public_schema_sha256": "b" * 64,
+        "native_operations": [
+            {"name": name}
+            for name in sorted(MANDATORY_REMOTE_NATIVE_OPERATIONS)
+        ],
+        "native_kernel_modules": [],
+        "native_import_modules": [],
+        "native_import_edges": {},
+    }
+    monkeypatch.setattr(
+        remote_workspace,
+        "get_ssh_timeout_sec",
+        lambda kind: 0.05 if kind == "admission" else 5,
+    )
+    broker = remote_workspace.RemoteSessionBroker(
+        tmp_path,
+        "generation-timeout",
+        manifest,
+        transport_factory=Transport,
+    )
+    try:
+        with pytest.raises(
+            remote_workspace.RemoteWorkspaceError,
+            match="Home deadline",
+        ) as timeout:
+            broker.admit_workspace(
+                {"id": "connection-timeout", "ssh_alias": "timeout"},
+                remote_root="/srv/timeout",
+                project_id="project-timeout",
+                task_id="project:project-timeout",
+            )
+        assert timeout.value.code == "remote_request_timeout"
+        assert entered.is_set()
+        released.set()
+        assert closed.wait(2)
+        assert broker.status()["connections"] == []
+    finally:
+        released.set()
+        broker.close(timeout_sec=2)
 
 
 def test_direct_project_room_gets_private_remote_lens_not_executor_authority(

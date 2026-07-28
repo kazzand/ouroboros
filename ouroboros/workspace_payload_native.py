@@ -29,6 +29,153 @@ from ouroboros.workspace_native_contract import (
 )
 
 
+def attach_remote_verification_facts(
+    workspace_root: pathlib.Path,
+    args: Mapping[str, Any],
+    checked: NativeOperationResult,
+) -> NativeOperationResult:
+    """Probe typed comparison/lifecycle facts immediately after a target check."""
+
+    root = pathlib.Path(workspace_root).resolve(strict=True)
+    declared = [
+        str(path).strip().replace("\\", "/")
+        for path in args.get("artifact_paths") or []
+        if str(path or "").strip()
+    ][:20]
+    raw_cwd = str(args.get("cwd") or "").strip()
+    try:
+        work_dir = pathlib.Path(raw_cwd) if raw_cwd else root
+        if not work_dir.is_absolute():
+            work_dir = root / work_dir
+        work_dir = work_dir.resolve(strict=False)
+        work_dir.relative_to(root)
+    except (OSError, ValueError):
+        work_dir = None
+    resolved: list[pathlib.Path | None] = []
+    for raw in declared:
+        pure = pathlib.PurePosixPath(raw)
+        candidate: pathlib.Path | None = None
+        if work_dir is not None and not pure.is_absolute() and ".." not in pure.parts:
+            try:
+                candidate = work_dir.joinpath(*pure.parts).resolve(strict=False)
+                candidate.relative_to(root)
+            except (OSError, ValueError):
+                candidate = None
+        resolved.append(candidate)
+    facts: dict[str, Any] = {}
+    if str(args.get("expected_match") or "") == "bytes_equal":
+        if len(declared) != 2:
+            raise ValueError("bytes_equal requires exactly two artifact paths")
+        comparable = (
+            len(resolved) == 2
+            and all(path is not None and path.is_file() for path in resolved)
+        )
+        matched = False
+        unavailable = next(
+            (
+                declared[index]
+                for index, path in enumerate(resolved)
+                if path is None or not path.is_file()
+            ),
+            declared[0],
+        )
+        detail = (
+            f"bytes_equal: file not found or unavailable: "
+            f"{unavailable}"
+        )
+        if comparable:
+            a_path, b_path = resolved
+            assert a_path is not None and b_path is not None
+            a_size, b_size = a_path.stat().st_size, b_path.stat().st_size
+            offset = 0
+            first_diff = -1
+            with a_path.open("rb") as a_stream, b_path.open("rb") as b_stream:
+                while True:
+                    a_chunk = a_stream.read(64 * 1024)
+                    b_chunk = b_stream.read(64 * 1024)
+                    if not a_chunk and not b_chunk:
+                        break
+                    if a_chunk != b_chunk:
+                        common = min(len(a_chunk), len(b_chunk))
+                        first_diff = next(
+                            (
+                                offset + index
+                                for index in range(common)
+                                if a_chunk[index] != b_chunk[index]
+                            ),
+                            offset + common,
+                        )
+                        break
+                    offset += len(a_chunk)
+            matched = first_diff < 0 and a_size == b_size
+            if matched:
+                detail = (
+                    f"bytes_equal: {declared[0]} == {declared[1]} "
+                    f"({a_size} bytes)"
+                )
+            else:
+                if first_diff < 0:
+                    first_diff = min(a_size, b_size)
+                window_start = max(0, first_diff - 16)
+                try:
+                    with a_path.open("rb") as stream:
+                        stream.seek(window_start)
+                        a_hex = stream.read(48).hex(" ")
+                except OSError:
+                    a_hex = "(unreadable)"
+                try:
+                    with b_path.open("rb") as stream:
+                        stream.seek(window_start)
+                        b_hex = stream.read(48).hex(" ")
+                except OSError:
+                    b_hex = "(unreadable)"
+                detail = (
+                    f"bytes differ at offset {first_diff} "
+                    f"(sizes {a_size} vs {b_size}).\n"
+                    f"{declared[0]} @{window_start}: {a_hex}\n"
+                    f"{declared[1]} @{window_start}: {b_hex}"
+                )
+        facts["bytes_equal"] = {"matched": matched, "detail": detail}
+    lifecycle: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for raw, path in zip(declared, resolved):
+        exists: bool | None = None
+        surface = "remote_target"
+        try:
+            if path is None:
+                raise ValueError("path is outside workspace")
+            path.lstat()
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        except (OSError, ValueError):
+            surface = "unavailable"
+        lifecycle.append(
+            {
+                "path": raw[:300],
+                "exists_after": exists,
+                "check_surface": surface,
+            }
+        )
+        if exists is False:
+            missing.append(raw[:300])
+    if lifecycle:
+        facts["artifact_lifecycle"] = lifecycle
+    if missing:
+        facts["artifacts_missing_after"] = missing
+    envelope = checked.envelope
+    return NativeOperationResult(
+        ToolExecutionEnvelope(
+            text=envelope.text,
+            diagnostic=envelope.diagnostic,
+            process=envelope.process,
+            artifacts=envelope.artifacts,
+            trace={**envelope.trace, "verification": facts},
+        ),
+        checked.blobs,
+    )
+
+
 def validate_reviewed_payload(
     args: Mapping[str, Any],
     blobs: Mapping[str, bytes],

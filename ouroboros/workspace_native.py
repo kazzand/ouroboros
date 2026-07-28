@@ -56,7 +56,7 @@ from ouroboros.workspace_native_contract import (
     validate_remote_native_operation_map as validate_remote_native_operation_map,
 )
 from ouroboros.workspace_payload_native import (
-    collect_declared_outputs,
+    attach_remote_verification_facts, collect_declared_outputs,
     execute_inline_script,
     execute_reviewed_payload,
     scratch_fingerprints,
@@ -66,10 +66,9 @@ from ouroboros.workspace_payload_native import (
 )
 from ouroboros.workspace_query_native import (
     classify_workspace_path,
+    execute_workspace_query_operation,
     export_workspace_patch,
     git_workspace,
-    query_workspace,
-    search_workspace,
 )
 from ouroboros.workspace_snapshot_native import (
     guarded_patch_apply as _guarded_patch_apply,
@@ -77,7 +76,6 @@ from ouroboros.workspace_snapshot_native import (
 from ouroboros.workspace_snapshot_native import snapshot_operation
 
 _SERVICE_LOG_TAIL_MAX = 80_000
-
 
 @dataclass
 class _NativeService:
@@ -306,6 +304,8 @@ def prepare_native_operation(
         "workspace_root": root.as_posix(),
         "task_id": str(task_id or ""),
     }
+    if isinstance((protected_rows := args.get("_protected_paths")), list):
+        facts["protected_paths"] = [_relative_text(item) for item in protected_rows[:1000] if str(item or "").strip()]
     if operation == "execute_reviewed_payload":
         execution_args, payload_facts = validate_reviewed_payload(
             execution_args,
@@ -1475,10 +1475,8 @@ def execute_native_operation(
             return NativeOperationResult(_write_file(root, args))
         if operation == "edit_text":
             return NativeOperationResult(_edit_text(root, args))
-        if operation == "search_code":
-            return NativeOperationResult(search_workspace(root, args))
-        if operation == "query_code":
-            return NativeOperationResult(query_workspace(root, args))
+        if operation in {"search_code", "query_code"}:
+            return NativeOperationResult(execute_workspace_query_operation(root, operation, args, native_facts))
         if operation == "run_command":
             cmd = [str(part) for part in args.get("cmd") or []]
             if not cmd:
@@ -1576,7 +1574,9 @@ def execute_native_operation(
             cmd = [str(part) for part in args.get("cmd") or []]
             if not cmd:
                 raise ValueError("cmd is required")
-            return _run_process(root, args, cmd=cmd, control=control)
+            return attach_remote_verification_facts(
+                root, args, _run_process(root, args, cmd=cmd, control=control),
+            )
         if operation == "extract_video_frames":
             return _extract_video_frames(root, args, control=control)
         raise ValueError(f"unsupported native operation: {operation}")

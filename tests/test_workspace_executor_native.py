@@ -266,6 +266,31 @@ def test_native_search_honors_include_cap_and_skip_policy(tmp_path):
     assert result.trace["truncated"] is True
 
 
+def test_native_search_surfaces_walk_permission_errors_as_partial(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.workspace_query_native as query_native
+
+    denied = tmp_path / "denied"
+
+    def broken_walk(scope, *, followlinks, onerror):
+        del scope, followlinks
+        onerror(PermissionError(13, "permission denied", str(denied)))
+        return iter(())
+
+    monkeypatch.setattr(query_native.os, "walk", broken_walk)
+    result = execute_native_operation(
+        tmp_path,
+        "search_code",
+        {"query": "needle"},
+    ).envelope
+
+    assert "SEARCH_PARTIAL" in result.text
+    assert result.trace["completion"] == "partial"
+    assert "PermissionError" in result.trace["unreadable"][0]
+
+
 def test_native_edit_feedback_and_tracked_shrink_force(tmp_path):
     path = tmp_path / "tracked.txt"
     path.write_text("first needle\nsecond needle\n" + "x" * 200, encoding="utf-8")
@@ -811,6 +836,325 @@ def test_remote_verify_runs_on_target_and_records_home_receipt(tmp_path):
         / "verification_receipts.jsonl"
     )
     assert receipt_path.is_file()
+
+
+@pytest.mark.parametrize(
+    "protected_paths",
+    [
+        ["reference", "secret.py"],
+        ["/workspace/reference", "/workspace/secret.py"],
+    ],
+)
+def test_remote_protected_artifacts_block_reads_but_allow_execution(
+    tmp_path,
+    protected_paths,
+):
+    target = tmp_path / "actual-remote"
+    target.mkdir()
+    reference = target / "reference"
+    reference.write_text("#!/bin/sh\necho reference-ok\n")
+    reference.chmod(0o700)
+    (target / "secret.py").write_text("def hidden_symbol():\n    return 1\n")
+    (target / "visible.txt").write_text("visible\n")
+    registry, fake = _remote_registry(tmp_path, target)
+    record = {
+        "id": "reference",
+        "role": "black_box_reference",
+        "paths": protected_paths,
+        "allow": ["execute"],
+    }
+    registry._ctx.task_contract = {
+        "resource_policy": {"protected_artifacts": [record]}
+    }
+    registry._ctx.task_metadata["task_contract"] = registry._ctx.task_contract
+    try:
+        direct = registry.execute(
+            "read_file",
+            {"path": "reference", "root": "active_workspace"},
+        )
+        shell_read = registry.execute(
+            "run_command",
+            {"cmd": ["cat", "reference"]},
+        )
+        write = registry.execute(
+            "write_file",
+            {"path": "reference", "content": "stolen"},
+        )
+        byte_probe = registry.execute(
+            "verify_and_record",
+            {
+                "contract_kind": "explicit_command",
+                "check": [sys.executable, "-c", "print('checked')"],
+                "expected_match": "bytes_equal",
+                "artifact_paths": ["reference", "visible.txt"],
+            },
+        )
+        executed = registry.execute(
+            "run_command",
+            {"cmd": ["./reference"]},
+        )
+        search = registry.execute(
+            "search_code",
+            {"query": "hidden_symbol", "path": "."},
+        )
+        query = registry.execute(
+            "query_code",
+            {"op": "symbols", "path": "."},
+        )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert "RESOURCE_POLICY_BLOCKED" in direct
+    assert "RESOURCE_POLICY_BLOCKED" in shell_read
+    assert "RESOURCE_POLICY_BLOCKED" in write
+    assert "bytes_equal refused" in byte_probe
+    assert "reference-ok" in executed
+    assert "No matches found" in search
+    assert "hidden_symbol" not in query
+    assert [prepared.tool for prepared in fake.prepared] == [
+        "run_command",
+        "search_code",
+        "query_code",
+    ]
+    assert fake.prepared[-1].native_facts["protected_paths"] == [
+        "reference",
+        "secret.py",
+    ]
+
+
+def test_remote_project_room_lens_is_read_only_and_never_grants_processes(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "actual-remote"
+    target.mkdir()
+    (target / "room.txt").write_text("remote-room\n")
+    (target / "search.txt").write_text("remote-needle\n")
+    registry, fake = _remote_registry(tmp_path, target)
+    monkeypatch.setattr(
+        "ouroboros.tools.registry._builtin_tool_availability",
+        lambda name, ctx: (True, "", ""),
+    )
+    room_ref = registry._ctx.task_metadata.pop("_sealed_workspace_ref")
+    registry._ctx.task_metadata["_project_room_workspace_ref"] = room_ref
+    try:
+        read = registry.execute(
+            "read_file",
+            {"path": "room.txt", "root": "active_workspace"},
+        )
+        listed = registry.execute(
+            "list_files",
+            {"path": ".", "root": "active_workspace"},
+        )
+        searched = registry.execute(
+            "search_code",
+            {
+                "query": "remote-needle",
+                "path": ".",
+                "root": "active_workspace",
+            },
+        )
+        write = registry.execute(
+            "write_file",
+            {
+                "path": "room.txt",
+                "content": "changed",
+                "root": "active_workspace",
+            },
+        )
+        active_workspace_calls = {
+            "query_code": {"op": "symbols", "path": ".", "root": "active_workspace"},
+            "run_command": {"cmd": ["pwd"], "cwd": "active_workspace"},
+            "vcs_status": {},
+            "start_service": {"name": "web", "cmd": [sys.executable, "-m", "http.server"]},
+            "service_status": {"name": "web"},
+            "claude_code_edit": {"prompt": "change room.txt"},
+            "integrate_subagent_patch": {
+                "task_id": "child",
+                "decision": "apply",
+            },
+            "verify_and_record": {
+                "contract_kind": "explicit_command",
+                "check": [sys.executable, "-c", "print('checked')"],
+            },
+        }
+        blocked = {
+            name: registry.execute(name, call_args)
+            for name, call_args in active_workspace_calls.items()
+        }
+        home = registry.execute(
+            "run_command",
+            {"cmd": [sys.executable, "-c", "print('home-ok')"], "cwd": "task_drive"},
+        )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert "remote-room" in read
+    assert "room.txt" in listed
+    assert "remote-needle" in searched
+    assert "ROOM_ACTIVE_WORKSPACE_REQUIRES_TASK" in write
+    assert all(
+        "ROOM_ACTIVE_WORKSPACE_REQUIRES_TASK" in result
+        for result in blocked.values()
+    )
+    assert "home-ok" in home
+    assert [prepared.tool for prepared in fake.prepared] == [
+        "read_file",
+        "list_files",
+        "search_code",
+    ]
+    assert (target / "room.txt").read_text() == "remote-room\n"
+
+
+def test_remote_project_room_invalid_ref_fails_loud(tmp_path):
+    target = tmp_path / "actual-remote"
+    target.mkdir()
+    (target / "room.txt").write_text("remote-room\n")
+    registry, fake = _remote_registry(tmp_path, target)
+    registry._ctx.task_metadata.pop("_sealed_workspace_ref")
+    registry._ctx.task_metadata["_project_room_workspace_ref"] = {
+        "kind": "ssh",
+        "connection_id": "conn",
+        "remote_root": "relative/path",
+        "workspace_id": "workspace",
+    }
+    try:
+        result = registry.execute(
+            "read_file",
+            {"path": "room.txt", "root": "active_workspace"},
+        )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert "WORKSPACE_REF_INVALID" in result
+    assert "NOT_FOUND" not in result
+    assert not fake.prepared
+
+
+def test_remote_verify_records_bytes_equal_and_artifact_lifecycle(tmp_path):
+    target = tmp_path / "actual-remote"
+    work_dir = target / "subdir"
+    work_dir.mkdir(parents=True)
+    (work_dir / "a.bin").write_bytes(b"same")
+    (work_dir / "b.bin").write_bytes(b"same")
+    registry, fake = _remote_registry(tmp_path, target)
+    try:
+        equal = registry.execute(
+            "verify_and_record",
+            {
+                "contract_kind": "explicit_command",
+                "check": [sys.executable, "-c", "print('checked')"],
+                "expected_match": "bytes_equal",
+                "artifact_paths": ["a.bin", "b.bin"],
+                "cwd": "subdir",
+            },
+        )
+        lifecycle = registry.execute(
+            "verify_and_record",
+            {
+                "contract_kind": "explicit_command",
+                "check": [sys.executable, "-c", "print('checked')"],
+                "expected": "checked",
+                "artifact_paths": ["a.bin", "missing.bin"],
+                "cwd": "subdir",
+            },
+        )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert "PASS" in equal and "bytes_equal" in equal
+    assert "PASS" in lifecycle
+    receipt_path = (
+        registry._ctx.drive_root
+        / "task_results"
+        / "artifacts"
+        / "remote-task"
+        / "verification_receipts.jsonl"
+    )
+    receipts = [
+        json.loads(line)
+        for line in receipt_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert receipts[0]["matched"] is True
+    assert all(
+        row["exists_after"] is True
+        for row in receipts[0]["artifact_lifecycle"]
+    )
+    assert receipts[1]["artifacts_missing_after"] == ["missing.bin"]
+    assert fake.prepared[0].execution_args["expected_match"] == "bytes_equal"
+    assert fake.prepared[0].execution_args["cwd"] == str(work_dir)
+
+
+def test_local_verify_keeps_missing_check_precedence_for_bytes_equal(tmp_path):
+    system = tmp_path / "system"
+    data = tmp_path / "data"
+    system.mkdir()
+    data.mkdir()
+    registry = ToolRegistry(repo_dir=system, drive_root=data)
+
+    result = registry.execute(
+        "verify_and_record",
+        {
+            "contract_kind": "explicit_command",
+            "expected_match": "bytes_equal",
+            "artifact_paths": ["only-one.bin"],
+        },
+    )
+
+    assert "requires `check`" in result
+    assert "exactly two" not in result
+
+
+def test_remote_search_excludes_protected_paths_before_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    protected = tmp_path / "secret.py"
+    protected.write_text("hidden_symbol = 1\n")
+    unreadable = tmp_path / "unreadable.py"
+    unreadable.write_text("needle = 1\n")
+    visible = tmp_path / "visible.py"
+    visible.write_text("visible = 1\n")
+    original_lstat = pathlib.Path.lstat
+    calls: dict[pathlib.Path, int] = {}
+
+    def guarded_lstat(path):
+        resolved = pathlib.Path(path).resolve(strict=False)
+        calls[resolved] = calls.get(resolved, 0) + 1
+        if resolved == protected.resolve(strict=False):
+            raise AssertionError("protected path metadata was touched")
+        if resolved == unreadable.resolve(strict=False):
+            raise PermissionError(13, "permission denied", str(path))
+        return original_lstat(path)
+
+    monkeypatch.setattr(pathlib.Path, "lstat", guarded_lstat)
+    result = execute_native_operation(
+        tmp_path,
+        "search_code",
+        {"query": "absent", "path": "."},
+        native_facts={
+            "workspace_root": str(tmp_path),
+            "protected_paths": ["secret.py"],
+        },
+    ).envelope
+
+    assert result.trace["completion"] == "partial"
+    assert "SEARCH_PARTIAL" in result.text
+    assert "unreadable.py" in result.text
+    assert "secret.py" not in result.text
+    assert calls.get(protected.resolve(strict=False), 0) == 0
+    assert calls.get(visible.resolve(strict=False), 0) == 1
+
+    direct = execute_native_operation(
+        tmp_path,
+        "search_code",
+        {"query": "visible", "path": "visible.py"},
+    ).envelope
+
+    assert direct.trace["completion"] == "complete"
+    assert "visible.py" in direct.text
+    assert calls.get(visible.resolve(strict=False), 0) == 2
 
 
 def test_registry_remote_service_follows_opaque_home_ledger(tmp_path):

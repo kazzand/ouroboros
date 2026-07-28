@@ -248,3 +248,115 @@ def test_reconnect_wire_reset_retains_operations_but_clears_session_state():
     assert transport._downloads == {}
     assert transport._known_operations == {("request-a", "operation-a"): "a" * 64}
     assert transport._active_tasks == {"task-a"}
+
+
+def test_reconnect_keeps_a_healthy_transport_and_only_reconciles(monkeypatch):
+    import ouroboros.remote_ssh as remote_ssh
+    from ouroboros.remote_ssh import OpenSSHExecdTransport
+
+    class LiveProcess:
+        @staticmethod
+        def poll():
+            return None
+
+    transport = object.__new__(OpenSSHExecdTransport)
+    transport._session_lock = threading.RLock()
+    transport._stop = threading.Event()
+    transport._process = LiveProcess()
+    transport._reader_error = None
+    transport._handshake = {"session_id": "same-session"}
+    transport._last_reconciliation = []
+    transport._reset_wire_state = lambda: pytest.fail("healthy transport reset")
+    transport.bootstrap = lambda **_kwargs: pytest.fail("healthy transport bootstrapped")
+    transport._start_session = lambda **_kwargs: pytest.fail("healthy transport restarted")
+    monkeypatch.setattr(
+        remote_ssh,
+        "reconcile_remote_operations",
+        lambda *_args, **_kwargs: [{"completion": "completed"}],
+    )
+
+    result = transport.reconnect(timeout_sec=7)
+
+    assert result["status"] == "ready"
+    assert result["handshake"]["session_id"] == "same-session"
+    assert result["reconciliation"] == [{"completion": "completed"}]
+
+    monkeypatch.setattr(
+        remote_ssh,
+        "reconcile_remote_operations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("reconcile failed")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="reconcile failed"):
+        transport.reconnect(timeout_sec=7)
+
+    events = []
+
+    class DeadProcess:
+        @staticmethod
+        def poll():
+            return 1
+
+    transport._process = DeadProcess()
+    transport._reset_wire_state = lambda: events.append("reset")
+    transport.bootstrap = lambda **_kwargs: events.append("bootstrap")
+    transport._start_session = lambda **_kwargs: events.append("start")
+    monkeypatch.setattr(
+        remote_ssh,
+        "reconcile_remote_operations",
+        lambda *_args, **_kwargs: [],
+    )
+
+    transport.reconnect(timeout_sec=7)
+
+    assert events == ["reset", "bootstrap", "start"]
+
+
+def test_panic_pipe_write_is_portable_and_cleanup_is_unconditional(
+    monkeypatch,
+):
+    import ouroboros.platform_layer as platform_layer
+    import ouroboros.remote_ssh as remote_ssh
+    from ouroboros.remote_ssh import OpenSSHExecdTransport
+
+    monkeypatch.delattr(platform_layer.os, "set_blocking", raising=False)
+    assert (
+        platform_layer.best_effort_nonblocking_pipe_write(7, b"panic")
+        is False
+    )
+
+    class Input:
+        @staticmethod
+        def fileno():
+            return 7
+
+    class LiveProcess:
+        stdin = Input()
+
+        @staticmethod
+        def poll():
+            return None
+
+    process = LiveProcess()
+    helper = object()
+    discarded = []
+    transport = object.__new__(OpenSSHExecdTransport)
+    transport._stop = threading.Event()
+    transport._process = process
+    transport._helper_process = helper
+    transport._send_lock = threading.Lock()
+    transport._sequence = 0
+    transport.request = type("Request", (), {"server_generation": "g"})()
+    transport._panic_discard_process = discarded.append
+    monkeypatch.setattr(
+        remote_ssh,
+        "best_effort_nonblocking_pipe_write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("platform anomaly")
+        ),
+    )
+
+    transport.panic()
+
+    assert discarded == [helper, process]

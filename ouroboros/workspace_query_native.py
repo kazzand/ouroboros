@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import time
 from collections.abc import Mapping
@@ -149,35 +150,12 @@ def walk_candidate_files(
 def _search_skippable(path: pathlib.Path) -> bool:
     if any(fnmatch.fnmatch(path.name, pattern) for pattern in _SEARCH_SKIP_GLOBS):
         return True
-    try:
-        return (
-            path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_size > _SEARCH_MAX_FILE_BYTES
-        )
-    except OSError:
-        return True
-
-
-def _search_files(root: pathlib.Path, scope: pathlib.Path):
-    seen = 0
-    for dirpath, dirnames, filenames in os.walk(scope, followlinks=False):
-        dirnames[:] = sorted(
-            name for name in dirnames if name not in _SEARCH_EXCLUDED_DIRS
-        )
-        for name in sorted(filenames):
-            path = pathlib.Path(dirpath) / name
-            if _search_skippable(path):
-                continue
-            try:
-                resolved = path.resolve(strict=True)
-                resolved.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            yield resolved
-            seen += 1
-            if seen >= _SEARCH_MAX_FILES:
-                return
+    stat_result = path.lstat()
+    return (
+        stat.S_ISLNK(stat_result.st_mode)
+        or not stat.S_ISREG(stat_result.st_mode)
+        or stat_result.st_size > _SEARCH_MAX_FILE_BYTES
+    )
 
 
 def search_workspace(
@@ -185,6 +163,7 @@ def search_workspace(
     args: Mapping[str, Any],
     *,
     path_allowed: Callable[[pathlib.Path], bool] | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> ToolExecutionEnvelope:
     """Run the case-sensitive public search_code contract on a workspace."""
 
@@ -195,10 +174,29 @@ def search_workspace(
             text="⚠️ SEARCH_ERROR: query is required.",
             trace={"completion": "complete"},
         )
+    excluded = set(excluded_paths or ())
+    raw_scope = str(args.get("path") or "").strip().replace("\\", "/")
+    pure_scope = pathlib.PurePosixPath(raw_scope or ".")
+    lexical_scope = (
+        pure_scope.as_posix().removeprefix("./")
+        if not pure_scope.is_absolute() and ".." not in pure_scope.parts
+        else ""
+    )
+    scope_excluded = bool(
+        lexical_scope not in {"", "."}
+        and any(
+            lexical_scope == denied or lexical_scope.startswith(denied + "/")
+            for denied in excluded
+        )
+    )
     try:
-        rel = _relative_scope(root, args.get("path"))
-        scope = (root / (rel or ".")).resolve(strict=True)
-        scope.relative_to(root)
+        if scope_excluded:
+            rel = lexical_scope
+            scope: pathlib.Path | None = None
+        else:
+            rel = _relative_scope(root, args.get("path"))
+            scope = (root / (rel or ".")).resolve(strict=True)
+            scope.relative_to(root)
     except FileNotFoundError:
         raise
     except (OSError, ValueError) as exc:
@@ -223,11 +221,107 @@ def search_workspace(
     unreadable: list[str] = []
     scanned = 0
     truncated = False
-    paths = [scope] if scope.is_file() else _search_files(root, scope)
+    scan_limit_hit = False
+    metadata_checked: set[pathlib.Path] = set()
+    paths: list[pathlib.Path] = []
+    if scope is not None:
+        try:
+            if not _search_skippable(scope):
+                paths = [scope]
+            metadata_checked.add(scope)
+        except OSError as exc:
+            if len(unreadable) < 20:
+                unreadable.append(
+                    f"{rel or '.'}: {type(exc).__name__}: {exc}"
+                )
+            scope = None
+    if scope is not None and not paths:
+        for dirpath, dirnames, filenames in os.walk(
+            scope,
+            followlinks=False,
+            onerror=lambda exc: unreadable.append(
+                f"{getattr(exc, 'filename', scope)}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if len(unreadable) < 20
+            else None,
+        ):
+            directory = pathlib.Path(dirpath)
+            try:
+                directory_rel = directory.relative_to(root)
+            except ValueError:
+                directory_rel = pathlib.Path(".")
+            kept_dirs: list[str] = []
+            for name in sorted(dirnames):
+                child_rel = (directory_rel / name).as_posix()
+                if child_rel.startswith("./"):
+                    child_rel = child_rel[2:]
+                if name in _SEARCH_EXCLUDED_DIRS or any(
+                    child_rel == denied or child_rel.startswith(denied + "/")
+                    for denied in excluded
+                ):
+                    continue
+                kept_dirs.append(name)
+            dirnames[:] = kept_dirs
+            for name in sorted(filenames):
+                path = pathlib.Path(dirpath) / name
+                try:
+                    relpath = path.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if any(
+                    relpath == denied or relpath.startswith(denied + "/")
+                    for denied in excluded
+                ):
+                    continue
+                try:
+                    if _search_skippable(path):
+                        continue
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
+                except OSError as exc:
+                    if len(unreadable) < 20:
+                        try:
+                            display = path.relative_to(root).as_posix()
+                        except (OSError, ValueError):
+                            display = path.as_posix()
+                        unreadable.append(
+                            f"{display}: {type(exc).__name__}: {exc}"
+                        )
+                    continue
+                except ValueError:
+                    continue
+                paths.append(resolved)
+                metadata_checked.add(resolved)
+                if len(paths) >= _SEARCH_MAX_FILES:
+                    scan_limit_hit = True
+                    break
+            if scan_limit_hit:
+                break
     for path in paths:
         if include and not fnmatch.fnmatch(path.name, include):
             continue
-        if _search_skippable(path):
+        try:
+            relpath = path.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if any(
+            relpath == denied or relpath.startswith(denied + "/")
+            for denied in excluded
+        ):
+            continue
+        try:
+            if path not in metadata_checked and _search_skippable(path):
+                continue
+        except OSError as exc:
+            if len(unreadable) < 20:
+                try:
+                    display = path.relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    display = path.as_posix()
+                unreadable.append(
+                    f"{display}: {type(exc).__name__}: {exc}"
+                )
             continue
         if path_allowed is not None and not path_allowed(path):
             continue
@@ -239,7 +333,6 @@ def search_workspace(
                 f"{path.relative_to(root).as_posix()}: {type(exc).__name__}: {exc}"
             )
             continue
-        relpath = path.relative_to(root).as_posix()
         for line_no, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 matches.append(
@@ -252,7 +345,7 @@ def search_workspace(
             break
     complete = (
         not unreadable
-        and scanned < _SEARCH_MAX_FILES
+        and not scan_limit_hit
         and not truncated
     )
     display_path = f"active_workspace:{rel or '.'}"
@@ -262,7 +355,7 @@ def search_workspace(
             f"{'es' if len(matches) != 1 else ''} in {display_path} "
             f"({scanned} files searched)"
         )
-        if scanned >= _SEARCH_MAX_FILES:
+        if scan_limit_hit:
             header += (
                 f" — scan stopped at {_SEARCH_MAX_FILES} files "
                 "(narrow the path or glob)"
@@ -275,7 +368,7 @@ def search_workspace(
             f"No matches found for {'regex' if regex_mode else 'literal'} "
             f"`{query}` in {display_path} ({scanned} files searched)."
         )
-        if scanned >= _SEARCH_MAX_FILES:
+        if scan_limit_hit:
             text += (
                 f" Scan stopped after {_SEARCH_MAX_FILES} files — "
                 "narrow the path or glob."
@@ -292,6 +385,34 @@ def search_workspace(
             "unreadable": unreadable[:20],
             "truncated": truncated,
         },
+    )
+
+
+def execute_workspace_query_operation(
+    root: pathlib.Path,
+    operation: str,
+    args: Mapping[str, Any],
+    native_facts: Mapping[str, Any],
+) -> ToolExecutionEnvelope:
+    """Apply private visibility facts to the two public query operations."""
+
+    protected = {
+        str(item)
+        for item in native_facts.get("protected_paths") or []
+        if str(item or "")
+    }
+    if operation == "search_code":
+        return search_workspace(root, args, excluded_paths=protected)
+    if operation != "query_code":
+        raise ValueError(f"unsupported workspace query operation: {operation}")
+    return query_workspace(
+        root,
+        args,
+        visible=lambda relative: not any(
+            relative == denied or relative.startswith(denied + "/")
+            for denied in protected
+        ),
+        exclude_paths=[root / path for path in protected],
     )
 
 
@@ -750,6 +871,7 @@ def query_workspace(
     *,
     inventory: Any | None = None,
     visible: Callable[[str], bool] | None = None,
+    exclude_paths: list[pathlib.Path] | None = None,
 ) -> ToolExecutionEnvelope:
     """Run a model-visible query_code operation without Home authority imports."""
 
@@ -790,7 +912,11 @@ def query_workspace(
             )
         else:
             if inventory is None:
-                inventory = build_code_inventory(root, persist=False)
+                inventory = build_code_inventory(
+                    root,
+                    persist=False,
+                    exclude_paths=exclude_paths,
+                )
             if visible is not None:
                 inventory.files = [
                     fact for fact in inventory.files if visible(str(fact.path))

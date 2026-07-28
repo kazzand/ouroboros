@@ -1052,7 +1052,7 @@ def test_ci_release_publishes_only_named_execd_assets():
     assert "release-artifacts/*" not in files
 
 
-def test_ci_execd_bundle_runs_only_for_manual_or_tag_builds():
+def test_ci_execd_bundle_runs_for_target_pr_manual_or_tag_builds():
     workflow = _ci_workflow()
 
     stage_header = workflow.split("\n  execd-stage:\n", 1)[1].split(
@@ -1062,6 +1062,8 @@ def test_ci_execd_bundle_runs_only_for_manual_or_tag_builds():
         "\n    needs:", 1
     )[0]
     for header in (stage_header, bundle_header):
+        assert "github.event_name == 'pull_request'" in header
+        assert "github.base_ref == 'ouroboros'" in header
         assert "github.event_name == 'workflow_dispatch'" in header
         assert "startsWith(github.ref, 'refs/tags/v')" in header
 

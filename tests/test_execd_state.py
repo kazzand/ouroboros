@@ -2437,6 +2437,42 @@ def test_protocol_ssh_neutralizes_alias_forwarding_but_browser_rejects_it(
     ]
 
 
+def test_ssh_operational_settings_drive_openssh_argv(
+    monkeypatch,
+):
+    import ouroboros.remote_ssh as remote_ssh
+
+    monkeypatch.setenv("OUROBOROS_SSH_CONNECT_TIMEOUT_SEC", "41")
+    monkeypatch.setenv("OUROBOROS_SSH_KEEPALIVE_INTERVAL_SEC", "7")
+    monkeypatch.setenv("OUROBOROS_SSH_KEEPALIVE_COUNT", "4")
+    rendered = (
+        "remotecommand none\n"
+        "requesttty false\n"
+        "clearallforwardings yes\n"
+        "tunnel false\n"
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=rendered,
+            stderr="",
+        )
+
+    monkeypatch.setattr(remote_ssh.subprocess, "run", run)
+    command = remote_ssh.validated_ssh_base_command(
+        "configured-host",
+        "/usr/bin/ssh",
+    )
+
+    assert "ConnectTimeout=41" in command
+    assert "ServerAliveInterval=7" in command
+    assert "ServerAliveCountMax=4" in command
+    assert all(call[1]["timeout"] == 41 for call in calls)
+
+
 def test_broker_panic_does_not_wait_for_held_state_lock(monkeypatch):
     from ouroboros.remote_service_leases import RemoteServiceLeaseBook
     from ouroboros.remote_workspace import RemoteSessionBroker

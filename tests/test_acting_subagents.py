@@ -1033,6 +1033,128 @@ def test_post_task_evolution_js_guard():
     assert not _blocks_post_task_evolution_js("document.title")
 
 
+def test_remote_subagent_apply_declares_exact_snapshot_changes(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+
+    from ouroboros.tools.subagent_integration import (
+        _integrate_remote_subagent_patch,
+    )
+    from ouroboros.workspace_native import execute_native_operation
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "data"
+    _init_repo(repo, {"file.txt": "before\n"})
+    drive.mkdir()
+    patch = tmp_path / "workspace.patch"
+    patch.write_text(
+        "diff --git a/file.txt b/file.txt\n"
+        "index 90be1c4..6c72a3a 100644\n"
+        "--- a/file.txt\n"
+        "+++ b/file.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(patch.read_bytes()).hexdigest()
+    snapshot_result = execute_native_operation(
+        repo,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    snapshot_manifest = snapshot_result.envelope.trace["snapshot"]
+    before = next(
+        row for row in snapshot_manifest["entries"]
+        if row["path"] == "file.txt"
+    )
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "file.txt").write_bytes(snapshot_result.blobs[before["sha256"]])
+    calls = []
+
+    class MaterializedSnapshot:
+        root = mirror
+        manifest = snapshot_manifest
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.workspace_executor.materialize_remote_workspace_snapshot",
+        lambda _ctx: MaterializedSnapshot(),
+    )
+
+    def execute(_ctx, operation, args, blobs=None):
+        calls.append((operation, dict(args), dict(blobs or {})))
+        return execute_native_operation(
+            repo,
+            operation,
+            args,
+            blobs=dict(blobs or {}),
+        ).envelope
+
+    monkeypatch.setattr(
+        "ouroboros.workspace_executor.execute_remote_system_operation",
+        execute,
+    )
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=drive,
+        task_id="parent",
+        task_metadata={
+            "_sealed_workspace_ref": {
+                "kind": "ssh",
+                "connection_id": "connection",
+                "remote_root": "/srv/project",
+                "workspace_id": "workspace",
+            }
+        },
+    )
+
+    result = _integrate_remote_subagent_patch(
+        ctx,
+        child_task_id="child",
+        child_surface="external_workspace",
+        reason="reviewed",
+        requested_target="/srv/project",
+        patch_path=patch,
+        manifest={"sha256": digest},
+        child_result={},
+        touched=["file.txt"],
+    )
+
+    assert result.startswith("✅ Applied")
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "after\n"
+    apply_args = calls[0][1]
+    assert apply_args["changes"] == [
+        {
+            "path": "file.txt",
+            "before": before,
+            "after": {
+                "path": "file.txt",
+                "kind": "file",
+                "sha256": hashlib.sha256(b"after\n").hexdigest(),
+                "size": len(b"after\n"),
+                "mode": before["mode"],
+            },
+        }
+    ]
+    assert apply_args["expected_fingerprint"] == snapshot_manifest["fingerprint"]
+    assert apply_args["expected_head"] == snapshot_manifest["git"]["head"]
+    assert (
+        apply_args["expected_index_sha256"]
+        == snapshot_manifest["git"]["index_sha256"]
+    )
+    assert apply_args["expected_content_fingerprint"]
+    assert calls[0][2][digest] == patch.read_bytes()
+
+
 def test_pro_acting_shell_write_outside_surface_blocked(tmp_path):
     # Even in pro mode, an acting child's write-like shell targeting outside its
     # isolated surface is blocked (no pro workspace passthrough for acting subagents).

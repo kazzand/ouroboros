@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import pathlib
 import re
 from typing import Any, Dict, Iterable, List
@@ -133,6 +134,7 @@ _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({
 _DIRECTORY_TARGET_OPERATIONS = frozenset({"copy", "delete", "read_bytes", "static_introspection", "write"})
 _SHELL_GLOB_CHARS = frozenset("*?[")
 _FIND_EXPRESSION_MARKERS = frozenset({"!", "(", ")"})
+_CANONICAL_WORKSPACE_BACKEND_ROOT = "/workspace"
 
 
 def _task_contract(ctx: Any) -> Dict[str, Any]:
@@ -174,6 +176,19 @@ def _resolve_policy_path(ctx: Any, raw_path: str) -> pathlib.Path | None:
     text = str(raw_path or "").strip()
     if not text:
         return None
+    normalized = slash_normalize_path_text(text).rstrip("/")
+    if getattr(ctx, "_remote_policy_projection", False) and (
+        normalized == _CANONICAL_WORKSPACE_BACKEND_ROOT
+        or normalized.startswith(_CANONICAL_WORKSPACE_BACKEND_ROOT + "/")
+    ):
+        roots = _base_roots(ctx)
+        if not roots:
+            return None
+        relative = normalized[len(_CANONICAL_WORKSPACE_BACKEND_ROOT):].lstrip("/")
+        parts = [part for part in relative.split("/") if part]
+        if any(part in {".", ".."} for part in parts):
+            return None
+        return roots[0].joinpath(*parts).resolve(strict=False)
     try:
         path = pathlib.Path(text).expanduser()
     except (OSError, TypeError, ValueError):
@@ -225,7 +240,25 @@ def _backend_cwd_relative_spellings(ctx: Any, work_dir: pathlib.Path, spellings:
     return relative
 
 
-def protected_artifact_paths(ctx: Any) -> List[pathlib.Path]:
+def protected_artifact_paths(
+    ctx: Any,
+    *,
+    remote_root: str = "",
+) -> List[pathlib.Path]:
+    if remote_root:
+        ctx = copy.copy(ctx)
+        root = pathlib.Path(remote_root)
+        ctx.workspace_root = root
+        ctx.repo_dir = root
+        ctx.system_repo_dir = root
+        ctx.executor_ref = None
+        ctx._remote_policy_projection = True
+        for field in ("task_metadata", "metadata"):
+            raw = getattr(ctx, field, {})
+            value = dict(raw) if isinstance(raw, dict) else {}
+            value.pop("_sealed_workspace_ref", None)
+            value.pop("_project_room_workspace_ref", None)
+            setattr(ctx, field, value)
     paths: List[pathlib.Path] = []
     for record in _artifact_records(ctx):
         for raw_path in record.get("paths") or []:
@@ -254,7 +287,12 @@ def _operation_denied(record: Dict[str, Any], operation: str) -> bool:
     return str(record.get("role") or "") == "black_box_reference" and operation in _DEFAULT_DENIED_OPERATIONS
 
 
-def _matches(candidate: pathlib.Path, protected_path: pathlib.Path) -> bool:
+def _matches(
+    candidate: pathlib.Path,
+    protected_path: pathlib.Path,
+    *,
+    assume_directory: bool = False,
+) -> bool:
     try:
         candidate_resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
         protected_resolved = pathlib.Path(protected_path).expanduser().resolve(strict=False)
@@ -262,7 +300,7 @@ def _matches(candidate: pathlib.Path, protected_path: pathlib.Path) -> bool:
         return False
     if candidate_resolved == protected_resolved:
         return True
-    if protected_resolved.is_dir():
+    if assume_directory or protected_resolved.is_dir():
         try:
             candidate_resolved.relative_to(protected_resolved)
             return True
@@ -294,7 +332,29 @@ def _backend_spelling_matches(candidate: pathlib.Path, protected_spellings: set[
     return False
 
 
-def block_reason_for_path(ctx: Any, target: pathlib.Path, operation: str) -> str:
+def block_reason_for_path(
+    ctx: Any,
+    target: pathlib.Path,
+    operation: str,
+    *,
+    remote_root: str = "",
+) -> str:
+    if remote_root:
+        ctx = copy.copy(ctx)
+        root = pathlib.Path(remote_root)
+        ctx.workspace_root = root
+        ctx.repo_dir = root
+        ctx.system_repo_dir = root
+        ctx.executor_ref = None
+        ctx._remote_policy_projection = True
+        for field in ("task_metadata", "metadata"):
+            raw = getattr(ctx, field, {})
+            value = dict(raw) if isinstance(raw, dict) else {}
+            value.pop("_sealed_workspace_ref", None)
+            value.pop("_project_room_workspace_ref", None)
+            setattr(ctx, field, value)
+        target_path = pathlib.Path(target)
+        target = target_path if target_path.is_absolute() else root / target_path
     for record in _artifact_records(ctx):
         if not _operation_denied(record, operation):
             continue
@@ -304,7 +364,13 @@ def block_reason_for_path(ctx: Any, target: pathlib.Path, operation: str) -> str
             target_backend_spellings = _backend_spellings_for_host_path(ctx, pathlib.Path(target))
             if (
                 protected_path is not None
-                and _matches(pathlib.Path(target), protected_path)
+                and _matches(
+                    pathlib.Path(target),
+                    protected_path,
+                    assume_directory=bool(
+                        getattr(ctx, "_remote_policy_projection", False)
+                    ),
+                )
                 or _backend_spelling_matches(pathlib.Path(target), protected_spellings)
                 or bool(protected_spellings & target_backend_spellings)
             ):
@@ -805,7 +871,29 @@ def _git_static_introspection_is_path_limited(work_dir: pathlib.Path, candidates
     return False
 
 
-def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pathlib.Path | None = None) -> str:
+def shell_block_reason(
+    ctx: Any,
+    raw_cmd: Any,
+    *,
+    cwd: str = "",
+    default_cwd: pathlib.Path | None = None,
+    remote_root: str = "",
+) -> str:
+    if remote_root:
+        ctx = copy.copy(ctx)
+        root = pathlib.Path(remote_root)
+        ctx.workspace_root = root
+        ctx.repo_dir = root
+        ctx.system_repo_dir = root
+        ctx.executor_ref = None
+        ctx._remote_policy_projection = True
+        default_cwd = root
+        for field in ("task_metadata", "metadata"):
+            raw = getattr(ctx, field, {})
+            value = dict(raw) if isinstance(raw, dict) else {}
+            value.pop("_sealed_workspace_ref", None)
+            value.pop("_project_room_workspace_ref", None)
+            setattr(ctx, field, value)
     protected_paths = protected_artifact_paths(ctx)
     if not protected_paths:
         return ""

@@ -135,8 +135,48 @@ async def _admit_project_workspace(request: Request, raw: Any, project_id: str) 
     )
     if not result.get("ok"):
         return None, JSONResponse(result, status_code=_service_status_code(result))
+    try:
+        admitted_ref = _admitted_workspace_ref(result, requested)
+    except ValueError as exc:
+        cleanup_ref = None
+        try:
+            from ouroboros.workspace_ref import normalize_workspace_ref
+
+            cleanup_ref = normalize_workspace_ref(
+                result.get("workspace_ref")
+                if isinstance(result.get("workspace_ref"), dict)
+                else {
+                    "kind": "ssh",
+                    "connection_id": requested["connection_id"],
+                    "remote_root": requested["remote_root"],
+                    "workspace_id": str(result.get("workspace_id") or ""),
+                }
+            )
+        except (TypeError, ValueError):
+            cleanup_ref = None
+        if (
+            cleanup_ref is not None
+            and cleanup_ref["kind"] == "ssh"
+            and cleanup_ref["connection_id"] == requested["connection_id"]
+        ):
+            await _close_provisional_project_session(
+                request,
+                cleanup_ref,
+                project_id,
+            )
+        return None, JSONResponse(
+            {
+                "error": str(exc),
+                "error_code": "remote_service_invalid_response",
+                "action": "retry",
+            },
+            status_code=503,
+        )
     observed_host_id = _observed_host_id(result)
     if not observed_host_id:
+        await _close_provisional_project_session(
+            request, admitted_ref, project_id
+        )
         return None, JSONResponse(
             {
                 "error": "remote admission did not return a host continuity identity",
@@ -152,6 +192,9 @@ async def _admit_project_workspace(request: Request, raw: Any, project_id: str) 
             path=_request_store_path(request),
         )
     except ValueError as exc:
+        await _close_provisional_project_session(
+            request, admitted_ref, project_id
+        )
         return None, JSONResponse(
             {
                 "error": str(exc),
@@ -161,6 +204,9 @@ async def _admit_project_workspace(request: Request, raw: Any, project_id: str) 
             status_code=409,
         )
     except KeyError:
+        await _close_provisional_project_session(
+            request, admitted_ref, project_id
+        )
         return None, JSONResponse(
             {
                 "error": "connection became unavailable during host identity pinning",
@@ -169,17 +215,7 @@ async def _admit_project_workspace(request: Request, raw: Any, project_id: str) 
             },
             status_code=409,
         )
-    try:
-        return _admitted_workspace_ref(result, requested), None
-    except ValueError as exc:
-        return None, JSONResponse(
-            {
-                "error": str(exc),
-                "error_code": "remote_service_invalid_response",
-                "action": "retry",
-            },
-            status_code=503,
-        )
+    return admitted_ref, None
 
 
 def _project_has_live_tasks(drive_root: object, project_id: str) -> bool:
@@ -204,9 +240,18 @@ async def _close_provisional_project_session(
     workspace_ref: dict,
     project_id: str,
 ) -> None:
-    """Best-effort rollback for admission that lost the final quiescence race."""
+    """Best-effort close only when the ref is no longer Project-authoritative."""
 
     from ouroboros.gateway.connections import _remote_service, _service_call
+    from ouroboros.projects_registry import get_project, workspace_identity_key
+
+    authoritative = get_project(request_drive_root(request), project_id)
+    if (
+        authoritative is not None
+        and workspace_identity_key(authoritative)
+        == workspace_identity_key(workspace_ref)
+    ):
+        return
 
     service = _remote_service(request)
     if service is not None:
@@ -493,6 +538,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
     historical facts; ``trusted_at`` is stamped automatically for attach/clone
     (the notification trust model — attaching IS the owner's explicit grant).
     """
+    placement_lock = None
     try:
         import asyncio
 
@@ -530,6 +576,17 @@ async def api_projects_create(request: Request) -> JSONResponse:
             raw_id = project_id_from_display_name(name)
         if not raw_id:
             return JSONResponse({"error": "id or name is required"}, status_code=400)
+        placement_locks = getattr(
+            request.app.state, "_remote_project_placement_locks", None
+        )
+        if placement_locks is None:
+            placement_locks = {}
+            request.app.state._remote_project_placement_locks = placement_locks
+        candidate_lock = placement_locks.setdefault(
+            sanitize_project_id(raw_id), asyncio.Lock()
+        )
+        await candidate_lock.acquire()
+        placement_lock = candidate_lock
         attach_path = str(body.get("path") or "").strip()
         git_url = str(body.get("git_url") or "").strip()
         with_workspace = bool(body.get("with_workspace"))
@@ -632,30 +689,47 @@ async def api_projects_create(request: Request) -> JSONResponse:
             )
             from supervisor import queue as supervisor_queue
 
-            with supervisor_queue._queue_lock:
-                connection = get_connection(
-                    admitted_remote_ref["connection_id"],
-                    _request_store_path(request),
-                )
-                if (
-                    connection is None
-                    or connection.get("lifecycle", "active") != "active"
-                ):
-                    return JSONResponse(
-                        {
-                            "error": "connection became unavailable during project admission",
-                            "error_code": "connection_retired",
-                            "action": "choose_active_connection",
-                        },
-                        status_code=409,
+            retired_response = None
+            try:
+                with supervisor_queue._queue_lock:
+                    connection = get_connection(
+                        admitted_remote_ref["connection_id"],
+                        _request_store_path(request),
                     )
-                entry = create_project(
-                    drive_root,
+                    if (
+                        connection is None
+                        or connection.get("lifecycle", "active") != "active"
+                    ):
+                        retired_response = JSONResponse(
+                            {
+                                "error": "connection became unavailable during project admission",
+                                "error_code": "connection_retired",
+                                "action": "choose_active_connection",
+                            },
+                            status_code=409,
+                        )
+                    else:
+                        entry = create_project(
+                            drive_root,
+                            sanitize_project_id(raw_id),
+                            name=name,
+                            workspace_ref=admitted_remote_ref,
+                            origin="owner_ui",
+                        )
+            except Exception:
+                await _close_provisional_project_session(
+                    request,
+                    admitted_remote_ref,
                     sanitize_project_id(raw_id),
-                    name=name,
-                    workspace_ref=admitted_remote_ref,
-                    origin="owner_ui",
                 )
+                raise
+            if retired_response is not None:
+                await _close_provisional_project_session(
+                    request,
+                    admitted_remote_ref,
+                    sanitize_project_id(raw_id),
+                )
+                return retired_response
         else:
             entry = create_project(
                 drive_root,
@@ -695,11 +769,18 @@ async def api_projects_create(request: Request) -> JSONResponse:
         return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
+    finally:
+        if placement_lock is not None:
+            placement_lock.release()
 
 
 async def api_project_update(request: Request) -> JSONResponse:
     """Rename and, only while quiescent, atomically rebind project placement."""
+    placement_lock = None
     try:
+        import asyncio
+
+        from ouroboros.project_facts import sanitize_project_id
         from ouroboros.projects_registry import (
             PROJECT_NAME_MAX,
             get_project,
@@ -712,15 +793,27 @@ async def api_project_update(request: Request) -> JSONResponse:
         if not isinstance(body, dict):
             return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
         drive_root = request_drive_root(request)
-        current = get_project(drive_root, project_id)
-        if current is None:
-            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         has_name = "name" in body
         has_workspace_ref = "workspace_ref" in body
         if not has_name and not has_workspace_ref:
             return JSONResponse(
                 {"error": "name or workspace_ref is required"}, status_code=400
             )
+        if has_workspace_ref:
+            placement_locks = getattr(
+                request.app.state, "_remote_project_placement_locks", None
+            )
+            if placement_locks is None:
+                placement_locks = {}
+                request.app.state._remote_project_placement_locks = placement_locks
+            candidate_lock = placement_locks.setdefault(
+                sanitize_project_id(project_id), asyncio.Lock()
+            )
+            await candidate_lock.acquire()
+            placement_lock = candidate_lock
+        current = get_project(drive_root, project_id)
+        if current is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         name = str(body.get("name") or "").strip() if has_name else ""
         if has_name and not name:
             return JSONResponse({"error": "name must not be empty"}, status_code=400)
@@ -740,74 +833,107 @@ async def api_project_update(request: Request) -> JSONResponse:
                 return remote_error
         entry = current
         late_live_tasks = False
+        rebind_response = None
         if has_workspace_ref:
+            from ouroboros.projects_registry import workspace_identity_key
+            from ouroboros.workspace_ref import normalize_workspace_ref
             from supervisor import queue as supervisor_queue
 
-            with supervisor_queue._queue_lock:
-                if _project_has_live_tasks(drive_root, project_id):
-                    late_live_tasks = True
-                elif admitted_ref is not None:
-                    from ouroboros.gateway.connections import (
-                        _request_store_path,
-                        get_connection,
-                    )
+            try:
+                with supervisor_queue._queue_lock:
+                    if _project_has_live_tasks(drive_root, project_id):
+                        late_live_tasks = True
+                    elif admitted_ref is not None:
+                        from ouroboros.gateway.connections import (
+                            _request_store_path,
+                            get_connection,
+                        )
 
-                    connection = get_connection(
-                        admitted_ref["connection_id"],
-                        _request_store_path(request),
-                    )
-                    if (
-                        connection is None
-                        or connection.get("lifecycle", "active") != "active"
-                    ):
-                        return JSONResponse(
-                            {
-                                "error": "connection became unavailable during rebind",
-                                "error_code": "connection_retired",
-                                "action": "choose_active_connection",
-                            },
-                            status_code=409,
+                        connection = get_connection(
+                            admitted_ref["connection_id"],
+                            _request_store_path(request),
                         )
-                if not late_live_tasks:
-                    try:
-                        entry = rebind_project_workspace(
-                            drive_root,
-                            project_id,
-                            admitted_ref,
-                            expected_routing_generation=int(
-                                current.get("routing_generation") or 0
-                            ),
-                        )
-                    except ValueError as exc:
-                        if str(exc) == "project_routing_generation_changed":
-                            return JSONResponse(
+                        if (
+                            connection is None
+                            or connection.get("lifecycle", "active") != "active"
+                        ):
+                            rebind_response = JSONResponse(
                                 {
-                                    "error": "project routing changed during rebind",
-                                    "error_code": "project_routing_generation_changed",
-                                    "action": "refresh_project",
+                                    "error": "connection became unavailable during rebind",
+                                    "error_code": "connection_retired",
+                                    "action": "choose_active_connection",
                                 },
                                 status_code=409,
                             )
-                        raise
-            if late_live_tasks:
-                if admitted_ref is not None:
-                    from ouroboros.projects_registry import workspace_identity_key
-
-                    if workspace_identity_key(current) != workspace_identity_key(
-                        admitted_ref
-                    ):
-                        await _close_provisional_project_session(
-                            request,
-                            admitted_ref,
-                            project_id,
-                        )
+                    if not late_live_tasks and rebind_response is None:
+                        try:
+                            entry = rebind_project_workspace(
+                                drive_root,
+                                project_id,
+                                admitted_ref,
+                                expected_routing_generation=int(
+                                    current.get("routing_generation") or 0
+                                ),
+                            )
+                        except ValueError as exc:
+                            if str(exc) == "project_routing_generation_changed":
+                                rebind_response = JSONResponse(
+                                    {
+                                        "error": "project routing changed during rebind",
+                                        "error_code": "project_routing_generation_changed",
+                                        "action": "refresh_project",
+                                    },
+                                    status_code=409,
+                                )
+                            else:
+                                raise
+            except Exception:
+                if (
+                    admitted_ref is not None
+                    and workspace_identity_key(current)
+                    != workspace_identity_key(admitted_ref)
+                ):
+                    await _close_provisional_project_session(
+                        request,
+                        admitted_ref,
+                        project_id,
+                    )
+                raise
+            if late_live_tasks or rebind_response is not None:
+                if (
+                    admitted_ref is not None
+                    and workspace_identity_key(current)
+                    != workspace_identity_key(admitted_ref)
+                ):
+                    await _close_provisional_project_session(
+                        request,
+                        admitted_ref,
+                        project_id,
+                    )
+                if rebind_response is not None:
+                    return rebind_response
                 return _project_rebind_busy_response()
+            old_ref = normalize_workspace_ref(current.get("workspace_ref"))
+            if (
+                old_ref is not None
+                and old_ref["kind"] == "ssh"
+                and workspace_identity_key(old_ref)
+                != workspace_identity_key(admitted_ref)
+            ):
+                await _close_provisional_project_session(
+                    request,
+                    old_ref,
+                    project_id,
+                )
         if has_name:
             entry = update_project(drive_root, project_id, name=name)
         _broadcast_projects_changed(str((entry or {}).get("id") or project_id), (entry or {}).get("chat_id"))
         return JSONResponse({"project": entry})
     except Exception as exc:
         return json_exception(exc)
+    finally:
+        if placement_lock is not None:
+            placement_lock.release()
 
 
 async def api_project_delete(request: Request) -> JSONResponse:

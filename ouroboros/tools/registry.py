@@ -54,7 +54,11 @@ from ouroboros.tools.shell_guards import (
     writer_target_tokens,
 )
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
-from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
+from ouroboros.protected_artifacts import (
+    block_reason_for_path as protected_artifact_block_reason,
+    protected_artifact_paths,
+    shell_block_reason as protected_artifact_shell_block_reason,
+)
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
 from ouroboros.tool_access import is_external_workspace, light_cognitive_or_root_redirect, normalize_root, normalize_root_relative, resolve_shell_cwd, shell_cwd_block_message, workspace_mode_block_reason
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
@@ -2908,6 +2912,34 @@ class ToolRegistry:
                         reason="invalid_arguments",
                     )
                     return ToolExecutionEnvelope(text=_format_tool_arg_error(entry))
+            if operation in {
+                "run_command",
+                "run_script",
+                "start_service",
+                "verify_remote_check",
+            }:
+                if operation == "run_script":
+                    raw_policy_cmd: Any = [
+                        str(canonical.get("interpreter") or "python3"),
+                        "-c",
+                        str(canonical.get("script") or ""),
+                    ]
+                else:
+                    raw_policy_cmd = canonical.get("cmd") or []
+                artifact_block = protected_artifact_shell_block_reason(
+                    self._ctx,
+                    raw_policy_cmd,
+                    cwd=str(canonical.get("cwd") or ""),
+                    remote_root=str(workspace_ref.get("remote_root") or ""),
+                )
+                if artifact_block:
+                    service.abort_prepared(
+                        dict(workspace_ref),
+                        prepared,
+                        task_id=task_id,
+                        reason="denied",
+                    )
+                    return ToolExecutionEnvelope(text=artifact_block)
             safety_message = ""
             if authorize:
                 safety_block, safety_message = self._stage_home_policy_and_safety(
@@ -3096,6 +3128,14 @@ class ToolRegistry:
         )
         raw_cmd = guard_args.get("cmd", guard_args.get("command", ""))
         argv = strip_leading_env_assignments(unwrap_env_argv(shell_argv(raw_cmd)))
+        artifact_block = protected_artifact_shell_block_reason(
+            self._ctx,
+            raw_cmd,
+            cwd=str(guard_args.get("cwd") or ""),
+            remote_root=remote_root,
+        )
+        if artifact_block:
+            return artifact_block
         if sudo_noninteractive_violation(argv):
             return (
                 "⚠️ SUDO_INTERACTIVE_BLOCKED: sudo must be noninteractive. "
@@ -3226,6 +3266,65 @@ class ToolRegistry:
                         return f"⚠️ WORKSPACE_PATH_BLOCKED: {exc}."
 
         broker_args = copy.deepcopy(args)
+        if name in _PATH_NORMALIZED_TOOLS:
+            operations = {
+                "read_file": ("read_bytes",),
+                "write_file": ("write",),
+                "edit_text": ("write",),
+                "list_files": ("static_introspection",),
+                "search_code": ("read_bytes", "static_introspection"),
+                "query_code": ("read_bytes", "static_introspection"),
+            }.get(name, ())
+            candidates = [
+                str(broker_args.get(key) or "")
+                for key in ("path", "dir")
+                if str(broker_args.get(key) or "").strip()
+            ]
+            candidates.extend(
+                str(item.get("path") or "")
+                for item in broker_args.get("files") or []
+                if isinstance(item, dict)
+                and str(item.get("path") or "").strip()
+            )
+            for operation in operations:
+                for candidate in candidates or ["."]:
+                    artifact_block = protected_artifact_block_reason(
+                        self._ctx,
+                        pathlib.Path(candidate),
+                        operation,
+                        remote_root=remote_root,
+                    )
+                    if artifact_block:
+                        return artifact_block
+            if name in {"search_code", "query_code"}:
+                root_path = pathlib.Path(remote_root).resolve(strict=False)
+                protected_rows: set[str] = set()
+                for protected in protected_artifact_paths(
+                    self._ctx,
+                    remote_root=remote_root,
+                ):
+                    if not any(
+                        protected_artifact_block_reason(
+                            self._ctx,
+                            protected,
+                            operation,
+                            remote_root=remote_root,
+                        )
+                        for operation in (
+                            "read_bytes",
+                            "static_introspection",
+                        )
+                    ):
+                        continue
+                    try:
+                        relative = protected.resolve(
+                            strict=False
+                        ).relative_to(root_path)
+                    except (OSError, ValueError):
+                        continue
+                    if str(relative) not in {"", "."}:
+                        protected_rows.add(relative.as_posix())
+                broker_args["_protected_paths"] = sorted(protected_rows)
         if name in {"run_command", "run_script", "start_service"}:
             if name == "run_command":
                 cmd = broker_args.get("cmd")
@@ -3400,6 +3499,7 @@ class ToolRegistry:
         """Run the native check remotely, then persist the receipt on Home."""
 
         from ouroboros.tools.verify import (
+            _EXPECTED_MATCH_KINDS,
             _RUN_KINDS,
             _normalize_check,
             record_remote_verification_result,
@@ -3420,10 +3520,60 @@ class ToolRegistry:
                 f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind={kind} "
                 "requires `check`."
             )
+        match_mode = (
+            str(args.get("expected_match") or "substring").strip().lower()
+            or "substring"
+        )
+        if match_mode not in _EXPECTED_MATCH_KINDS:
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must "
+                f"be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
+            )
+        if match_mode == "bytes_equal" and str(
+            args.get("expected") or ""
+        ).strip():
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): "
+                "expected_match=bytes_equal takes NO `expected` string."
+            )
+        declared_paths = [
+            str(path).strip()
+            for path in args.get("artifact_paths") or []
+            if str(path or "").strip()
+        ]
+        if match_mode == "bytes_equal" and len(declared_paths) != 2:
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): "
+                "expected_match=bytes_equal requires exactly two artifact_paths."
+            )
+        remote_paths: list[str] = []
+        remote_root = str(workspace_ref.get("remote_root") or "")
+        for path in declared_paths[:20]:
+            try:
+                remote_path = self._remote_root_relative(remote_root, path)
+            except ValueError:
+                if match_mode == "bytes_equal":
+                    return (
+                        "⚠️ TOOL_ARG_ERROR (verify_and_record): bytes_equal "
+                        "paths must stay inside the active remote workspace."
+                    )
+                remote_path = path
+            if match_mode == "bytes_equal":
+                artifact_block = protected_artifact_block_reason(
+                    self._ctx,
+                    pathlib.Path(remote_path),
+                    "read_bytes",
+                    remote_root=remote_root,
+                )
+                if artifact_block:
+                    return f"bytes_equal refused: {artifact_block}"
+            remote_paths.append(remote_path)
         remote_args = {
             "cmd": argv,
             "cwd": str(args.get("cwd") or ""),
             "timeout_sec": int(args.get("timeout_sec") or 120),
+            "expected_match": match_mode,
+            "artifact_paths": remote_paths,
         }
         shell_block = self._remote_shell_safety_check(
             "verify_and_record",
@@ -3674,6 +3824,7 @@ class ToolRegistry:
         args: Dict[str, Any],
         runtime_mode: str,
         ext_tool: Mapping[str, Any] | None = None,
+        placement: PlacementDecision | None = None,
     ) -> tuple[bool, str]:
         """Dispatch the SSH-owned half, or decline cleanly to the Home path."""
 
@@ -3681,8 +3832,85 @@ class ToolRegistry:
             from ouroboros.workspace_ref import workspace_ref_for
 
             workspace_ref = workspace_ref_for(self._ctx)
-        except Exception:
-            workspace_ref = None
+            if (
+                workspace_ref is None
+                and str(args.get("root") or "active_workspace")
+                == "active_workspace"
+            ):
+                room_ref = workspace_ref_for(
+                    self._ctx,
+                    include_room_lens=True,
+                )
+                if room_ref is not None and room_ref["kind"] == "ssh":
+                    room_selected = False
+                    if name in _REMOTE_DIRECT_NATIVE_TOOLS:
+                        room_selected = self._remote_dispatch_selected(
+                            room_ref,
+                            name,
+                            args,
+                        )
+                        if name in {
+                            "service_status",
+                            "service_logs",
+                            "stop_service",
+                        }:
+                            room_selected = True
+                    elif name == "verify_and_record":
+                        room_selected = (
+                            str(args.get("contract_kind") or "") in {
+                                "visible_verifier",
+                                "explicit_command",
+                                "explicit_metric",
+                            }
+                            and self._remote_dispatch_selected(
+                                room_ref,
+                                "run_command",
+                                args,
+                            )
+                        )
+                    elif name == "claude_code_edit":
+                        room_selected = self._remote_dispatch_selected(
+                            room_ref,
+                            "run_script",
+                            args,
+                        )
+                    elif name == "integrate_subagent_patch":
+                        room_selected = True
+                    elif name in {
+                        "view_image",
+                        "ocr_pdf",
+                        "vlm_query",
+                        "extract_video_frames",
+                    }:
+                        room_selected = (
+                            self._remote_media_source(room_ref, name, args)
+                            is not None
+                        )
+                    elif ext_tool:
+                        room_selected = (
+                            str(ext_tool.get("execution_affinity") or "home")
+                            == "active_workspace"
+                        )
+                    elif placement is not None:
+                        room_selected = placement.placement == "active_workspace"
+                    if (
+                        name in {"read_file", "list_files", "search_code"}
+                        and room_selected
+                    ):
+                        workspace_ref = room_ref
+                    elif room_selected:
+                        return True, (
+                            "⚠️ ROOM_ACTIVE_WORKSPACE_REQUIRES_TASK: this room's "
+                            f"files live in {room_ref['remote_root']}; only "
+                            "read_file, list_files, and search_code are available "
+                            "before promotion. Call promote_chat_to_task for work "
+                            'there, or select an explicit Home root/cwd.'
+                        )
+        except Exception as exc:
+            return True, (
+                "⚠️ WORKSPACE_REF_INVALID: project/task workspace placement "
+                f"could not be validated: {type(exc).__name__}: {exc}."
+            )
         if workspace_ref is None or workspace_ref["kind"] != "ssh":
             return False, ""
         if (
@@ -3922,7 +4150,7 @@ class ToolRegistry:
         return _compose_execute_result(result, route_note, safety_msg)
 
     def execute(self, name: str, args: Dict[str, Any]) -> str:
-        name, args, entry, _placement = self._stage_raw_lookup_and_lexical_placement(
+        name, args, entry, placement = self._stage_raw_lookup_and_lexical_placement(
             name,
             args,
         )
@@ -4095,6 +4323,7 @@ class ToolRegistry:
             entry=entry,
             args=args,
             runtime_mode=_runtime_mode,
+            placement=placement,
         )
         if remote_handled:
             return remote_result

@@ -19,7 +19,11 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from ouroboros.platform_layer import kill_process_group_id, kill_process_tree
+from ouroboros.platform_layer import (
+    best_effort_nonblocking_pipe_write,
+    kill_process_group_id,
+    kill_process_tree,
+)
 from ouroboros.process_custody import spawn_supervised
 from ouroboros.remote_finalization import reconcile_remote_operations
 from ouroboros.remote_protocol import (
@@ -104,9 +108,14 @@ def _ssh_config(
     *,
     forwarding: bool,
 ) -> tuple[list[str], dict[str, list[str]]]:
+    from ouroboros.config import get_ssh_timeout_sec
+
     binary = str(ssh_binary or "").strip() or shutil.which("ssh")
     if not binary:
         raise _error("ssh_unavailable", "OpenSSH client is unavailable.", phase="connect")
+    connect_timeout = get_ssh_timeout_sec("connect")
+    keepalive_interval = get_ssh_timeout_sec("keepalive_interval")
+    keepalive_count = get_ssh_timeout_sec("keepalive_count")
     base = [
         binary,
         "-T",
@@ -117,11 +126,11 @@ def _ssh_config(
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={connect_timeout}",
         "-o",
-        "ServerAliveInterval=15",
+        f"ServerAliveInterval={keepalive_interval}",
         "-o",
-        "ServerAliveCountMax=2",
+        f"ServerAliveCountMax={keepalive_count}",
         "-o",
         "ForwardAgent=no",
         "-o",
@@ -159,7 +168,7 @@ def _ssh_config(
         stderr=subprocess.PIPE,
         text=True,
         errors="replace",
-        timeout=10,
+        timeout=connect_timeout,
         check=False,
         env=_minimal_ssh_env(),
     )
@@ -170,7 +179,7 @@ def _ssh_config(
         stderr=subprocess.PIPE,
         text=True,
         errors="replace",
-        timeout=10,
+        timeout=connect_timeout,
         check=False,
         env=_minimal_ssh_env(),
     )
@@ -706,17 +715,32 @@ class OpenSSHExecdTransport:
                     "SSH execd session is closed.",
                     phase="connect",
                 )
-            self._reset_wire_state()
-            self.bootstrap(timeout_sec=timeout_sec)
+            process = self._process
+            live = (
+                process is not None
+                and process.poll() is None
+                and self._reader_error is None
+            )
+            if not live:
+                self._reset_wire_state()
+                self.bootstrap(timeout_sec=timeout_sec)
             try:
-                self._start_session(timeout_sec=timeout_sec)
+                if not live:
+                    self._start_session(timeout_sec=timeout_sec)
                 rows = reconcile_remote_operations(
                     self,
                     ack_timeout_sec=_ACK_TIMEOUT_SEC,
                     retention_cap=_MAX_KNOWN_OPERATIONS,
                 )
             except BaseException:
-                self._reset_wire_state()
+                process = self._process
+                if (
+                    not live
+                    or process is None
+                    or process.poll() is not None
+                    or self._reader_error is not None
+                ):
+                    self._reset_wire_state()
                 raise
             self._last_reconciliation = rows
             return {
@@ -773,31 +797,38 @@ class OpenSSHExecdTransport:
         self._process = None
         helper = self._helper_process
         self._helper_process = None
-        if (
-            process is not None
-            and process.poll() is None
-            and process.stdin is not None
-            and self._send_lock.acquire(blocking=False)
-        ):
-            try:
-                sequence = self._sequence
-                self._sequence += 1
-                payload = encode_control(
-                    {
-                        "kind": "panic",
-                        "seq": sequence,
-                        "server_generation": self.request.server_generation,
-                    }
-                )
-                fd = process.stdin.fileno()
-                os.set_blocking(fd, False)
-                os.write(fd, payload)
-            except (BlockingIOError, OSError, ValueError):
-                pass
-            finally:
-                self._send_lock.release()
-        self._panic_discard_process(helper)
-        self._panic_discard_process(process)
+        try:
+            if (
+                process is not None
+                and process.poll() is None
+                and process.stdin is not None
+                and self._send_lock.acquire(blocking=False)
+            ):
+                try:
+                    sequence = self._sequence
+                    self._sequence += 1
+                    payload = encode_control(
+                        {
+                            "kind": "panic",
+                            "seq": sequence,
+                            "server_generation": self.request.server_generation,
+                        }
+                    )
+                    try:
+                        best_effort_nonblocking_pipe_write(
+                            process.stdin,
+                            payload,
+                        )
+                    except Exception:
+                        # The helper's contract is never-raising; retain panic
+                        # teardown even if a test double or platform anomaly
+                        # violates it.
+                        pass
+                finally:
+                    self._send_lock.release()
+        finally:
+            self._panic_discard_process(helper)
+            self._panic_discard_process(process)
 
     def close(self) -> None:
         if self._stop.is_set():

@@ -2242,7 +2242,11 @@ async def lifespan(app):
             pass
         if remote_workspace_service is not None:
             try:
-                remote_workspace_service.close(timeout_sec=5)
+                from ouroboros.config import get_ssh_timeout_sec
+
+                remote_workspace_service.close(
+                    timeout_sec=float(get_ssh_timeout_sec("shutdown"))
+                )
             except Exception:
                 log.warning("Remote workspace broker shutdown failed", exc_info=True)
         if extension_reconcile_task is not None:

@@ -502,7 +502,11 @@ def _integrate_remote_subagent_patch(
     """Apply an imported child patch to the exact reviewed remote fingerprint."""
 
     del child_surface, child_result
-    from ouroboros.workspace_executor import execute_remote_system_operation
+    from ouroboros.remote_claude import _content_manifest
+    from ouroboros.workspace_executor import (
+        execute_remote_system_operation,
+        materialize_remote_workspace_snapshot,
+    )
     from ouroboros.workspace_ref import workspace_ref_for
 
     workspace_ref = workspace_ref_for(ctx)
@@ -539,33 +543,73 @@ def _integrate_remote_subagent_patch(
                 runtime_mode=runtime_mode,
                 action=f"integrate remote subagent patch {child_task_id} touching",
             )
-    snapshot = execute_remote_system_operation(
-        ctx,
-        "snapshot_manifest_and_blob_export",
-        {},
-    )
-    snapshot_manifest = (
-        snapshot.trace.get("snapshot")
-        if isinstance(snapshot.trace, dict)
-        else None
-    )
-    if (
-        not isinstance(snapshot_manifest, dict)
-        or not snapshot_manifest.get("complete")
-        or not str(snapshot_manifest.get("fingerprint") or "")
-    ):
-        return "⚠️ INTEGRATE_REMOTE_SNAPSHOT_FAILED: target snapshot is partial or unstable."
     patch_bytes = patch_path.read_bytes()
     digest = _sha256_file(patch_path)
     expected_digest = str(manifest.get("sha256") or "")
     if expected_digest and digest != expected_digest:
         return "⚠️ INTEGRATE_PATCH_CORRUPT: child patch changed before remote apply."
+    with materialize_remote_workspace_snapshot(ctx) as snapshot:
+        snapshot_manifest = snapshot.manifest
+        preview = subprocess.run(
+            ["git", "apply", "-"],
+            cwd=str(snapshot.root),
+            input=patch_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if preview.returncode:
+            return (
+                "⚠️ INTEGRATE_REMOTE_PATCH_PREVIEW_FAILED: "
+                + preview.stderr.decode("utf-8", errors="replace")[:600]
+            )
+        after_manifest = _content_manifest(snapshot.root)
+    current_rows = {
+        str(row.get("path") or ""): dict(row)
+        for row in snapshot_manifest.get("entries") or []
+        if isinstance(row, dict) and str(row.get("path") or "")
+    }
+    after_rows = {
+        str(row.get("path") or ""): dict(row)
+        for row in after_manifest.get("entries") or []
+        if isinstance(row, dict) and str(row.get("path") or "")
+    }
+    changed_paths = sorted(
+        path
+        for path in current_rows.keys() | after_rows.keys()
+        if current_rows.get(path) != after_rows.get(path)
+    )
+    if changed_paths != authoritative_touched:
+        return (
+            "⚠️ INTEGRATE_REMOTE_PATCH_CHANGESET_MISMATCH: preview changed "
+            f"{changed_paths}, expected {authoritative_touched}."
+        )
+    git_facts = (
+        snapshot_manifest.get("git")
+        if isinstance(snapshot_manifest.get("git"), dict)
+        else {}
+    )
     applied = execute_remote_system_operation(
         ctx,
         "guarded_patch_apply",
         {
             "expected_fingerprint": str(snapshot_manifest["fingerprint"]),
+            "expected_head": str(git_facts.get("head") or ""),
+            "expected_index_sha256": str(
+                git_facts.get("index_sha256") or ""
+            ),
+            "expected_content_fingerprint": str(
+                after_manifest["content_fingerprint"]
+            ),
             "patch_blob_id": digest,
+            "changes": [
+                {
+                    "path": path,
+                    "before": current_rows.get(path),
+                    "after": after_rows.get(path),
+                }
+                for path in authoritative_touched
+            ],
         },
         blobs={digest: patch_bytes},
     )
