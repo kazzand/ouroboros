@@ -701,6 +701,7 @@ finalization states.
 │   │   ├── scheduled_tasks.json ← Queue-backed cron schedules (5-field cron, timezone, last/next run, task template)
 │   │   ├── projects.json ← Project registry: immutable id/chat identity, optional working folder, lifecycle/routing fence, visible revision, and deletion error; tombstones are durable and never age-pruned
 │   │   ├── remote_connections.json ← Owner-only (0600), locked SSH alias metadata, pinned execd continuity ID/history, and active/retired lifecycle; never SSH keys/passwords/options or live session state
+│   │   ├── remote_reconciliation/<scope>/<operation>.pending.json ← Fsynced Home reconciliation intents written before remote CONTINUE; terminal unavailable evidence uses a separate `<operation>.json`, so ACK cleanup and evidence retention never erase a live intent
 │   │   ├── project_task_bindings.json ← Task→project bindings (schema v1) with a REQUIRED typed origin: the ingress-captured source-row ref (+`source_text`, the retention-proof full copy, stored only for CROSS-thread origins — i.e. the message that started the project) or a closed-enum `origin_absent` reason. Immutable except ONE-WAY enrichment (a same-project re-bind may fill a missing ref; a valid ref is never changed); one root belongs to at most one Project and tombstoning never removes the binding. The retention-proof invariant is FORWARD-ONLY by owner decision: pre-v6.73.0 bindings (no `source_text`) are not migrated and their start messages remain rotation-vulnerable as before
 │   │   ├── ui_preferences.json ← Owner-local layout preferences and monotonic `project_seen_revision` paint ACKs; legacy `project_last_viewed`/`project_hidden` are one-minor deprecated no-ops
 │   │   ├── queue_snapshot.json
@@ -1397,6 +1398,13 @@ consciousness, scheduler, review authority or self-evolution. A missing
 mandatory native capability blocks SSH admission instead of hiding tools from
 the model.
 
+`remote_connections.json` is non-secret owner metadata. Owner-only means that
+authenticated owner routes/CLI own connection and trust mutations; deterministic
+path guards are defense in depth, not a confidentiality sandbox against
+arbitrary code already running as the same Home Unix user. Real same-UID
+confidentiality would require a separate OS identity/process boundary or vault
+and is outside this transport boundary.
+
 V1 remote placement is Project-only. Project creation admits a canonical
 remote Git worktree and persists its opaque `workspace_id`; every task inherits
 an immutable ref plus `ExecutorRef(type="ssh_exec")`. Tasks cannot carry raw
@@ -1424,6 +1432,21 @@ arguments and native facts. Tamper, expiry, replay or changed workspace
 identity fails before handler start. Arbitrary shell remains an unsandboxed
 process running with the selected remote Unix account's OS permissions; execd
 does not elevate authority.
+
+Immediately before `CONTINUE`, Home fsyncs a bounded reconciliation intent under
+`state/remote_reconciliation/`. It contains session/operation identity and a
+closed import contract, but no command arguments, prepared token, blob, SSH
+alias/options or credentials. This record is not a second execution ledger:
+execd's generation-independent operation journal alone decides whether the
+effect started/completed. On Home restart the broker groups these intents by
+connection/Project/workspace, revalidates current placement and host/workspace/
+capability/artifact identity before sending `RECONCILE`, then reconciles in a
+non-startup-blocking broker pass before any replay. Retired connections may be
+opened only for that pass and are closed immediately afterward. A proved
+`not_started` result or verified Home import plus ACK removes the intent;
+unknown/import-failed outcomes retain it. Recovery reuses the ordinary
+per-Project admission lock, so a newly submitted task cannot race a second
+transport against import/ACK of the same retained operation.
 
 `remote_workspace.RemoteSessionBroker` is server-owned and keyed by connection,
 Project, workspace and Home server generation. Workers use bounded

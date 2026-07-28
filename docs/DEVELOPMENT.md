@@ -98,7 +98,10 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   model-facing tool names/schemas at equal role/runtime/resource policy.
 - Home-only consumers of SSH source must use the shared stable snapshot bridge,
   verify every declared blob, and clean the temporary mirror on success and
-  failure. A remote mutation imported from a Home model requires the exact
+  failure. Policy-filtered snapshots may omit only disclosed sensitive/protected
+  paths; they remain explicitly partial and are usable only when the independent
+  integrity axis has no read/walk/limit/stability failure. A remote mutation
+  imported from a Home model requires the exact
   source/HEAD/index precondition, a complete before→after change manifest,
   `git apply --check`, an expected post-content fingerprint, and explicit
   rollback evidence. Never copy Home model/provider credentials to execd.
@@ -122,6 +125,20 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   continuity; compatibility plus fresh health remain process-local evidence,
   so a Home restart requires the fast verified Bootstrap path before Project
   selection rather than a new mutable field in `remote_connections.json`.
+  The store contains no SSH key, password, token or raw option. “Owner-only”
+  describes authenticated administration and mutation authority, not secrecy
+  from arbitrary code already executing as the same Home Unix user: path guards
+  are defense in depth, while a stronger confidentiality boundary requires a
+  separate OS user/process boundary or credential vault.
+- Before sending remote `CONTINUE`, Home must fsync one bounded reconciliation
+  intent under `state/remote_reconciliation/`. It records only operation/session
+  identity plus a closed import kind—never args, prepared tokens, blobs, SSH
+  settings or credentials. The execd journal remains the sole execution truth;
+  Home asks it to reconcile after restart and removes the intent only after a
+  verified import plus ACK (or a proved `not_started` result). Pending
+  `*.pending.json` records and retained terminal-evidence `*.json` records are
+  distinct: evidence retention/cleanup must never prune an unacknowledged
+  intent.
 - Workspace-mode tasks must use an explicit allowlist, reject system-repo/data
   overlap, require a git worktree root, and return patch artifacts instead of
   committing in the target repository.

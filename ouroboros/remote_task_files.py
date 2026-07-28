@@ -226,6 +226,76 @@ def attachment_blob_map(
     return canonical, verified
 
 
+def validate_staged_attachment_envelope(
+    manifest: list[dict[str, Any]],
+    raw_envelope: Mapping[str, Any],
+    fetched: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate the closed attachment import contract without a closure."""
+
+    from ouroboros.remote_workspace import (
+        RemoteWorkspaceError,
+        _envelope_from_dict,
+    )
+
+    fetched = fetched or {}
+    if fetched.get("externalized_envelope") or fetched.get("process_blobs"):
+        raise RemoteWorkspaceError(
+            "attachment_manifest_invalid",
+            "Attachment staging returned unexpected external result blobs.",
+            phase="import",
+        )
+    envelope = _envelope_from_dict(raw_envelope)
+    if envelope.diagnostic is not None:
+        raise RemoteWorkspaceError(
+            envelope.diagnostic.code,
+            envelope.diagnostic.message,
+            phase=envelope.diagnostic.phase,
+            completion=envelope.diagnostic.completion,
+            retryable=envelope.diagnostic.retryable,
+            details=envelope.diagnostic.details,
+        )
+    staged = envelope.trace.get("attachment_manifest")
+    if not isinstance(staged, list) or len(staged) != len(manifest):
+        raise RemoteWorkspaceError(
+            "attachment_manifest_invalid",
+            "Execd returned an invalid staged attachment manifest.",
+            phase="finalize",
+        )
+    validated: list[dict[str, Any]] = []
+    for expected, remote in zip(manifest, staged):
+        if not isinstance(remote, dict):
+            raise RemoteWorkspaceError(
+                "attachment_manifest_invalid",
+                "Execd returned an invalid staged attachment entry.",
+                phase="finalize",
+            )
+        source_facts = {key: remote.get(key) for key in expected}
+        if canonical_json(source_facts) != canonical_json(expected):
+            raise RemoteWorkspaceError(
+                "attachment_manifest_changed",
+                "Execd changed authoritative attachment facts.",
+                phase="finalize",
+            )
+        execution_path = str(remote.get("execution_path") or "")
+        if (
+            not execution_path.startswith("/")
+            or len(execution_path) > 4096
+            or any(ord(character) < 32 for character in execution_path)
+        ):
+            raise RemoteWorkspaceError(
+                "attachment_execution_path_invalid",
+                "Execd returned an invalid attachment execution path.",
+                phase="finalize",
+            )
+        validated.append({
+            **expected,
+            "execution_path": execution_path,
+            "abs_path": execution_path,
+        })
+    return validated
+
+
 def stage_remote_task_attachments(
     session: Any,
     task_id: str,
@@ -238,7 +308,6 @@ def stage_remote_task_attachments(
         return None
     from ouroboros.remote_workspace import (
         RemoteWorkspaceError,
-        _envelope_from_dict,
         _validated_prepared,
     )
 
@@ -291,82 +360,20 @@ def stage_remote_task_attachments(
             "Execd prepared a different attachment manifest.",
             phase="authorize",
         )
-    result: list[dict[str, Any]] = []
-
-    def _complete_on_home(
-        _wire_result: Mapping[str, Any],
-        raw_envelope: Mapping[str, Any],
-        fetched: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        nonlocal result
-        if fetched.get("externalized_envelope") or fetched.get("process_blobs"):
-            raise RemoteWorkspaceError(
-                "attachment_manifest_invalid",
-                "Attachment staging returned unexpected external result blobs.",
-                phase="import",
-            )
-        envelope = _envelope_from_dict(raw_envelope)
-        if envelope.diagnostic is not None:
-            raise RemoteWorkspaceError(
-                envelope.diagnostic.code,
-                envelope.diagnostic.message,
-                phase=envelope.diagnostic.phase,
-                completion=envelope.diagnostic.completion,
-                retryable=envelope.diagnostic.retryable,
-                details=envelope.diagnostic.details,
-            )
-        staged = envelope.trace.get("attachment_manifest")
-        if not isinstance(staged, list) or len(staged) != len(manifest):
-            raise RemoteWorkspaceError(
-                "attachment_manifest_invalid",
-                "Execd returned an invalid staged attachment manifest.",
-                phase="finalize",
-            )
-        validated: list[dict[str, Any]] = []
-        for expected, remote in zip(manifest, staged):
-            if not isinstance(remote, dict):
-                raise RemoteWorkspaceError(
-                    "attachment_manifest_invalid",
-                    "Execd returned an invalid staged attachment entry.",
-                    phase="finalize",
-                )
-            source_facts = {key: remote.get(key) for key in expected}
-            if canonical_json(source_facts) != canonical_json(expected):
-                raise RemoteWorkspaceError(
-                    "attachment_manifest_changed",
-                    "Execd changed authoritative attachment facts.",
-                    phase="finalize",
-                )
-            execution_path = str(remote.get("execution_path") or "")
-            if (
-                not execution_path.startswith("/")
-                or len(execution_path) > 4096
-                or any(ord(character) < 32 for character in execution_path)
-            ):
-                raise RemoteWorkspaceError(
-                    "attachment_execution_path_invalid",
-                    "Execd returned an invalid attachment execution path.",
-                    phase="finalize",
-                )
-            validated.append({
-                **expected,
-                "execution_path": execution_path,
-                "abs_path": execution_path,
-            })
-        result = validated
-        return dict(raw_envelope)
-
-    session.transport.execute_prepared(
+    imported = session.transport.execute_prepared(
         {
             "request_id": request_id,
             "operation_id": operation_id,
             "prepared_hash": prepared["prepared_hash"],
             "prepared_token": prepared["prepared_token"],
             "task_id": task_id,
-            "_home_completion_validator": _complete_on_home,
+            "_home_import_kind": "attachment_stage_v1",
+            "_home_import_context": {
+                "expected_manifest": manifest,
+            },
         }
     )
-    return result
+    return validate_staged_attachment_envelope(manifest, imported)
 
 
 def remote_task_admission_result(

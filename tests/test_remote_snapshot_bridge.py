@@ -11,6 +11,7 @@ import pytest
 from ouroboros.gateways.claude_code import ClaudeCodeResult
 from ouroboros.remote_claude import run_remote_claude_edit
 from ouroboros.remote_workspace import PreparedRemoteCall, set_remote_workspace_service
+from ouroboros.workspace_diagnostics import ToolExecutionEnvelope
 from ouroboros.workspace_executor import (
     RemoteWorkspaceOperationError,
     materialize_remote_workspace_snapshot,
@@ -153,6 +154,27 @@ def test_snapshot_refuses_partial_sensitive_or_escaping_symlink_view(
         set_remote_workspace_service(None)
 
 
+def test_snapshot_materializes_policy_filtered_sensitive_view(
+    tmp_path,
+    remote_repo,
+):
+    (remote_repo / ".env").write_text("SECRET=not-for-home\n")
+    fake = _FakeRemote(remote_repo)
+    set_remote_workspace_service(fake)
+    try:
+        with materialize_remote_workspace_snapshot(_Context(tmp_path)) as snapshot:
+            assert not (snapshot.root / ".env").exists()
+            assert (snapshot.root / "tracked.txt").read_text() == "dirty worktree\n"
+            assert snapshot.manifest["complete"] is False
+            assert snapshot.manifest["materializable"] is True
+            assert {
+                (row["path"], row["reason"])
+                for row in snapshot.manifest["exclusions"]
+            } >= {(".env", "sensitive_file")}
+    finally:
+        set_remote_workspace_service(None)
+
+
 def test_snapshot_never_exports_tracked_secrets_or_protected_artifacts(
     tmp_path,
     remote_repo,
@@ -163,6 +185,7 @@ def test_snapshot_never_exports_tracked_secrets_or_protected_artifacts(
     (remote_repo / "reference.bin").write_bytes(protected)
     _git(remote_repo, "add", ".env", "reference.bin")
     _git(remote_repo, "commit", "-qm", "tracked protected inputs")
+    os.link(remote_repo / ".env", remote_repo / "public-config.txt")
     os.link(remote_repo / "reference.bin", remote_repo / "reference-hardlink.bin")
     ctx = _Context(tmp_path)
     ctx.task_metadata["task_contract"] = {
@@ -183,13 +206,218 @@ def test_snapshot_never_exports_tracked_secrets_or_protected_artifacts(
     fake = _FakeRemote(remote_repo)
     set_remote_workspace_service(fake)
     try:
-        with pytest.raises(RemoteWorkspaceOperationError, match="partial"):
-            materialize_remote_workspace_snapshot(subject)
+        with materialize_remote_workspace_snapshot(subject) as snapshot:
+            assert not (snapshot.root / ".env").exists()
+            assert not (snapshot.root / "public-config.txt").exists()
+            assert not (snapshot.root / "reference.bin").exists()
+            assert not (snapshot.root / "reference-hardlink.bin").exists()
+            assert (snapshot.root / "tracked.txt").is_file()
+            assert snapshot.manifest["materializable"] is True
     finally:
         set_remote_workspace_service(None)
 
     assert hashlib.sha256(secret).hexdigest() not in fake.blobs
     assert hashlib.sha256(protected).hexdigest() not in fake.blobs
+
+
+def test_snapshot_never_exports_hardlink_to_protected_file_below_omitted_dir(
+    tmp_path,
+    remote_repo,
+):
+    protected_dir = remote_repo / ".ouroboros"
+    protected_dir.mkdir()
+    protected = b"protected-below-omitted-directory"
+    (protected_dir / "blackbox.bin").write_bytes(protected)
+    os.link(
+        protected_dir / "blackbox.bin",
+        remote_repo / "public-hardlink.bin",
+    )
+    ctx = _Context(tmp_path)
+    ctx.task_metadata["task_contract"] = {
+        "resource_policy": {
+            "protected_artifacts": [
+                {
+                    "role": "black_box_reference",
+                    "paths": [
+                        "/remote/project/.ouroboros/blackbox.bin"
+                    ],
+                }
+            ]
+        }
+    }
+    fake = _FakeRemote(remote_repo)
+    set_remote_workspace_service(fake)
+    try:
+        with materialize_remote_workspace_snapshot(ctx) as snapshot:
+            assert not (snapshot.root / ".ouroboros").exists()
+            assert not (snapshot.root / "public-hardlink.bin").exists()
+    finally:
+        set_remote_workspace_service(None)
+
+    assert hashlib.sha256(protected).hexdigest() not in fake.blobs
+
+
+def test_remote_claude_policy_filtered_patch_cannot_create_sensitive_file(
+    tmp_path,
+    remote_repo,
+    monkeypatch,
+):
+    (remote_repo / ".env").write_text("SECRET=remote-only\n")
+    fake = _FakeRemote(remote_repo)
+    set_remote_workspace_service(fake)
+
+    def _edit(**kwargs):
+        mirror = pathlib.Path(kwargs["cwd"])
+        (mirror / "tracked.txt").write_text("claude\n")
+        (mirror / ".env").write_text("SECRET=overwrite\n")
+        return ClaudeCodeResult(success=True, result_text="done")
+
+    monkeypatch.setattr("ouroboros.gateways.claude_code.run_edit", _edit)
+    try:
+        with pytest.raises(
+            RemoteWorkspaceOperationError,
+            match="omitted policy path",
+        ):
+            run_remote_claude_edit(
+                _Context(tmp_path),
+                prompt="edit",
+                budget=1,
+                validate=False,
+                system_prompt="governance",
+            )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert (remote_repo / ".env").read_text() == "SECRET=remote-only\n"
+    assert (remote_repo / "tracked.txt").read_text() == "dirty worktree\n"
+
+
+def test_remote_claude_cannot_create_snapshot_omitted_runtime_path(
+    tmp_path,
+    remote_repo,
+    monkeypatch,
+):
+    fake = _FakeRemote(remote_repo)
+    set_remote_workspace_service(fake)
+
+    def _edit(**kwargs):
+        mirror = pathlib.Path(kwargs["cwd"])
+        (mirror / "tracked.txt").write_text("claude\n")
+        (mirror / ".ouroboros").mkdir()
+        (mirror / ".ouroboros" / "hidden").write_text("hidden\n")
+        return ClaudeCodeResult(success=True, result_text="done")
+
+    monkeypatch.setattr("ouroboros.gateways.claude_code.run_edit", _edit)
+    try:
+        with pytest.raises(
+            RemoteWorkspaceOperationError,
+            match="omitted policy path",
+        ):
+            run_remote_claude_edit(
+                _Context(tmp_path),
+                prompt="edit",
+                budget=1,
+                validate=False,
+                system_prompt="governance",
+            )
+    finally:
+        set_remote_workspace_service(None)
+
+    assert not (remote_repo / ".ouroboros").exists()
+    assert (remote_repo / "tracked.txt").read_text() == "dirty worktree\n"
+
+
+def test_home_rejects_complete_manifest_with_failed_integrity(
+    tmp_path,
+    remote_repo,
+    monkeypatch,
+):
+    fake = _FakeRemote(remote_repo)
+    native = execute_native_operation(
+        remote_repo,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    fake.blobs.update(native.blobs)
+    manifest = dict(native.envelope.trace["snapshot"])
+    manifest.update(
+        complete=True,
+        integrity_complete=False,
+        materializable=False,
+        unstable=True,
+        failures=[{"path": "bad", "reason": "entry_read_error"}],
+        failure_count=1,
+    )
+    monkeypatch.setattr(
+        "ouroboros.workspace_executor.execute_remote_system_operation",
+        lambda *_args, **_kwargs: ToolExecutionEnvelope(
+            text="",
+            trace={"snapshot": manifest},
+        ),
+    )
+    set_remote_workspace_service(fake)
+    try:
+        with pytest.raises(RemoteWorkspaceOperationError, match="partial"):
+            materialize_remote_workspace_snapshot(_Context(tmp_path))
+    finally:
+        set_remote_workspace_service(None)
+
+
+def test_home_rejects_duplicate_snapshot_entry_paths(
+    tmp_path,
+    remote_repo,
+    monkeypatch,
+):
+    fake = _FakeRemote(remote_repo)
+    native = execute_native_operation(
+        remote_repo,
+        "snapshot_manifest_and_blob_export",
+        {},
+    )
+    fake.blobs.update(native.blobs)
+    manifest = dict(native.envelope.trace["snapshot"])
+    entries = [dict(row) for row in manifest["entries"]]
+    entries.append(dict(entries[0]))
+    entries.sort(key=lambda row: row["path"])
+    manifest["entries"] = entries
+    manifest["total_bytes"] = sum(int(row["size"]) for row in entries)
+    manifest["content_fingerprint"] = hashlib.sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    manifest["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            {
+                "entries": entries,
+                "git": manifest["git"],
+                "policy_exclusions": manifest["policy_exclusions"],
+                "protected_paths": manifest["protected_paths"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    monkeypatch.setattr(
+        "ouroboros.workspace_executor.execute_remote_system_operation",
+        lambda *_args, **_kwargs: ToolExecutionEnvelope(
+            text="",
+            trace={"snapshot": manifest},
+        ),
+    )
+    set_remote_workspace_service(fake)
+    try:
+        with pytest.raises(
+            RemoteWorkspaceOperationError,
+            match="topology",
+        ):
+            materialize_remote_workspace_snapshot(_Context(tmp_path))
+    finally:
+        set_remote_workspace_service(None)
 
 
 def test_continuous_snapshot_mutation_never_materializes_stale_blobs(
@@ -385,9 +613,9 @@ def test_snapshot_cleanup_on_claude_failure(tmp_path, remote_repo, monkeypatch):
     fake = _FakeRemote(remote_repo)
     set_remote_workspace_service(fake)
     roots: list[pathlib.Path] = []
-    from ouroboros import workspace_executor
+    from ouroboros import remote_snapshot_home
 
-    original_mkdtemp = workspace_executor.tempfile.mkdtemp
+    original_mkdtemp = remote_snapshot_home.tempfile.mkdtemp
 
     def _recording_mkdtemp(*args, **kwargs):
         root = pathlib.Path(original_mkdtemp(*args, **kwargs))
@@ -398,7 +626,11 @@ def test_snapshot_cleanup_on_claude_failure(tmp_path, remote_repo, monkeypatch):
         del kwargs
         raise RuntimeError("SDK crash")
 
-    monkeypatch.setattr(workspace_executor.tempfile, "mkdtemp", _recording_mkdtemp)
+    monkeypatch.setattr(
+        remote_snapshot_home.tempfile,
+        "mkdtemp",
+        _recording_mkdtemp,
+    )
     monkeypatch.setattr("ouroboros.gateways.claude_code.run_edit", _explode)
     with pytest.raises(RuntimeError, match="SDK crash"):
         run_remote_claude_edit(

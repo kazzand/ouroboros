@@ -7,7 +7,6 @@ OpenSSH processes, protocol sessions, leases, bootstrap and reconciliation.
 """
 
 from __future__ import annotations
-
 import concurrent.futures
 import dataclasses
 import multiprocessing
@@ -1288,8 +1287,6 @@ class RemoteSessionBroker:
         return _validated_prepared(response)
 
     def _execute_on_broker(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from ouroboros.remote_finalization import import_remote_result_to_home
-
         task_id = _optional_opaque(payload.get("task_id"), "task_id")
         session = self._session_for_ref(payload["workspace_ref"], task_id=task_id)
         prepared = _prepared_from_dict(payload.get("prepared"))
@@ -1313,17 +1310,8 @@ class RemoteSessionBroker:
                     "prepared_hash": prepared.prepared_hash,
                     "prepared_token": prepared.prepared_token,
                     "task_id": task_id,
-                    "_home_completion_validator": lambda _result, envelope, fetched: (
-                        _validated_envelope_dict(
-                            import_remote_result_to_home(
-                                self.drive_root,
-                                task_id,
-                                prepared.operation_id,
-                                envelope,
-                                fetched,
-                            )
-                        )
-                    ),
+                    "_home_import_kind": "task_result_v1",
+                    "_home_import_context": {},
                     "_response_timeout_sec": response_timeout,
                 }
             )
@@ -1423,8 +1411,6 @@ class RemoteSessionBroker:
         return True
 
     def _refresh_service_leases(self, connection_id: str) -> None:
-        from ouroboros.remote_finalization import import_remote_result_to_home
-
         refresh_deadline = time.monotonic() + 5.0
         for candidate in self._service_leases.candidates(connection_id)[:128]:
             remaining = refresh_deadline - time.monotonic()
@@ -1473,19 +1459,8 @@ class RemoteSessionBroker:
                             "prepared_hash": prepared.prepared_hash,
                             "prepared_token": prepared.prepared_token,
                             "task_id": task_id,
-                            "_home_completion_validator": (
-                                lambda _result, envelope, fetched: (
-                                    _validated_envelope_dict(
-                                        import_remote_result_to_home(
-                                            self.drive_root,
-                                            task_id,
-                                            prepared.operation_id,
-                                            envelope,
-                                            fetched,
-                                        )
-                                    )
-                                )
-                            ),
+                            "_home_import_kind": "task_result_v1",
+                            "_home_import_context": {},
                             "_response_timeout_sec": max(
                                 0.1,
                                 refresh_deadline - time.monotonic(),
@@ -1506,25 +1481,10 @@ class RemoteSessionBroker:
             finally:
                 if callable(task_lease) and not was_tracked:
                     task_lease(task_id, forget=True)
-
     def _recover_on_broker(self, _payload: dict[str, Any]) -> list[dict[str, Any]]:
-        with self._state_lock:
-            sessions = list(self._sessions.values())
-        rows: list[dict[str, Any]] = []
-        for session in sessions:
-            try:
-                rows.extend(session.transport.reconcile())
-            except Exception as exc:
-                rows.append(
-                    {
-                        "connection_id": session.key[0],
-                        "workspace_id": session.key[2],
-                        "status": "reconcile_failed",
-                        "error": _error_dict(exc),
-                    }
-                )
-        return rows
+        from ouroboros.remote_pending_operations import recover_pending_on_broker
 
+        return recover_pending_on_broker(self)
     def _reconnect_connection_on_broker(self, payload: dict[str, Any]) -> dict[str, Any]:
         connection = _json_copy(payload.get("connection"), "connection")
         connection_id = _opaque(connection.get("id"), "connection_id")

@@ -16,7 +16,6 @@ import posixpath
 import shlex
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -222,6 +221,38 @@ def _subject_task_id(subject: Any) -> str:
     return str(getattr(subject, "task_id", "") or "")
 
 
+def _remote_protected_paths(subject: Any, remote_root: str) -> tuple[str, ...]:
+    from ouroboros.protected_artifacts import (
+        block_reason_for_path,
+        protected_artifact_paths,
+    )
+
+    root = pathlib.Path(remote_root).resolve(strict=False)
+    rows: set[str] = set()
+    for protected in protected_artifact_paths(
+        subject,
+        remote_root=str(root),
+    ):
+        if not block_reason_for_path(
+            subject,
+            protected,
+            "read_bytes",
+            remote_root=str(root),
+        ):
+            continue
+        try:
+            relative = protected.resolve(strict=False).relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if str(relative) not in {"", "."}:
+            rows.add(relative.as_posix())
+    if len(rows) > 1000:
+        raise RemoteWorkspaceOperationError(
+            "remote protected-path policy exceeds the supported limit"
+        )
+    return tuple(sorted(rows))
+
+
 def execute_remote_system_operation(
     subject: Any,
     operation: str,
@@ -242,6 +273,33 @@ def execute_remote_system_operation(
     workspace_ref = workspace_ref_for(subject)
     if workspace_ref is None or workspace_ref["kind"] != "ssh":
         raise ValueError("remote system operation requires a sealed SSH workspace")
+    operation_args = dict(args)
+    if operation in {
+        "snapshot_manifest_and_blob_export",
+        "guarded_patch_apply",
+        "vcs_diff",
+        "vcs_status",
+    }:
+        supplied = operation_args.get("_protected_paths")
+        supplied_rows = (
+            [str(item) for item in supplied]
+            if isinstance(supplied, list)
+            else []
+        )
+        protected_rows = set(
+            _remote_protected_paths(
+                subject,
+                str(workspace_ref["remote_root"]),
+            )
+        )
+        protected_rows.update(
+            row for row in supplied_rows if row.strip()
+        )
+        if len(protected_rows) > 1000:
+            raise RemoteWorkspaceOperationError(
+                "remote protected-path policy exceeds the supported limit"
+            )
+        operation_args["_protected_paths"] = sorted(protected_rows)
     try:
         service = get_remote_workspace_service()
     except Exception as exc:
@@ -265,7 +323,7 @@ def execute_remote_system_operation(
             request_id=request_id,
             operation_id=operation_id,
             tool=str(operation),
-            args=dict(args),
+            args=operation_args,
             blobs=dict(blobs or {}),
             task_id=task_id,
             parent_task_id=parent_task_id,
@@ -328,161 +386,13 @@ def materialize_remote_workspace_snapshot(
     max_bytes: int = _REMOTE_SNAPSHOT_MAX_BYTES,
 ) -> RemoteWorkspaceSnapshot:
     """Fetch a fingerprint-stable CAS snapshot and verify every byte on Home."""
+    from ouroboros.remote_snapshot_home import materialize_snapshot
 
-    from ouroboros.remote_workspace import get_remote_workspace_service
-    from ouroboros.workspace_ref import workspace_ref_for
-
-    from ouroboros.protected_artifacts import (
-        block_reason_for_path,
-        protected_artifact_paths,
-    )
-
-    workspace_ref = workspace_ref_for(subject)
-    if workspace_ref is None or workspace_ref["kind"] != "ssh":
-        raise ValueError("remote snapshot requires a sealed SSH workspace")
-    remote_root = pathlib.Path(str(workspace_ref["remote_root"])).resolve(strict=False)
-    protected_rows: set[str] = set()
-    for protected in protected_artifact_paths(subject, remote_root=str(remote_root)):
-        if not block_reason_for_path(
-            subject,
-            protected,
-            "read_bytes",
-            remote_root=str(remote_root),
-        ):
-            continue
-        try:
-            relative = protected.resolve(strict=False).relative_to(remote_root)
-        except (OSError, ValueError):
-            continue
-        if str(relative) not in {"", "."}:
-            protected_rows.add(relative.as_posix())
-    envelope = execute_remote_system_operation(
+    return materialize_snapshot(
         subject,
-        "snapshot_manifest_and_blob_export",
-        {"_protected_paths": sorted(protected_rows)},
+        max_files=max_files,
+        max_bytes=max_bytes,
     )
-    trace = getattr(envelope, "trace", {})
-    manifest = trace.get("snapshot") if isinstance(trace, dict) else None
-    if not isinstance(manifest, dict):
-        raise RemoteWorkspaceOperationError("remote snapshot omitted its manifest")
-    entries = manifest.get("entries")
-    if not isinstance(entries, list):
-        raise RemoteWorkspaceOperationError("remote snapshot entries are invalid")
-    if not bool(manifest.get("complete")):
-        raise RemoteWorkspaceOperationError(
-            "remote snapshot is partial or unstable; refusing local review/finalization"
-        )
-    if len(entries) > max(1, int(max_files)):
-        raise RemoteWorkspaceOperationError("remote snapshot exceeds the file limit")
-    declared_total = int(manifest.get("total_bytes") or 0)
-    if declared_total > max(1, int(max_bytes)):
-        raise RemoteWorkspaceOperationError("remote snapshot exceeds the byte limit")
-
-    service = get_remote_workspace_service()
-    if service is None:
-        raise RemoteWorkspaceOperationError("remote workspace broker is unavailable")
-    temp_root = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-remote-snapshot-"))
-    materialized = temp_root / "workspace"
-    materialized.mkdir()
-    consumed = 0
-    canonical_entries: list[dict[str, Any]] = []
-    try:
-        for raw in entries:
-            if not isinstance(raw, dict):
-                raise RemoteWorkspaceOperationError("remote snapshot row is invalid")
-            rel = str(raw.get("path") or "").replace("\\", "/")
-            parts = [part for part in rel.split("/") if part not in {"", "."}]
-            if not parts or any(part == ".." for part in parts):
-                raise RemoteWorkspaceOperationError("remote snapshot path is unsafe")
-            target = materialized.joinpath(*parts)
-            resolved_parent = target.parent.resolve(strict=False)
-            if not path_is_relative_to(resolved_parent, materialized):
-                raise RemoteWorkspaceOperationError("remote snapshot path escapes materialization")
-            digest = str(raw.get("sha256") or "")
-            size = int(raw.get("size") or 0)
-            if not digest or size < 0:
-                raise RemoteWorkspaceOperationError("remote snapshot blob declaration is invalid")
-            consumed += size
-            if consumed > max(1, int(max_bytes)):
-                raise RemoteWorkspaceOperationError("remote snapshot exceeds the byte limit")
-            data = service.fetch_blob(
-                workspace_ref,
-                digest,
-                max_bytes=size,
-                task_id=_subject_task_id(subject),
-            )
-            if not isinstance(data, bytes) or len(data) != size:
-                raise RemoteWorkspaceOperationError("remote snapshot blob size mismatch")
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise RemoteWorkspaceOperationError("remote snapshot blob digest mismatch")
-            kind = str(raw.get("kind") or "file")
-            if kind == "symlink":
-                target.parent.mkdir(parents=True, exist_ok=True)
-                link_target = data.decode("utf-8", errors="surrogateescape")
-                if pathlib.Path(link_target).is_absolute() or not path_is_relative_to(
-                    (target.parent / link_target).resolve(strict=False),
-                    materialized,
-                ):
-                    raise RemoteWorkspaceOperationError(
-                        "remote snapshot symlink escapes materialization"
-                    )
-                os.symlink(
-                    link_target,
-                    target,
-                )
-            elif kind == "file":
-                _atomic_materialized_write(target, data)
-                try:
-                    os.chmod(target, int(raw.get("mode") or 0o600) & 0o777)
-                except OSError:
-                    pass
-            else:
-                raise RemoteWorkspaceOperationError("remote snapshot file kind is invalid")
-            canonical_entries.append(
-                {
-                    "path": "/".join(parts),
-                    "kind": kind,
-                    "sha256": digest,
-                    "size": size,
-                    "mode": int(raw.get("mode") or 0) & 0o777,
-                }
-            )
-        canonical_entries.sort(key=lambda row: row["path"])
-        encoded = json.dumps(
-            canonical_entries,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        actual_fingerprint = hashlib.sha256(encoded).hexdigest()
-        if actual_fingerprint != str(manifest.get("content_fingerprint") or ""):
-            raise RemoteWorkspaceOperationError(
-                "remote snapshot content fingerprint mismatch"
-            )
-        return RemoteWorkspaceSnapshot(
-            root=materialized,
-            manifest=dict(manifest),
-            _cleanup_root=temp_root,
-        )
-    except Exception:
-        shutil.rmtree(temp_root, ignore_errors=True)
-        raise
-
-
-def _atomic_materialized_write(path: pathlib.Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
 
 
 def normalize_executor_ref(raw: dict[str, Any]) -> ExecutorRef | None:

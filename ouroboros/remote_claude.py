@@ -64,6 +64,7 @@ def run_remote_claude_edit(
         _git(mirror, ["add", "-A"])
         _git(mirror, ["commit", "-qm", "remote snapshot", "--allow-empty"])
         before = _content_manifest(mirror)
+        omission_note = _snapshot_omission_note(snapshot.manifest)
         result = run_edit(
             prompt=prompt,
             cwd=str(mirror),
@@ -113,6 +114,9 @@ def run_remote_claude_edit(
                     ),
                     "patch_blob_id": patch_id,
                     "changes": changes,
+                    "_protected_paths": list(
+                        snapshot.manifest.get("protected_paths") or []
+                    ),
                 },
                 blobs={patch_id: patch},
             )
@@ -123,6 +127,10 @@ def run_remote_claude_edit(
                     envelope=envelope,
                 )
         validation_summary = _remote_validation(ctx) if validate else ""
+        if omission_note:
+            validation_summary = "\n".join(
+                part for part in (omission_note, validation_summary) if part
+            )
         return RemoteClaudeOutcome(
             result=result,
             source_fingerprint=source_fingerprint,
@@ -131,6 +139,31 @@ def run_remote_claude_edit(
             apply_trace=apply_trace,
             validation_summary=validation_summary,
         )
+
+
+def _snapshot_omission_note(manifest: dict[str, Any]) -> str:
+    exclusions = [
+        row
+        for row in list(manifest.get("exclusions") or [])
+        if isinstance(row, dict)
+        and str(row.get("reason") or "")
+        in {"protected_artifact", "sensitive_file"}
+    ]
+    if not exclusions:
+        return ""
+    rendered = ", ".join(
+        f"{row.get('path')} ({row.get('reason')})"
+        for row in exclusions[:20]
+    )
+    suffix = (
+        f"; +{len(exclusions) - 20} more"
+        if len(exclusions) > 20
+        else ""
+    )
+    return (
+        "NOTICE: remote review used a policy-filtered snapshot; omitted "
+        f"{rendered}{suffix}."
+    )
 
 def _assert_mirror_head_unchanged(root: pathlib.Path) -> None:
     if _git_text(root, ["rev-list", "--count", "HEAD"]) != "1":

@@ -389,6 +389,19 @@ def test_schedules_api_validates_five_field_cron(tmp_path):
         "task": {"text": "nope", "metadata": {"delegation_role": "subagent"}},
     })
     assert nested_reserved.status_code == 400
+    project = client.post("/api/schedules", json={
+        "id": "project-task",
+        "name": "project-task",
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "task": {"text": "project work", "project_id": "project-1"},
+    })
+    assert project.status_code == 200
+    nested_project = client.post("/api/schedules", json={
+        "name": "bad-project-metadata",
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "task": {"text": "nope", "metadata": {"project_id": "project-1"}},
+    })
+    assert nested_project.status_code == 400
     nested_actor = client.post("/api/schedules", json={
         "name": "bad-actor",
         "trigger": {"type": "cron", "expr": "* * * * *"},
@@ -414,6 +427,7 @@ def test_schedules_api_validates_five_field_cron(tmp_path):
     })
     assert bad_id.status_code == 400
     assert client.delete("/api/schedules/ok").json()["ok"] is True
+    assert client.delete("/api/schedules/project-task").json()["ok"] is True
     assert client.get("/api/schedules").json()["tasks"] == []
 
 
@@ -567,6 +581,7 @@ def test_frontend_evolution_and_consciousness_controls_are_present():
 
     root = Path(__file__).resolve().parents[1]
     evolution = (root / "web" / "modules" / "evolution.js").read_text(encoding="utf-8")
+    activity = (root / "web" / "modules" / "activity.js").read_text(encoding="utf-8")
     settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
     settings = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
 
@@ -580,6 +595,8 @@ def test_frontend_evolution_and_consciousness_controls_are_present():
     assert "s-model-consciousness" in settings_ui
     assert "s-local-consciousness" in settings_ui
     assert "OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'" in settings
+    assert "schedule.task?.project_id" in activity
+    assert "· project ${projectId}" in activity
 
 
 def test_evolution_checkpoint_records_and_reads(tmp_path):

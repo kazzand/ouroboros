@@ -43,6 +43,24 @@ def close_materialized_plan_snapshot(ctx: Any) -> None:
             pass
 
 
+def snapshot_omission_rows(ctx: Any) -> list[dict[str, str]]:
+    snapshot = getattr(ctx, "_remote_plan_review_snapshot", None)
+    manifest = getattr(snapshot, "manifest", {})
+    if not isinstance(manifest, dict):
+        return []
+    return [
+        {
+            "section": "remote_workspace_snapshot",
+            "path": str(row.get("path") or ""),
+            "reason": str(row.get("reason") or ""),
+        }
+        for row in list(manifest.get("exclusions") or [])[:100]
+        if isinstance(row, dict)
+        and str(row.get("reason") or "")
+        in {"protected_artifact", "sensitive_file"}
+    ]
+
+
 def remote_snapshot_lifecycle(
     function: Callable[..., Awaitable[_T]],
 ) -> Callable[..., Awaitable[_T]]:

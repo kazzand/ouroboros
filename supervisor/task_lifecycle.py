@@ -710,6 +710,12 @@ def complete_requested_admission(
                 if str(written.get("status") or "") != STATUS_FAILED:
                     q.persist_queue_snapshot(reason="remote_admission_terminal_cleanup")
                     return {"ok": False, "status": "stale", "task_id": task_id}
+                _record_completed_scheduled_admission(
+                    q,
+                    task,
+                    succeeded=False,
+                    reason_code=reason_code if error else blocked,
+                )
             except Exception as exc:
                 _rollback_admission_transition(
                     q,
@@ -754,6 +760,7 @@ def complete_requested_admission(
             if str(written.get("status") or "") != STATUS_SCHEDULED:
                 raise RuntimeError("scheduled task-result transition was rejected")
             q.persist_queue_snapshot(reason="remote_admission_scheduled", required=True)
+            _record_completed_scheduled_admission(q, task, succeeded=True)
         except Exception as exc:
             _rollback_admission_transition(
                 q,
@@ -861,25 +868,44 @@ def record_scheduled_admission(
     """Project a cron dispatch refusal into terminal task/schedule state."""
     q = _queue_module()
     block = (
-        str(admitted.get("_admission_blocked") or "")
+        str(
+            admitted.get("_admission_blocked")
+            or (
+                admitted.get("reason_code")
+                if admitted.get("ok") is False
+                else ""
+            )
+            or (
+                admitted.get("error")
+                if admitted.get("ok") is False
+                else ""
+            )
+            or ""
+        )
         if isinstance(admitted, dict)
         else ""
     )
     if not block:
         record["failure_count"] = int(record.get("failure_count") or 0)
+        if isinstance(admitted, dict) and admitted.get("placement") == "remote":
+            return
         record["last_error"] = ""
         return
     detail = f"Scheduled task was not queued: {block}."
     try:
         from ouroboros.task_results import STATUS_FAILED, write_task_result
 
-        write_task_result(
-            q.DRIVE_ROOT,
-            str(task["id"]),
-            STATUS_FAILED,
+        result_fields = _task_result_fields(task)
+        result_fields.update(
             result=detail,
             reason_code=block,
             cost_usd=0.0,
+        )
+        write_task_result(
+            pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT),
+            str(task["id"]),
+            STATUS_FAILED,
+            **result_fields,
         )
     except Exception:
         q.log.warning(
@@ -889,6 +915,51 @@ def record_scheduled_admission(
         )
     record["failure_count"] = int(record.get("failure_count") or 0) + 1
     record["last_error"] = detail
+
+
+def _record_completed_scheduled_admission(
+    q: Any,
+    task: Dict[str, Any],
+    *,
+    succeeded: bool,
+    reason_code: str = "",
+) -> None:
+    """Update only the schedule fire that still owns this async admission."""
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    schedule_id = str(metadata.get("schedule_id") or "").strip()
+    task_id = str(task.get("id") or "").strip()
+    if not schedule_id or not task_id:
+        return
+    try:
+        data = q.list_scheduled_tasks()
+        changed = False
+        for record in data.get("tasks") or []:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("id") or "") != schedule_id:
+                continue
+            if str(record.get("last_task_id") or "") != task_id:
+                return
+            record["failure_count"] = int(record.get("failure_count") or 0)
+            if succeeded:
+                record["last_error"] = ""
+            else:
+                record["failure_count"] += 1
+                code = str(reason_code or "remote_admission_failed")
+                record["last_error"] = (
+                    f"Remote scheduled admission failed: {code}."
+                )
+            changed = True
+            break
+        if changed:
+            q._write_scheduled_tasks(data)
+    except Exception:
+        q.log.warning(
+            "Failed to update schedule outcome for remote task %s",
+            task_id,
+            exc_info=True,
+        )
 
 
 def transition_acceptance_fence(

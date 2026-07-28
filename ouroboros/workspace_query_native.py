@@ -34,7 +34,10 @@ from ouroboros.workspace_diagnostics import (
     ToolExecutionEnvelope,
 )
 from ouroboros.workspace_native_contract import NativeOperationResult
-from ouroboros.workspace_snapshot_native import snapshot_workspace
+from ouroboros.workspace_snapshot_native import (
+    snapshot_integrity_ready,
+    snapshot_workspace,
+)
 
 QUERY_OPERATION_ORDER = (
     "relevant_files",
@@ -420,14 +423,21 @@ def git_workspace(
     workspace_root: pathlib.Path | str,
     args: Mapping[str, Any],
     subcommand: list[str],
+    *,
+    excluded_paths: tuple[str, ...] = (),
 ) -> ToolExecutionEnvelope:
     """Run one bounded read-only Git projection with public VCS rendering."""
 
     root = pathlib.Path(workspace_root).resolve(strict=True)
     path = _relative_scope(root, args.get("path"))
     cmd = ["git", *subcommand]
-    if path:
-        cmd.extend(["--", path])
+    if path or excluded_paths:
+        cmd.extend(["--", path or "."])
+        cmd.extend(
+            f":(exclude,literal){item}"
+            for item in sorted(set(excluded_paths))
+            if item
+        )
     proc = subprocess.run(
         cmd,
         cwd=str(root),
@@ -463,6 +473,51 @@ def git_workspace(
         text=text,
         process=process,
         trace={"completion": "complete"},
+    )
+
+
+def execute_git_workspace_operation(
+    root: pathlib.Path,
+    operation: str,
+    args: Mapping[str, Any],
+    native_facts: Mapping[str, Any],
+) -> NativeOperationResult:
+    excluded = tuple(native_facts.get("protected_paths") or ())
+    if operation == "vcs_status":
+        return NativeOperationResult(
+            git_workspace(
+                root,
+                args,
+                ["status", "--porcelain"],
+                excluded_paths=excluded,
+            )
+        )
+    if bool(args.get("artifact_export", False)):
+        return export_workspace_patch(
+            root,
+            args,
+            protected_paths=excluded,
+        )
+    if bool(args.get("recent_commit", False)):
+        subcommand = [
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--stat",
+            "-p",
+            "HEAD",
+        ]
+    else:
+        subcommand = ["diff"]
+        if bool(args.get("staged", False)):
+            subcommand.append("--staged")
+        if bool(args.get("name_only", False)):
+            subcommand.append("--name-only")
+        elif bool(args.get("stat", False)):
+            subcommand.append("--stat")
+    return NativeOperationResult(
+        git_workspace(root, args, subcommand, excluded_paths=excluded)
     )
 
 
@@ -509,8 +564,15 @@ def _sensitive_patch_path(rel: str) -> bool:
 def export_workspace_patch(
     root: pathlib.Path,
     args: Mapping[str, Any],
+    *,
+    protected_paths: tuple[str, ...] = (),
 ) -> NativeOperationResult:
-    before, _ = snapshot_workspace(root)
+    before, _ = snapshot_workspace(
+        root,
+        protected_paths=protected_paths,
+    )
+    if not snapshot_integrity_ready(before):
+        raise RuntimeError("remote workspace snapshot is partial or unstable")
     expected_head = str(args.get("expected_head") or "")
     current_head = _git_bytes(
         root,
@@ -540,7 +602,7 @@ def export_workspace_patch(
         for item in _git_bytes(
             root,
             [
-                "diff", "--name-only", "-z", "--no-ext-diff",
+                "diff", "--name-only", "--no-renames", "-z", "--no-ext-diff",
                 "--no-textconv", "--no-color", base_ref, "--",
             ],
         ).split(b"\0")
@@ -579,18 +641,33 @@ def export_workspace_patch(
                 pass
         kept_untracked.append(rel)
     untracked = kept_untracked
+    omitted_paths = tuple(
+        str(row.get("path") or "")
+        for row in list(before.get("policy_exclusions") or [])
+        if isinstance(row, dict) and str(row.get("path") or "")
+    )
+    protected = sorted(
+        rel
+        for rel in {*tracked, *untracked}
+        if _path_matches_any(rel, (*protected_paths, *omitted_paths))
+    )
     sensitive = sorted(
         rel for rel in {*tracked, *untracked} if _sensitive_patch_path(rel)
     )
-    if sensitive:
+    if sensitive or protected:
         return NativeOperationResult(
             ToolExecutionEnvelope(
-                text="⚠️ REMOTE_PATCH_SENSITIVE_FILES: refusing patch export.",
+                text=(
+                    "⚠️ REMOTE_PATCH_PROTECTED_FILES: refusing patch export."
+                    if protected
+                    else "⚠️ REMOTE_PATCH_SENSITIVE_FILES: refusing patch export."
+                ),
                 trace={
                     "completion": "complete",
                     "patch_export": {
                         "status": "failed",
                         "sensitive_blocked": sensitive,
+                        "protected_blocked": protected,
                         "snapshot_fingerprint": before["fingerprint"],
                     },
                 },
@@ -620,7 +697,14 @@ def export_workspace_patch(
     patch_bytes = b"\n".join(chunks)
     if len(patch_bytes) > _PATCH_MAX_BYTES:
         raise ValueError("remote workspace patch exceeds export limit")
-    after, _ = snapshot_workspace(root)
+    after, _ = snapshot_workspace(
+        root,
+        protected_paths=protected_paths,
+    )
+    if not snapshot_integrity_ready(after):
+        raise RuntimeError(
+            "remote workspace snapshot became partial or unstable"
+        )
     if before["fingerprint"] != after["fingerprint"]:
         raise RuntimeError("remote workspace changed while patch was exported")
     digest = hashlib.sha256(patch_bytes).hexdigest() if patch_bytes else ""
@@ -643,6 +727,7 @@ def export_workspace_patch(
         "untracked_included": untracked,
         "scratch_excluded": scratch_excluded,
         "sensitive_blocked": [],
+        "protected_blocked": [],
         "patch_size": len(patch_bytes),
         "sha256": digest,
         "snapshot_fingerprint": before["fingerprint"],
@@ -654,6 +739,14 @@ def export_workspace_patch(
             trace={"completion": "complete", "patch_export": export},
         ),
         {digest: patch_bytes} if patch_bytes else {},
+    )
+
+
+def _path_matches_any(path: str, denied_paths: tuple[str, ...]) -> bool:
+    return any(
+        path == denied or path.startswith(denied + "/")
+        for denied in denied_paths
+        if denied
     )
 
 

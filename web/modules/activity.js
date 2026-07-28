@@ -183,7 +183,8 @@ export function initActivity({ mount, ws } = {}) {
             const next = esc(schedule.next_run_at || '');
             const enabled = schedule.enabled !== false;
             const id = esc(schedule.id || '');
-            const sub = `${cron}${next ? ` · next ${next}` : ''}${managed && schedule.skill ? ` · ${esc(schedule.skill)}` : ''}`;
+            const projectId = esc(schedule.task?.project_id || '');
+            const sub = `${cron}${next ? ` · next ${next}` : ''}${projectId ? ` · project ${projectId}` : ''}${managed && schedule.skill ? ` · ${esc(schedule.skill)}` : ''}`;
             const actions = managed
                 ? '<span class="activity-tag">managed by skill</span>'
                 : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}">${enabled ? 'Disable' : 'Enable'}</button>

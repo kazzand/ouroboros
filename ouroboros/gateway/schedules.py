@@ -50,6 +50,22 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
         if RESERVED_TEMPLATE_FIELDS & set(metadata):
             return json_error("scheduled task template metadata cannot include reserved lineage/workspace fields", 400)
+        if "project_id" in metadata:
+            return json_error(
+                "scheduled task project_id must be a top-level task field, not metadata",
+                400,
+            )
+        if "project_id" in task:
+            from ouroboros.project_facts import explicit_project_id_ok
+
+            raw_project_id = task.get("project_id")
+            if not isinstance(raw_project_id, str) or not explicit_project_id_ok(
+                raw_project_id
+            ):
+                return json_error(
+                    "scheduled task project_id must be a filesystem-safe non-empty string",
+                    400,
+                )
         if str(task.get("type") or "task") != "task":
             return json_error("scheduled task templates must use type='task'", 400)
         if "priority" in task:

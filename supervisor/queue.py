@@ -434,6 +434,15 @@ def _schedule_running_or_queued(schedule_id: str) -> bool:
         task_meta = task.get("metadata") if isinstance(task, dict) and isinstance(task.get("metadata"), dict) else {}
         if str(task_meta.get("schedule_id") or "") == schedule_id:
             return True
+    for row in list_requested_admissions():
+        task = row.get("task") if isinstance(row.get("task"), dict) else {}
+        task_meta = (
+            task.get("metadata")
+            if isinstance(task.get("metadata"), dict)
+            else {}
+        )
+        if str(task_meta.get("schedule_id") or "") == schedule_id:
+            return True
     return False
 
 
@@ -463,6 +472,8 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("attachments", "context", "expected_output", "constraints", "deadline_at"):
         if key in template:
             task[key] = template[key]
+    if "project_id" in template:
+        task["project_id"] = template.get("project_id")
     allowed_resources = normalize_allowed_resources(template.get("allowed_resources") or metadata.get("allowed_resources") or {})
     if allowed_resources:
         task["allowed_resources"] = allowed_resources
@@ -532,31 +543,15 @@ def check_scheduled_tasks() -> None:
             if next_run > now:
                 continue
             task = _task_from_schedule(record)
-            try:
-                from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+            from supervisor.scheduled_dispatch import dispatch_scheduled_task
 
-                write_task_result(
-                    DRIVE_ROOT,
-                    str(task["id"]),
-                    STATUS_SCHEDULED,
-                    root_task_id=str(task["id"]),
-                    actor_id="scheduler",
-                    delegation_role="root",
-                    description=str(task.get("description") or task.get("text") or ""),
-                    expected_output=str(task.get("expected_output") or ""),
-                    constraints=str(task.get("constraints") or ""),
-                    context=str(task.get("context") or ""),
-                    allowed_resources=task.get("allowed_resources") if isinstance(task.get("allowed_resources"), dict) else {},
-                    deadline_at=str(task.get("deadline_at") or ""),
-                    task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
-                    result="Scheduled task queued.",
-                    metadata=dict(task.get("metadata") or {}),
-                    schedule_id=schedule_id,
-                    schedule_name=str(record.get("name") or ""),
-                )
-            except Exception:
-                log.debug("Failed to persist scheduled task result before enqueue", exc_info=True)
-            admitted = enqueue_task(task)
+            admitted = dispatch_scheduled_task(
+                task,
+                drive_root=DRIVE_ROOT,
+                schedule_id=schedule_id,
+                schedule_name=str(record.get("name") or ""),
+                enqueue=enqueue_task,
+            )
             record["last_run_at"] = now.isoformat()
             record["last_task_id"] = task["id"]
             record_scheduled_admission(task, admitted, record)

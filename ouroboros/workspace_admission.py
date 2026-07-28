@@ -252,3 +252,89 @@ def bounded_workspace_preflight(workspace_root: Any, *, timeout_sec: float = 8.0
             "error": f"preflight exceeded {timeout_sec:.0f}s cap at admission; snapshot skipped (disclosed)",
         }
     return dict(result["summary"])
+
+
+def prepare_local_project_task(
+    task: dict,
+    *,
+    drive_root: Any,
+    system_repo_dir: Any,
+    project_id: str,
+) -> dict:
+    """Apply Project workspace and isolated-memory parity to a non-HTTP root."""
+
+    from ouroboros.contracts.task_contract import attach_task_contract
+    from ouroboros.headless import prepare_task_drive, remove_subagent_task_drive
+
+    resolved_workspace, workspace_error = resolve_room_workspace(
+        drive_root=drive_root,
+        system_repo_dir=system_repo_dir,
+        project_id=project_id,
+    )
+    if workspace_error:
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "project_workspace_unusable",
+            "error": workspace_error,
+        }
+    try:
+        child_drive = prepare_task_drive(
+            pathlib.Path(drive_root),
+            str(task.get("id") or ""),
+            "forked",
+            project_id=project_id,
+        )
+    except Exception:
+        remove_subagent_task_drive(
+            pathlib.Path(drive_root), str(task.get("id") or "")
+        )
+        child_drive = None
+    if child_drive is None:
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "local_child_drive_failed",
+        }
+    metadata = task.setdefault("metadata", {})
+    task["drive_root"] = str(child_drive)
+    task["child_drive_root"] = str(child_drive)
+    task["budget_drive_root"] = str(pathlib.Path(drive_root))
+    metadata["child_drive_root"] = str(child_drive)
+    metadata["budget_drive_root"] = str(pathlib.Path(drive_root))
+    try:
+        if resolved_workspace:
+            task["workspace_root"] = resolved_workspace
+            task["workspace_mode"] = "external"
+            task["memory_mode"] = "forked"
+            preflight = bounded_workspace_preflight(resolved_workspace)
+            metadata["workspace_root"] = resolved_workspace
+            metadata["workspace_preflight"] = preflight
+            text = str(task.get("text") or "")
+            if not (
+                "[HEADLESS_WORKSPACE]" in text
+                and "[END_HEADLESS_WORKSPACE]" in text
+            ):
+                task["text"] = (
+                    f"{text}\n\n[HEADLESS_WORKSPACE]\n"
+                    + compose_workspace_block(
+                        workspace_root=resolved_workspace,
+                        workspace_mode="external",
+                        memory_mode="forked",
+                        workspace_preflight=preflight,
+                    )
+                    + "[END_HEADLESS_WORKSPACE]"
+                )
+        else:
+            task.setdefault("memory_mode", "shared")
+        attach_task_contract(task)
+    except Exception:
+        remove_subagent_task_drive(
+            pathlib.Path(drive_root), str(task.get("id") or "")
+        )
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "local_project_preparation_failed",
+        }
+    return {"ok": True, "placement": "local", "task": task}

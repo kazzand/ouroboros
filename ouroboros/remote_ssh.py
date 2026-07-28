@@ -1,7 +1,6 @@
 """Private OpenSSH transport and atomic execd bootstrap implementation."""
 
 from __future__ import annotations
-
 import fnmatch
 import concurrent.futures
 import hashlib
@@ -25,7 +24,16 @@ from ouroboros.platform_layer import (
     kill_process_tree,
 )
 from ouroboros.process_custody import spawn_supervised
-from ouroboros.remote_finalization import reconcile_remote_operations
+from ouroboros.remote_finalization import (
+    _complete_transport_import,
+    _remove_transport_pending,
+    reconcile_remote_operations,
+)
+from ouroboros.remote_pending_operations import (
+    bind_transport_intent,
+    restore_transport_tracking,
+    validate_transport_session_identity,
+)
 from ouroboros.remote_protocol import (
     MAX_BULK_BYTES,
     MAX_PREAMBLE_BYTES,
@@ -336,8 +344,10 @@ class OpenSSHExecdTransport:
         self._handshake: dict[str, Any] | None = None
         self._last_reconciliation: list[dict[str, Any]] = []
         self._active_tasks: set[str] = set()
-        self._known_operations: dict[tuple[str, str], str] = {}
-        self._operation_contexts: dict[tuple[str, str], dict[str, Any]] = {}
+        (
+            self._known_operations,
+            self._operation_contexts,
+        ) = restore_transport_tracking(request)
         self._downloads: dict[str, dict[str, Any]] = {}
         self._download_current = ""
         self._download_lock = threading.Lock()
@@ -534,7 +544,12 @@ class OpenSSHExecdTransport:
             self._operation_contexts = contexts
         contexts[key] = {
             "task_id": task_id,
+            "operation_id": operation_id,
+            "tool": str(message["tool"]),
+            "import_kind": "",
+            "import_context": {},
             "validator": None,
+            "pending_record": None,
         }
         return result
 
@@ -544,16 +559,24 @@ class OpenSSHExecdTransport:
         operation_id = str(message["operation_id"])
         prepared_hash = str(message["prepared_hash"])
         key = (request_id, operation_id)
-        contexts = getattr(self, "_operation_contexts", None)
-        if contexts is None:
-            contexts = {}
-            self._operation_contexts = contexts
-        context = contexts.setdefault(
-            key,
-            {"task_id": str(message.get("task_id") or ""), "validator": None},
+        known = getattr(self, "_known_operations", None)
+        if known is None:
+            known = {key: prepared_hash}
+            self._known_operations = known
+        if known.get(key) != prepared_hash:
+            raise _error(
+                "prepared_identity_mismatch",
+                "Home lost the exact prepared operation identity.",
+                phase="authorize",
+                completion="not_started",
+            )
+        context = bind_transport_intent(
+            self,
+            message,
+            request_id=request_id,
+            operation_id=operation_id,
+            prepared_hash=prepared_hash,
         )
-        context["task_id"] = str(message.get("task_id") or "")
-        context["validator"] = message.get("_home_completion_validator")
         self._renew_lease(str(message.get("task_id") or ""))
         self._send(
             "continue",
@@ -600,12 +623,13 @@ class OpenSSHExecdTransport:
                 result,
                 self.fetch_blob,
             )
-            validator = context.get("validator")
-            if not callable(validator):
-                raise RuntimeError("Home completion validator is unavailable")
-            envelope = validator(result, envelope, fetched)
-            if not isinstance(envelope, dict):
-                raise RuntimeError("Home completion validator returned a non-object")
+            envelope = _complete_transport_import(
+                self,
+                context,
+                result,
+                envelope,
+                fetched,
+            )
         except Exception as exc:
             raise _error(
                 "remote_result_import_failed",
@@ -639,8 +663,15 @@ class OpenSSHExecdTransport:
             pass
         else:
             if ack.get("kind") == "ack":
-                self._known_operations.pop(key, None)
-                contexts.pop(key, None)
+                if _remove_transport_pending(context):
+                    self._known_operations.pop(key, None)
+                    self._operation_contexts.pop(key, None)
+                else:
+                    _LOG.warning(
+                        "Remote operation %s was ACKed but Home pending "
+                        "cleanup remains for reconciliation.",
+                        operation_id,
+                    )
         return envelope
 
     def abort_prepared(self, message: Mapping[str, Any]) -> bool:
@@ -653,9 +684,14 @@ class OpenSSHExecdTransport:
         )
         self._wait_control(lambda row: row.get("kind") == "ack" and row.get("ack_seq") == sequence)
         key = (str(message["request_id"]), str(message["operation_id"]))
-        self._known_operations.pop(key, None)
         contexts = getattr(self, "_operation_contexts", None)
-        if contexts is not None:
+        context = contexts.get(key, {}) if contexts is not None else {}
+        if not isinstance(context.get("pending_record"), Mapping):
+            self._known_operations.pop(key, None)
+        if contexts is not None and not isinstance(
+            context.get("pending_record"),
+            Mapping,
+        ):
             contexts.pop(key, None)
         return True
 
@@ -727,6 +763,7 @@ class OpenSSHExecdTransport:
             try:
                 if not live:
                     self._start_session(timeout_sec=timeout_sec)
+                    validate_transport_session_identity(self)
                 rows = reconcile_remote_operations(
                     self,
                     ack_timeout_sec=_ACK_TIMEOUT_SEC,
@@ -953,6 +990,7 @@ class OpenSSHExecdTransport:
             self.bootstrap()
             try:
                 self._start_session()
+                validate_transport_session_identity(self)
                 rows = reconcile_remote_operations(
                     self,
                     ack_timeout_sec=_ACK_TIMEOUT_SEC,

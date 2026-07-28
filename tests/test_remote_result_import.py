@@ -413,17 +413,14 @@ def test_broker_home_completion_keeps_artifacts_wire_canonical(tmp_path):
 
     class Transport:
         def execute_prepared(self, message):
-            return message["_home_completion_validator"](
-                {},
-                {
-                    "text": "ok",
-                    "diagnostic": None,
-                    "process": None,
-                    "artifacts": [],
-                    "trace": {"completion": "complete"},
-                },
-                {},
-            )
+            assert message["_home_import_kind"] == "task_result_v1"
+            return {
+                "text": "ok",
+                "diagnostic": None,
+                "process": None,
+                "artifacts": [],
+                "trace": {"completion": "complete"},
+            }
 
     session = SimpleNamespace(
         key=("connection-1", "project-1", "workspace-1", "generation-1"),
@@ -559,7 +556,7 @@ def test_broker_binds_inherited_tasks_before_execute_and_blob_fetch():
         )
 
 
-def test_every_completed_result_requires_home_validation_before_ack():
+def test_every_remote_continue_requires_closed_home_import_contract():
     stdout = b"plain"
     stderr = b""
     result = _process_result(stdout, stderr)
@@ -581,7 +578,8 @@ def test_every_completed_result_requires_home_validation_before_ack():
             }
         )
 
-    assert caught.value.code == "remote_result_import_failed"
+    assert isinstance(caught.value, ValueError)
+    assert "continue" not in events
     assert "ack" not in events
 
 

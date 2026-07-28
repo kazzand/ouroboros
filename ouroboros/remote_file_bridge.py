@@ -30,6 +30,7 @@ class RemoteFileBridge:
     origin: str
     url: str
     token: str
+    omitted_count: int
     _server: http.server.ThreadingHTTPServer
     _thread: threading.Thread
 
@@ -44,18 +45,44 @@ class RemoteFileBridge:
         )
         snapshot = materialize_remote_workspace_snapshot(subject)
         try:
+            snapshot_manifest = getattr(snapshot, "manifest", {})
+            snapshot_manifest = (
+                snapshot_manifest
+                if isinstance(snapshot_manifest, dict)
+                else {}
+            )
+            for row in list(
+                snapshot_manifest.get("policy_exclusions") or []
+            ):
+                if not isinstance(row, dict):
+                    continue
+                omitted = str(row.get("path") or "")
+                if (
+                    relative.as_posix() == omitted
+                    or relative.as_posix().startswith(omitted + "/")
+                ):
+                    raise RemoteFileBridgeError(
+                        "remote file target is excluded by snapshot policy"
+                    )
             target = snapshot.root.joinpath(*relative.parts)
             resolved = target.resolve(strict=True)
             resolved.relative_to(snapshot.root.resolve(strict=True))
             if not resolved.is_file():
                 raise RemoteFileBridgeError("remote file target is not a file")
             assets = _load_assets(snapshot.root)
+            omitted_count = sum(
+                1
+                for row in list(snapshot_manifest.get("exclusions") or [])
+                if isinstance(row, dict)
+                and str(row.get("reason") or "")
+                in {"protected_artifact", "sensitive_file"}
+            )
             if relative.as_posix() not in assets:
                 raise RemoteFileBridgeError("remote file target exceeds bridge limits")
         finally:
             snapshot.close()
         token = secrets.token_urlsafe(32)
-        handler = _handler_factory(assets, token)
+        handler = _handler_factory(assets, token, omitted_count)
         try:
             server = http.server.ThreadingHTTPServer(
                 ("127.0.0.1", 0),
@@ -77,6 +104,7 @@ class RemoteFileBridge:
             origin=origin,
             url=f"{origin}/{token}/{path}",
             token=token,
+            omitted_count=omitted_count,
             _server=server,
             _thread=thread,
         )
@@ -113,6 +141,7 @@ def _remote_relative_path(remote_url: str, remote_root: str) -> pathlib.PurePosi
 def _handler_factory(
     assets: dict[str, tuple[bytes, str]],
     token: str,
+    omitted_count: int,
 ) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "OuroborosRemoteFile/1"
@@ -150,6 +179,14 @@ def _handler_factory(
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header(
+                "X-Ouroboros-Snapshot-Completeness",
+                "partial" if omitted_count else "complete",
+            )
+            self.send_header(
+                "X-Ouroboros-Snapshot-Omissions",
+                str(omitted_count),
+            )
             self.end_headers()
             if include_body:
                 self.wfile.write(data)

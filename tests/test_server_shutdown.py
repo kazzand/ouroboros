@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 
@@ -22,6 +24,9 @@ def test_remote_broker_initialization_uses_generation_and_registry_manifest(
     import server
 
     calls = []
+    recover_started = threading.Event()
+    recover_release = threading.Event()
+    recover_finished = threading.Event()
 
     class FakeRegistry:
         def __init__(self, *, repo_dir, drive_root):
@@ -39,7 +44,10 @@ def test_remote_broker_initialization_uses_generation_and_registry_manifest(
             calls.append(("start",))
 
         def recover(self):
+            recover_started.set()
+            recover_release.wait(timeout=1)
             calls.append(("recover",))
+            recover_finished.set()
             return []
 
     set_values = []
@@ -59,9 +67,15 @@ def test_remote_broker_initialization_uses_generation_and_registry_manifest(
     execd_bundle_dir = tmp_path / "immutable-bundle" / "assets" / "execd"
     monkeypatch.setenv("OUROBOROS_EXECD_BUNDLE_DIR", str(execd_bundle_dir))
 
+    started = time.monotonic()
     service = server._initialize_remote_workspace_service(tmp_path)
+    elapsed = time.monotonic() - started
 
     assert isinstance(service, FakeBroker)
+    assert elapsed < 0.5
+    assert recover_started.wait(timeout=1)
+    recover_release.set()
+    assert recover_finished.wait(timeout=1)
     assert calls[0] == ("registry", server.REPO_DIR, tmp_path)
     assert calls[1] == ("manifest", server.REPO_DIR)
     assert calls[2][0] == "broker"

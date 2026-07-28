@@ -1292,3 +1292,227 @@ def test_guarded_remote_patch_requires_exact_snapshot_and_blob_digest(tmp_path):
     )
     assert applied.envelope.text.startswith("OK:")
     assert (target / "file.txt").read_text() == "after\n"
+
+
+def test_guarded_patch_rejects_integrity_partial_source_with_same_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros import workspace_snapshot_native
+
+    target = tmp_path / "remote"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    (target / "file.txt").write_text("before\n")
+    snapshot, blobs = workspace_snapshot_native.snapshot_workspace(target)
+    partial = dict(snapshot)
+    partial.update(
+        complete=False,
+        materializable=False,
+        integrity_complete=False,
+        failures=[{"path": "ignored", "reason": "entry_read_error"}],
+        failure_count=1,
+    )
+    monkeypatch.setattr(
+        workspace_snapshot_native,
+        "snapshot_workspace",
+        lambda *_args, **_kwargs: (partial, blobs),
+    )
+    patch = (
+        "diff --git a/file.txt b/file.txt\n"
+        "index 90be1c4..6c72a3a 100644\n"
+        "--- a/file.txt\n"
+        "+++ b/file.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    ).encode()
+    digest = hashlib.sha256(patch).hexdigest()
+    result = workspace_snapshot_native.guarded_patch_apply(
+        target,
+        {
+            "expected_fingerprint": snapshot["fingerprint"],
+            "patch_blob_id": digest,
+            "changes": [],
+        },
+        {digest: patch},
+    )
+
+    assert result.trace["completion"] == "not_started"
+    assert "INTEGRITY_FAILED" in result.text
+    assert (target / "file.txt").read_text() == "before\n"
+
+
+def test_guarded_patch_rolls_back_integrity_partial_post_state(
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros import workspace_snapshot_native
+
+    target = tmp_path / "remote"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    (target / "file.txt").write_text("before\n")
+    before, _ = workspace_snapshot_native.snapshot_workspace(target)
+    before_row = next(
+        row for row in before["entries"] if row["path"] == "file.txt"
+    )
+    (target / "file.txt").write_text("after\n")
+    after, _ = workspace_snapshot_native.snapshot_workspace(target)
+    after_row = next(
+        row for row in after["entries"] if row["path"] == "file.txt"
+    )
+    (target / "file.txt").write_text("before\n")
+    original_snapshot = workspace_snapshot_native.snapshot_workspace
+    calls = 0
+
+    def _partial_after(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        manifest, blobs = original_snapshot(*args, **kwargs)
+        if calls == 2:
+            manifest = dict(manifest)
+            manifest.update(
+                complete=False,
+                materializable=False,
+                integrity_complete=False,
+                failures=[
+                    {"path": "ignored", "reason": "entry_read_error"}
+                ],
+                failure_count=1,
+            )
+        return manifest, blobs
+
+    monkeypatch.setattr(
+        workspace_snapshot_native,
+        "snapshot_workspace",
+        _partial_after,
+    )
+    patch = (
+        "diff --git a/file.txt b/file.txt\n"
+        "index 90be1c4..6c72a3a 100644\n"
+        "--- a/file.txt\n"
+        "+++ b/file.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    ).encode()
+    digest = hashlib.sha256(patch).hexdigest()
+    result = workspace_snapshot_native.guarded_patch_apply(
+        target,
+        {
+            "expected_fingerprint": before["fingerprint"],
+            "expected_content_fingerprint": after["content_fingerprint"],
+            "patch_blob_id": digest,
+            "changes": [
+                {
+                    "path": "file.txt",
+                    "before": before_row,
+                    "after": after_row,
+                }
+            ],
+        },
+        {digest: patch},
+    )
+
+    assert result.trace["completion"] == "not_started"
+    assert "ROLLED_BACK" in result.text
+    assert (target / "file.txt").read_text() == "before\n"
+
+
+def test_remote_patch_export_blocks_dynamic_protected_paths(tmp_path):
+    target = tmp_path / "remote"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=target,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=target,
+        check=True,
+    )
+    protected = target / "reference.bin"
+    protected.write_bytes(b"old")
+    subprocess.run(["git", "add", "reference.bin"], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=target, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    protected.write_bytes(b"PROTECTED-NEW-BYTES")
+
+    result = execute_native_operation(
+        target,
+        "vcs_diff",
+        {
+            "artifact_export": True,
+            "expected_head": head,
+            "expected_head_present": True,
+            "expected_admission_known": True,
+        },
+        native_facts={
+            "workspace_root": target.as_posix(),
+            "protected_paths": ["reference.bin"],
+        },
+    )
+
+    export = result.envelope.trace["patch_export"]
+    assert export["status"] == "failed"
+    assert export["protected_blocked"] == ["reference.bin"]
+    assert result.blobs == {}
+
+
+def test_remote_patch_export_blocks_rename_from_dynamic_protected_path(
+    tmp_path,
+):
+    target = tmp_path / "remote"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=target,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=target,
+        check=True,
+    )
+    protected = target / "reference.bin"
+    protected.write_bytes(b"protected")
+    subprocess.run(["git", "add", "reference.bin"], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=target, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    protected.rename(target / "public.bin")
+
+    result = execute_native_operation(
+        target,
+        "vcs_diff",
+        {
+            "artifact_export": True,
+            "expected_head": head,
+            "expected_head_present": True,
+            "expected_admission_known": True,
+        },
+        native_facts={
+            "workspace_root": target.as_posix(),
+            "protected_paths": ["reference.bin"],
+        },
+    )
+
+    export = result.envelope.trace["patch_export"]
+    assert export["status"] == "failed"
+    assert "reference.bin" in export["protected_blocked"]
+    assert result.blobs == {}

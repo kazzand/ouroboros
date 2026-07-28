@@ -1942,11 +1942,19 @@ def _run_startup_task_recovery(
         log.warning("Root post-task synthesis recovery at startup failed", exc_info=True)
 
 
+def _recover_remote_workspace_service(service: Any) -> None:
+    try:
+        service.recover()
+    except Exception:
+        log.warning("Remote workspace broker recovery failed", exc_info=True)
+
+
 def _initialize_remote_workspace_service(
     drive_root: pathlib.Path,
 ):
     """Create the one server-generation broker before workers recover tasks."""
 
+    service = None
     try:
         from ouroboros.process_custody import current_custody_session_id
         from ouroboros.remote_workspace import (
@@ -1973,11 +1981,21 @@ def _initialize_remote_workspace_service(
             ),
         )
         service.start()
-        service.recover()
         set_remote_workspace_service(service)
+        threading.Thread(
+            target=_recover_remote_workspace_service,
+            args=(service,),
+            daemon=True,
+            name="remote-workspace-recovery",
+        ).start()
         return service
     except Exception:
         log.warning("Remote workspace broker startup failed", exc_info=True)
+        if service is not None:
+            try:
+                service.close(timeout_sec=0)
+            except Exception:
+                pass
         try:
             from ouroboros.remote_workspace import set_remote_workspace_service
 

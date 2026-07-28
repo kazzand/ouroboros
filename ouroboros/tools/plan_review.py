@@ -808,10 +808,9 @@ def _planning_evidence_horizon(
                 refs.append({"kind": candidate.stem, "path": str(candidate)})
     omissions: list[dict] = []
     if not contract:
-        omissions.append({
-            "section": "task_contract",
-            "reason": "not_available_in_tool_context",
-        })
+        omissions.append({"section": "task_contract", "reason": "not_available_in_tool_context"})
+    from ouroboros.remote_plan_review import snapshot_omission_rows
+    omissions.extend(snapshot_omission_rows(ctx))
     payload = {
         "schema_version": 1,
         "canonical_intent": {

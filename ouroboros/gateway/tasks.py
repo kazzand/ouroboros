@@ -453,6 +453,156 @@ def submit_remote_task_admission(
     return {**registered, "submitted": True}
 
 
+def submit_project_task_admission(
+    task: dict,
+    *,
+    drive_root: object,
+    service: Any = None,
+) -> dict:
+    """Route one non-HTTP project task without inventing a second queue."""
+
+    if "project_id" not in task:
+        return {"ok": True, "placement": "local", "task": task}
+    raw_project_id = task.get("project_id")
+    from ouroboros.project_facts import explicit_project_id_ok
+
+    if not isinstance(raw_project_id, str) or not explicit_project_id_ok(
+        raw_project_id
+    ):
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "invalid_project_id",
+        }
+    project_id = raw_project_id
+    from ouroboros.projects_registry import get_reserved_project
+    from ouroboros.workspace_ref import normalize_workspace_ref
+
+    project = get_reserved_project(drive_root, project_id)
+    if not isinstance(project, dict):
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "project_not_found",
+        }
+    lifecycle = str(project.get("lifecycle") or "active")
+    if lifecycle != "active":
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "project_routing_fence",
+            "project_lifecycle": lifecycle,
+        }
+    try:
+        workspace_ref = normalize_workspace_ref(project.get("workspace_ref"))
+    except ValueError:
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "invalid_project_workspace_ref",
+        }
+    if workspace_ref is None or workspace_ref["kind"] == "local":
+        from ouroboros.config import REPO_DIR
+        from ouroboros.workspace_admission import prepare_local_project_task
+
+        return prepare_local_project_task(
+            task,
+            drive_root=drive_root,
+            system_repo_dir=REPO_DIR,
+            project_id=project_id,
+        )
+
+    metadata = task.setdefault("metadata", {})
+    task["workspace_mode"] = "external"
+    task["memory_mode"] = "forked"
+    metadata["_sealed_workspace_ref"] = dict(workspace_ref)
+    metadata["executor_ref"] = {
+        "type": "ssh_exec",
+        "id": workspace_ref["connection_id"],
+        "network": "host",
+        "workspace_id": workspace_ref["workspace_id"],
+    }
+    attach_task_contract(task)
+
+    from ouroboros.gateway.connections import get_connection
+
+    connection = get_connection(workspace_ref["connection_id"])
+    if connection is None or connection.get("lifecycle", "active") != "active":
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "remote_connection_unavailable",
+            "task": task,
+        }
+    if service is None:
+        try:
+            from ouroboros.remote_workspace import get_remote_workspace_service
+
+            service = get_remote_workspace_service()
+        except (ImportError, RuntimeError):
+            service = None
+    if service is None:
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "remote_service_unavailable",
+            "task": task,
+        }
+    try:
+        child_drive = prepare_task_drive(
+            pathlib.Path(drive_root),
+            str(task.get("id") or ""),
+            "forked",
+            project_id=project_id,
+        )
+    except Exception:
+        from ouroboros.headless import remove_subagent_task_drive
+
+        remove_subagent_task_drive(
+            pathlib.Path(drive_root), str(task.get("id") or "")
+        )
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "remote_child_drive_failed",
+        }
+    if child_drive is None:
+        return {
+            "ok": False,
+            "placement": "blocked",
+            "reason_code": "remote_child_drive_failed",
+        }
+    task["drive_root"] = str(child_drive)
+    task["child_drive_root"] = str(child_drive)
+    task["budget_drive_root"] = str(pathlib.Path(drive_root))
+    metadata["child_drive_root"] = str(child_drive)
+    metadata["budget_drive_root"] = str(pathlib.Path(drive_root))
+    try:
+        admitted = submit_remote_task_admission(
+            task,
+            connection=connection,
+            service=service,
+        )
+    except Exception:
+        from ouroboros.headless import remove_subagent_task_drive
+
+        remove_subagent_task_drive(
+            pathlib.Path(drive_root), str(task.get("id") or "")
+        )
+        raise
+    if not admitted.get("ok"):
+        from ouroboros.headless import remove_subagent_task_drive
+
+        remove_subagent_task_drive(
+            pathlib.Path(drive_root), str(task.get("id") or "")
+        )
+    return {
+        **admitted,
+        "placement": "remote" if admitted.get("ok") else "blocked",
+        "task": task,
+    }
+
+
 def finish_remote_task_admission(task_id: str, admission_id: str) -> None:
     """Forget process-local in-flight deduplication after queue completion."""
 

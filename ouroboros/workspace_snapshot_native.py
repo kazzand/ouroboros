@@ -34,6 +34,9 @@ _SENSITIVE_NAMES = frozenset(
 )
 _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[str, threading.Lock] = {}
+_MATERIALIZABLE_EXCLUSION_REASONS = frozenset(
+    {"excluded_directory", "protected_artifact", "sensitive_file"}
+)
 
 
 def snapshot_workspace(
@@ -53,7 +56,13 @@ def snapshot_workspace(
         previous, previous_blobs = manifest, blobs
     assert previous is not None
     previous["complete"] = False
+    previous["materializable"] = False
+    previous["integrity_complete"] = False
     previous["unstable"] = True
+    failures = list(previous.get("failures") or [])
+    failures.append({"path": "", "reason": "unstable_observation"})
+    previous["failures"] = failures
+    previous["failure_count"] = len(failures)
     return previous, previous_blobs
 
 
@@ -90,11 +99,24 @@ def guarded_patch_apply(
     root: pathlib.Path,
     args: Mapping[str, Any],
     blobs: Mapping[str, bytes],
+    *,
+    protected_paths: tuple[str, ...] = (),
 ) -> ToolExecutionEnvelope:
     """Check all preconditions, apply once, and restore exact originals on failure."""
 
     with _root_lock(root):
-        current, current_blobs = snapshot_workspace(root)
+        current, current_blobs = snapshot_workspace(
+            root,
+            protected_paths=protected_paths,
+        )
+        if not snapshot_integrity_ready(current):
+            return ToolExecutionEnvelope(
+                text=(
+                    "⚠️ REMOTE_SNAPSHOT_INTEGRITY_FAILED: guarded apply "
+                    "requires an integrity-complete source snapshot."
+                ),
+                trace={"completion": "not_started", "snapshot": current},
+            )
         expected = str(args.get("expected_fingerprint") or "")
         if not expected or current["fingerprint"] != expected:
             return _conflict_envelope(expected, current)
@@ -127,7 +149,14 @@ def guarded_patch_apply(
             applied = _git_apply(root, patch, check=False)
             if applied.returncode:
                 raise RuntimeError(applied.stderr.decode("utf-8", errors="replace") or "git apply failed")
-            after, _ = snapshot_workspace(root)
+            after, _ = snapshot_workspace(
+                root,
+                protected_paths=protected_paths,
+            )
+            if not snapshot_integrity_ready(after):
+                raise RuntimeError(
+                    "remote post-state snapshot is partial or unstable"
+                )
             expected_content = str(args.get("expected_content_fingerprint") or "")
             if (
                 (expected_content and after.get("content_fingerprint") != expected_content)
@@ -171,9 +200,9 @@ def _snapshot_once(
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     entries: list[dict[str, Any]] = []
     blobs: dict[str, bytes] = {}
-    excluded: list[dict[str, str]] = []
+    policy_exclusions: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
     total = 0
-    complete = True
     protected = tuple(
         sorted(
             {
@@ -187,34 +216,99 @@ def _snapshot_once(
         )
     )
     protected_inodes: set[tuple[int, int]] = set()
+
+    def record_failure(path: str, reason: str) -> None:
+        row = {"path": path, "reason": reason}
+        if row not in failures:
+            failures.append(row)
+
+    def walk_error(exc: OSError) -> None:
+        raw = pathlib.Path(str(getattr(exc, "filename", "") or root))
+        try:
+            rel = raw.relative_to(root).as_posix()
+        except ValueError:
+            rel = ""
+        record_failure(rel, "walk_error")
+
+    # Explicit protected paths may live below a directory omitted from ordinary
+    # snapshot traversal. Seed their identities directly so an outside hardlink
+    # cannot export the protected inode under an otherwise harmless name.
     for rel in protected:
         try:
-            target_stat = (root / rel).stat()
-            protected_inodes.add((target_stat.st_dev, target_stat.st_ino))
+            target_stat = root.joinpath(*rel.split("/")).stat()
+        except FileNotFoundError:
+            continue
         except OSError:
-            pass
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            record_failure(rel, "protected_identity_unverified")
+            continue
+        protected_inodes.add((target_stat.st_dev, target_stat.st_ino))
+
+    # Resolve every direct policy path before reading any ordinary entry. This
+    # prevents a lexically-earlier hardlink/symlink alias from exporting the
+    # inode of a later `.env` or protected artifact.
+    for dirpath, dirnames, filenames in os.walk(
+        root,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        current = pathlib.Path(dirpath)
+        dirnames[:] = [
+            name for name in sorted(dirnames)
+            if name not in _EXCLUDED_DIRS
+        ]
+        for name in sorted([*dirnames, *filenames]):
+            path = current / name
+            rel = path.relative_to(root).as_posix()
+            parts = [part.casefold() for part in rel.split("/") if part]
+            folded_name = parts[-1]
+            direct_policy_path = (
+                folded_name in _SENSITIVE_NAMES
+                or folded_name.startswith(".env.")
+                or folded_name.startswith(("id_rsa", "id_ed25519"))
+                or any(part in {".ssh", ".aws", ".gnupg"} for part in parts)
+                or any(
+                    rel == item or rel.startswith(item + "/")
+                    for item in protected
+                )
+            )
+            if not direct_policy_path:
+                continue
+            try:
+                target_stat = path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                record_failure(rel, "protected_identity_unverified")
+                continue
+            protected_inodes.add((target_stat.st_dev, target_stat.st_ino))
+
+    for dirpath, dirnames, filenames in os.walk(
+        root,
+        followlinks=False,
+        onerror=walk_error,
+    ):
         current = pathlib.Path(dirpath)
         kept_dirs: list[str] = []
         for name in sorted(dirnames):
             path = current / name
             rel = path.relative_to(root).as_posix()
             if any(rel == item or rel.startswith(item + "/") for item in protected):
-                excluded.append({"path": rel, "reason": "protected_artifact"})
-                complete = False
+                policy_exclusions.append(
+                    {"path": rel, "reason": "protected_artifact"}
+                )
             elif name in _EXCLUDED_DIRS:
-                excluded.append({"path": rel, "reason": "excluded_directory"})
+                continue
             elif path.is_symlink():
                 filenames.append(name)
             else:
                 kept_dirs.append(name)
         dirnames[:] = kept_dirs
         for name in sorted(filenames):
-            if len(entries) >= MAX_SNAPSHOT_FILES:
-                complete = False
-                break
             path = current / name
             rel = path.relative_to(root).as_posix()
+            if len(entries) + len(policy_exclusions) >= MAX_SNAPSHOT_FILES:
+                record_failure(rel, "file_limit_exceeded")
+                break
             parts = [part.casefold() for part in rel.split("/") if part]
             folded_name = parts[-1]
             if (
@@ -223,8 +317,7 @@ def _snapshot_once(
                 or folded_name.startswith(("id_rsa", "id_ed25519"))
                 or any(part in {".ssh", ".aws", ".gnupg"} for part in parts)
             ):
-                excluded.append({"path": rel, "reason": "sensitive_file"})
-                complete = False
+                policy_exclusions.append({"path": rel, "reason": "sensitive_file"})
                 continue
             protected_match = any(
                 rel == item or rel.startswith(item + "/") for item in protected
@@ -239,23 +332,49 @@ def _snapshot_once(
                 except OSError:
                     pass
             if protected_match:
-                excluded.append({"path": rel, "reason": "protected_artifact"})
-                complete = False
+                policy_exclusions.append(
+                    {"path": rel, "reason": "protected_artifact"}
+                )
                 continue
             try:
                 row, data = _read_stable_entry(path, rel, root)
-            except (OSError, RuntimeError):
-                complete = False
+            except RuntimeError:
+                record_failure(rel, "changed_during_read")
+                continue
+            except OSError as exc:
+                reason = (
+                    "unsafe_symlink"
+                    if "symlink escapes" in str(exc)
+                    else (
+                        "unsupported_file_kind"
+                        if "unsupported file kind" in str(exc)
+                        else "entry_read_error"
+                    )
+                )
+                record_failure(rel, reason)
                 continue
             total += len(data)
             if total > MAX_SNAPSHOT_BYTES:
-                complete = False
+                record_failure(rel, "byte_limit_exceeded")
                 break
             entries.append(row)
             blobs.setdefault(row["sha256"], data)
-        if not complete:
+        if failures:
             break
     entries.sort(key=lambda row: row["path"])
+    policy_exclusions = sorted(
+        {(
+            str(row["path"]),
+            str(row["reason"]),
+        ) for row in policy_exclusions}
+    )
+    policy_rows = [
+        {"path": path, "reason": reason}
+        for path, reason in policy_exclusions
+    ]
+    integrity_complete = not failures
+    policy_scope = "policy_filtered" if policy_rows else "full"
+    complete = integrity_complete and policy_scope == "full"
     git_facts = _git_facts(root)
     content_fingerprint = hashlib.sha256(
         json.dumps(
@@ -267,7 +386,12 @@ def _snapshot_once(
     ).hexdigest()
     fingerprint = hashlib.sha256(
         json.dumps(
-            {"entries": entries, "git": git_facts},
+            {
+                "entries": entries,
+                "git": git_facts,
+                "policy_exclusions": policy_rows,
+                "protected_paths": list(protected),
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -275,14 +399,23 @@ def _snapshot_once(
     ).hexdigest()
     return (
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "entries": entries,
             "fingerprint": fingerprint,
             "content_fingerprint": content_fingerprint,
             "git": git_facts,
             "complete": complete,
-            "exclusions": excluded,
-            "excluded_count": len(excluded),
+            "materializable": integrity_complete,
+            "integrity_complete": integrity_complete,
+            "policy_scope": policy_scope,
+            "unstable": False,
+            "protected_paths": list(protected),
+            "policy_exclusions": policy_rows,
+            "policy_excluded_count": len(policy_rows),
+            "exclusions": policy_rows,
+            "excluded_count": len(policy_rows),
+            "failures": failures,
+            "failure_count": len(failures),
             "total_bytes": total,
         },
         blobs,
@@ -369,10 +502,24 @@ def _validated_changes(
     }
     changes: list[dict[str, Any]] = []
     seen: set[str] = set()
+    excluded_paths = tuple(
+        str(row.get("path") or "")
+        for row in list(current.get("exclusions") or [])
+        if isinstance(row, dict)
+        and str(row.get("reason") or "") in _MATERIALIZABLE_EXCLUSION_REASONS
+        and str(row.get("path") or "")
+    )
+    protected_paths = tuple(
+        str(item)
+        for item in list(current.get("protected_paths") or [])
+        if str(item or "")
+    )
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError("change rows must be objects")
         path = _safe_relpath(item.get("path"))
+        if _policy_exclusion_reason(path, protected_paths, excluded_paths):
+            raise ValueError(f"change targets an omitted policy path: {path}")
         if path in seen:
             raise ValueError(f"duplicate change path: {path}")
         seen.add(path)
@@ -386,6 +533,42 @@ def _validated_changes(
             raise ValueError(f"change precondition mismatch: {path}")
         changes.append({"path": path, "before": before, "after": after})
     return changes
+
+
+def _policy_exclusion_reason(
+    path: str,
+    protected_paths: tuple[str, ...],
+    excluded_paths: tuple[str, ...] = (),
+) -> str:
+    parts = [part.casefold() for part in path.split("/") if part]
+    folded_name = parts[-1] if parts else ""
+    if any(part in _EXCLUDED_DIRS for part in parts):
+        return "excluded_directory"
+    if (
+        folded_name in _SENSITIVE_NAMES
+        or folded_name.startswith(".env.")
+        or folded_name.startswith(("id_rsa", "id_ed25519"))
+        or any(part in {".ssh", ".aws", ".gnupg"} for part in parts)
+    ):
+        return "sensitive_file"
+    for protected in (*protected_paths, *excluded_paths):
+        if path == protected or path.startswith(protected + "/"):
+            return "protected_artifact"
+    return ""
+
+
+def snapshot_integrity_ready(manifest: Mapping[str, Any]) -> bool:
+    failures = manifest.get("failures")
+    failure_count = manifest.get("failure_count")
+    return (
+        manifest.get("integrity_complete") is True
+        and manifest.get("materializable") is True
+        and manifest.get("unstable") is False
+        and isinstance(failures, list)
+        and not failures
+        and type(failure_count) is int
+        and failure_count == 0
+    )
 
 
 def _rollback_rows(

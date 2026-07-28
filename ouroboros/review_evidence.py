@@ -133,20 +133,41 @@ def _collect_remote_turn_diff(
         if isinstance(before.trace, dict)
         else {}
     )
-    if not isinstance(before_manifest, dict) or not before_manifest.get("complete"):
+    if (
+        not isinstance(before_manifest, dict)
+        or not before_manifest.get("integrity_complete")
+    ):
         raise RemoteWorkspacePathError(
             "remote review evidence snapshot is partial or unstable"
         )
+    omitted = [
+        row
+        for row in list(before_manifest.get("policy_exclusions") or [])
+        if isinstance(row, dict)
+    ]
+    excluded_paths = [
+        str(row.get("path") or "")
+        for row in omitted
+        if str(row.get("path") or "")
+    ]
     envelope = execute_remote_system_operation(
         ctx,
         "vcs_diff",
-        {"path": "", "max_chars": max(1, int(limit))},
+        {
+            "path": "",
+            "max_chars": max(1, int(limit)),
+            "_protected_paths": excluded_paths,
+        },
     )
     diff = truncate_review_artifact(str(envelope.text or ""), limit=limit)
     status = execute_remote_system_operation(
         ctx,
         "vcs_status",
-        {"path": "", "max_chars": 4000},
+        {
+            "path": "",
+            "max_chars": 4000,
+            "_protected_paths": excluded_paths,
+        },
     )
     status_text = truncate_review_artifact(str(status.text or ""), limit=4000)
     if status_text and status_text != "(clean)":
@@ -158,25 +179,16 @@ def _collect_remote_turn_diff(
     if include_recent_commit:
         recent = execute_remote_system_operation(
             ctx,
-            "verify_remote_check",
+            "vcs_diff",
             {
-                "cmd": [
-                    "git",
-                    "show",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    "--stat",
-                    "-p",
-                    "HEAD",
-                ],
-                "cwd": str(workspace_ref["remote_root"]),
-                "timeout_sec": 20,
+                "path": "",
+                "recent_commit": True,
+                "max_chars": max(1, int(limit)),
+                "_protected_paths": excluded_paths,
             },
         )
-        process = getattr(recent, "process", None)
         commit = truncate_review_artifact(
-            str(getattr(process, "stdout", "") or ""),
+            str(recent.text or ""),
             limit=limit,
         )
         if commit:
@@ -191,7 +203,10 @@ def _collect_remote_turn_diff(
         if isinstance(after.trace, dict)
         else {}
     )
-    if not isinstance(after_manifest, dict) or not after_manifest.get("complete"):
+    if (
+        not isinstance(after_manifest, dict)
+        or not after_manifest.get("integrity_complete")
+    ):
         raise RemoteWorkspacePathError(
             "remote review evidence snapshot is partial or unstable"
         )
@@ -200,8 +215,18 @@ def _collect_remote_turn_diff(
         raise RemoteWorkspacePathError(
             "remote workspace changed while review evidence was collected"
         )
+    omission_note = ""
+    if omitted:
+        rendered = ", ".join(
+            f"{row.get('path')} ({row.get('reason')})"
+            for row in omitted[:20]
+        )
+        omission_note = (
+            "# Remote snapshot scope: policy_filtered; "
+            f"{len(omitted)} path(s) omitted by policy: {rendered}\n"
+        )
     return redact_projection(
-        f"# Remote snapshot fingerprint: {binding}\n{diff}"
+        f"# Remote snapshot fingerprint: {binding}\n{omission_note}{diff}"
     ).value
 
 

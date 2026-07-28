@@ -602,6 +602,9 @@ def _integrate_remote_subagent_patch(
                 after_manifest["content_fingerprint"]
             ),
             "patch_blob_id": digest,
+            "_protected_paths": list(
+                snapshot_manifest.get("protected_paths") or []
+            ),
             "changes": [
                 {
                     "path": path,

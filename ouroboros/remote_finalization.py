@@ -47,6 +47,81 @@ _REMOTE_IMPORT_JSON_MAX_ITEMS = 100_000
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def complete_remote_import(
+    drive_root: pathlib.Path,
+    context: Mapping[str, Any],
+    wire_result: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    fetched: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Dispatch only closed, serializable Home import contracts."""
+
+    del wire_result
+    kind = str(context.get("import_kind") or "")
+    import_context = (
+        context.get("import_context")
+        if isinstance(context.get("import_context"), Mapping)
+        else {}
+    )
+    if kind == "task_result_v1":
+        return import_remote_result_to_home(
+            pathlib.Path(drive_root),
+            str(context.get("task_id") or ""),
+            str(context.get("operation_id") or ""),
+            envelope,
+            fetched,
+        )
+    if kind == "attachment_stage_v1":
+        from ouroboros.remote_task_files import (
+            validate_staged_attachment_envelope,
+        )
+
+        expected = import_context.get("expected_manifest")
+        if not isinstance(expected, list):
+            raise RuntimeError("attachment import context is unavailable")
+        validate_staged_attachment_envelope(expected, envelope, fetched)
+        return dict(envelope)
+    raise RuntimeError("Home completion importer is unavailable")
+
+
+def _complete_transport_import(
+    transport: Any,
+    context: Mapping[str, Any],
+    wire_result: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    fetched: Mapping[str, Any],
+) -> dict[str, Any]:
+    validator = context.get("validator")
+    if str(context.get("import_kind") or ""):
+        imported = complete_remote_import(
+            pathlib.Path(transport.request.drive_root),
+            context,
+            wire_result,
+            envelope,
+            fetched,
+        )
+    elif callable(validator):
+        imported = validator(wire_result, envelope, fetched)
+    else:
+        raise RuntimeError("Home completion importer is unavailable")
+    if not isinstance(imported, dict):
+        raise RuntimeError("Home completion importer returned a non-object")
+    return imported
+
+
+def _remove_transport_pending(context: Mapping[str, Any]) -> bool:
+    pending = context.get("pending_record")
+    if not isinstance(pending, Mapping):
+        return True
+    from ouroboros.remote_pending_operations import remove_pending_operation
+
+    try:
+        remove_pending_operation(pending)
+    except Exception:
+        return False
+    return True
+
+
 def reconcile_remote_operations(
     transport: Any,
     *,
@@ -99,16 +174,13 @@ def reconcile_remote_operations(
                         stored,
                         transport.fetch_blob,
                     )
-                    validator = context.get("validator")
-                    if not callable(validator):
-                        raise RuntimeError(
-                            "Home completion validator is unavailable"
-                        )
-                    imported = validator(stored, envelope, fetched)
-                    if not isinstance(imported, dict):
-                        raise RuntimeError(
-                            "Home completion validator returned a non-object"
-                        )
+                    imported = _complete_transport_import(
+                        transport,
+                        context,
+                        stored,
+                        envelope,
+                        fetched,
+                    )
                 except Exception as exc:
                     row.update(
                         imported=False,
@@ -142,9 +214,10 @@ def reconcile_remote_operations(
                     "trace": {"reconciled": True},
                 }
                 try:
-                    validator = context.get("validator")
-                    if callable(validator):
-                        terminal = validator(
+                    if context.get("import_kind") != "attachment_stage_v1":
+                        terminal = _complete_transport_import(
+                            transport,
+                            context,
                             {
                                 "completion": "completed",
                                 "prepared_hash": prepared_hash,
@@ -157,9 +230,16 @@ def reconcile_remote_operations(
                                 "process_blobs": {},
                             },
                         )
-                    if not isinstance(terminal, dict):
+                    elif not isinstance(
+                        (
+                            context.get("import_context")
+                            if isinstance(context.get("import_context"), Mapping)
+                            else {}
+                        ).get("expected_manifest"),
+                        list,
+                    ):
                         raise RuntimeError(
-                            "Home completion validator returned a non-object"
+                            "attachment import context is unavailable"
                         )
                     scope = sha256(
                         canonical_json(
@@ -211,7 +291,11 @@ def reconcile_remote_operations(
                     )
                     os.chmod(path, 0o600)
                     retained = sorted(
-                        root.glob("*.json"),
+                        (
+                            item
+                            for item in root.glob("*.json")
+                            if not item.name.endswith(".pending.json")
+                        ),
                         key=lambda item: item.stat().st_mtime_ns,
                         reverse=True,
                     )
@@ -237,8 +321,11 @@ def reconcile_remote_operations(
                     )
                     should_ack = True
         elif completion == "not_started":
-            transport._known_operations.pop(key, None)
-            contexts.pop(key, None)
+            if _remove_transport_pending(context):
+                transport._known_operations.pop(key, None)
+                contexts.pop(key, None)
+            else:
+                row["cleanup_pending"] = True
         if should_ack:
             sequence = transport._send(
                 "ack",
@@ -265,8 +352,11 @@ def reconcile_remote_operations(
                 pass
             else:
                 if ack.get("kind") == "ack":
-                    transport._known_operations.pop(key, None)
-                    contexts.pop(key, None)
+                    if _remove_transport_pending(context):
+                        transport._known_operations.pop(key, None)
+                        contexts.pop(key, None)
+                    else:
+                        row["cleanup_pending"] = True
         rows.append(row)
     return rows
 
@@ -945,6 +1035,7 @@ def write_remote_workspace_patch_artifacts(
                 "type": "remote_patch_export_failed",
                 "message": str(envelope.text or "remote patch export failed"),
                 "sensitive_blocked": list(export.get("sensitive_blocked") or []),
+                "protected_blocked": list(export.get("protected_blocked") or []),
             }
         )
     patch_artifact = next(
@@ -1066,6 +1157,21 @@ def write_deliverable_manifest_artifact(
             str(task.get("project_id") or ""),
         )
         manifest["workspace_root"] = display_root
+        if snapshot is not None:
+            omissions = [
+                dict(row)
+                for row in list(
+                    snapshot.manifest.get("policy_exclusions") or []
+                )[:100]
+                if isinstance(row, dict)
+            ]
+            manifest["source_snapshot_scope"] = str(
+                snapshot.manifest.get("policy_scope") or "full"
+            )
+            manifest["policy_excluded_count"] = int(
+                snapshot.manifest.get("policy_excluded_count") or 0
+            )
+            manifest["policy_exclusions"] = omissions
         path = artifact_dir / "deliverable_manifest.json"
         atomic_write_json(path, manifest, trailing_newline=True)
         return (

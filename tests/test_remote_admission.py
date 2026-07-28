@@ -1,5 +1,6 @@
 import json
 import queue as stdlib_queue
+import subprocess
 import threading
 import time
 
@@ -504,6 +505,426 @@ def test_background_admission_uses_project_identity_and_durable_cancel(
     assert event["admission_id"] == submitted["admission_id"]
     assert event["diagnostic"]["code"] == "cancelled"
     assert event["log_refs"][0]["blob_id"] == "admission-log"
+
+
+def test_cron_ssh_project_stays_requested_until_broker_admission(
+    isolated_queue,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    create_project(
+        isolated_queue,
+        "scheduled-remote",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": "connection-cron",
+            "remote_root": "/srv/cron",
+            "workspace_id": "workspace-cron",
+        },
+    )
+    events = stdlib_queue.Queue()
+    entered = threading.Event()
+    released = threading.Event()
+
+    class Service:
+        def admit_workspace(self, connection, **kwargs):
+            entered.set()
+            released.wait(2)
+            return {
+                "ok": True,
+                "workspace_ref": {
+                    "kind": "ssh",
+                    "connection_id": connection["id"],
+                    "remote_root": kwargs["remote_root"],
+                    "workspace_id": kwargs["workspace_id"],
+                },
+            }
+
+        def cancel_admission(self, _task_id):
+            released.set()
+            return True
+
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda: events)
+    monkeypatch.setattr(
+        "ouroboros.gateway.connections.get_connection",
+        lambda connection_id, *_args, **_kwargs: {
+            "id": connection_id,
+            "ssh_alias": "cron-host",
+            "lifecycle": "active",
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.remote_workspace.get_remote_workspace_service",
+        lambda: Service(),
+    )
+    monkeypatch.setattr(
+        queue,
+        "enqueue_task",
+        lambda *_args, **_kwargs: pytest.fail(
+            "remote cron became runnable before broker admission"
+        ),
+    )
+    queue.upsert_scheduled_task({
+        "id": "remote-cron",
+        "name": "Remote cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "remote scheduled work",
+            "project_id": "scheduled-remote",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+    assert entered.wait(1)
+    requested = list_requested_admissions()
+    assert len(requested) == 1
+    task = requested[0]["task"]
+    assert task["project_id"] == "scheduled-remote"
+    assert task["workspace_mode"] == "external"
+    assert task["memory_mode"] == "forked"
+    assert task["metadata"]["_sealed_workspace_ref"]["remote_root"] == "/srv/cron"
+    assert queue.PENDING == []
+    assert load_task_result(isolated_queue, task["id"])["status"] == STATUS_REQUESTED
+
+    queue.check_scheduled_tasks()
+    assert len(list_requested_admissions()) == 1
+    released.set()
+    assert events.get(timeout=1)["task_id"] == task["id"]
+
+
+def test_cron_missing_project_fails_closed_without_local_enqueue(
+    isolated_queue,
+    monkeypatch,
+):
+    called = []
+    monkeypatch.setattr(
+        queue,
+        "enqueue_task",
+        lambda task, **_kwargs: called.append(task) or task,
+    )
+    queue.upsert_scheduled_task({
+        "id": "missing-project-cron",
+        "name": "Missing project cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "must not run locally",
+            "project_id": "missing-project",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+
+    assert called == []
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    result = load_task_result(isolated_queue, schedule["last_task_id"])
+    assert result["status"] == STATUS_FAILED
+    assert result["reason_code"] == "project_not_found"
+
+
+def test_cron_local_project_uses_registered_workspace_and_child_drive(
+    isolated_queue,
+    tmp_path,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    workspace = tmp_path / "local-cron-workspace"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+    create_project(
+        isolated_queue,
+        "scheduled-local",
+        working_dir=str(workspace),
+    )
+    monkeypatch.setattr(
+        "ouroboros.workspace_admission.bounded_workspace_preflight",
+        lambda root: {"schema_version": 1, "workspace_root": str(root)},
+    )
+    queue.upsert_scheduled_task({
+        "id": "local-project-cron",
+        "name": "Local Project cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "work in the registered project",
+            "project_id": "scheduled-local",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+
+    assert len(queue.PENDING) == 1
+    task = queue.PENDING[0]
+    child = isolated_queue / "state" / "headless_tasks" / task["id"] / "data"
+    assert task["workspace_root"] == str(workspace.resolve())
+    assert task["workspace_mode"] == "external"
+    assert task["memory_mode"] == "forked"
+    assert task["drive_root"] == str(child)
+    assert task["child_drive_root"] == str(child)
+    assert task["budget_drive_root"] == str(isolated_queue)
+    assert task["metadata"]["workspace_root"] == str(workspace.resolve())
+    assert "[HEADLESS_WORKSPACE]" in task["text"]
+    assert child.is_dir()
+
+
+def test_cron_legacy_project_id_is_validated_exactly_at_fire_time(
+    isolated_queue,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    create_project(isolated_queue, "prod")
+    monkeypatch.setattr(
+        queue,
+        "enqueue_task",
+        lambda *_args, **_kwargs: pytest.fail(
+            "malformed legacy project id was normalized into a live Project"
+        ),
+    )
+    queue.upsert_scheduled_task({
+        "id": "legacy-project-id",
+        "name": "Legacy malformed Project id",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "must fail closed",
+            "project_id": "PROD",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    result = load_task_result(isolated_queue, schedule["last_task_id"])
+    assert result["status"] == STATUS_FAILED
+    assert result["reason_code"] == "invalid_project_id"
+    assert result["project_id"] == "PROD"
+
+
+def test_cron_remote_preflight_failure_preserves_identity_without_child_drive(
+    isolated_queue,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    create_project(
+        isolated_queue,
+        "offline-remote",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": "offline-connection",
+            "remote_root": "/srv/offline",
+            "workspace_id": "offline-workspace",
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.gateway.connections.get_connection",
+        lambda *_args, **_kwargs: None,
+    )
+    queue.upsert_scheduled_task({
+        "id": "offline-remote-cron",
+        "name": "Offline remote cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "remote scheduled work",
+            "project_id": "offline-remote",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    task_id = schedule["last_task_id"]
+    result = load_task_result(isolated_queue, task_id)
+    assert result["status"] == STATUS_FAILED
+    assert result["reason_code"] == "remote_connection_unavailable"
+    assert result["project_id"] == "offline-remote"
+    assert result["description"] == "remote scheduled work"
+    assert result["metadata"]["schedule_id"] == "offline-remote-cron"
+    assert (
+        result["metadata"]["_sealed_workspace_ref"]["connection_id"]
+        == "offline-connection"
+    )
+    assert not (
+        isolated_queue / "state" / "headless_tasks" / task_id
+    ).exists()
+
+
+def test_cron_remote_registration_refusal_removes_prepared_child_drive(
+    isolated_queue,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    create_project(
+        isolated_queue,
+        "rejected-remote",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": "rejected-connection",
+            "remote_root": "/srv/rejected",
+            "workspace_id": "rejected-workspace",
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.gateway.connections.get_connection",
+        lambda connection_id, *_args, **_kwargs: {
+            "id": connection_id,
+            "lifecycle": "active",
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.remote_workspace.get_remote_workspace_service",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "ouroboros.gateway.tasks.submit_remote_task_admission",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "status": "blocked",
+            "reason_code": "synthetic_registration_refusal",
+        },
+    )
+    queue.upsert_scheduled_task({
+        "id": "rejected-remote-cron",
+        "name": "Rejected remote cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "remote scheduled work",
+            "project_id": "rejected-remote",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    task_id = schedule["last_task_id"]
+    result = load_task_result(isolated_queue, task_id)
+    assert result["reason_code"] == "synthetic_registration_refusal"
+    assert not (
+        isolated_queue / "state" / "headless_tasks" / task_id
+    ).exists()
+
+
+def test_cron_broker_denial_updates_schedule_failure_state(
+    isolated_queue,
+    monkeypatch,
+):
+    from ouroboros.projects_registry import create_project
+
+    create_project(
+        isolated_queue,
+        "denied-remote",
+        workspace_ref={
+            "kind": "ssh",
+            "connection_id": "denied-connection",
+            "remote_root": "/srv/denied",
+            "workspace_id": "denied-workspace",
+        },
+    )
+    events = stdlib_queue.Queue()
+
+    class Service:
+        def admit_workspace(self, _connection, **_kwargs):
+            return {
+                "ok": False,
+                "error": "broker denied admission",
+                "error_code": "broker_denied",
+            }
+
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda: events)
+    monkeypatch.setattr(
+        "ouroboros.gateway.connections.get_connection",
+        lambda connection_id, *_args, **_kwargs: {
+            "id": connection_id,
+            "lifecycle": "active",
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.remote_workspace.get_remote_workspace_service",
+        lambda: Service(),
+    )
+    queue.upsert_scheduled_task({
+        "id": "denied-remote-cron",
+        "name": "Denied remote cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {
+            "type": "task",
+            "text": "remote scheduled work",
+            "project_id": "denied-remote",
+        },
+    })
+
+    queue.check_scheduled_tasks()
+    event = events.get(timeout=1)
+    outcome = complete_requested_admission(
+        event["task_id"],
+        admission_id=event["admission_id"],
+        admitted_task=event.get("admitted_task"),
+        error=event["error"],
+        reason_code=event["reason_code"],
+    )
+
+    assert outcome["status"] == "failed"
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    assert schedule["failure_count"] == 1
+    assert "broker_denied" in schedule["last_error"]
+
+
+def test_remote_schedule_completion_does_not_overwrite_newer_fire(
+    isolated_queue,
+):
+    from supervisor.task_lifecycle import _record_completed_scheduled_admission
+
+    queue.upsert_scheduled_task({
+        "id": "guarded-remote-cron",
+        "name": "Guarded remote cron",
+        "enabled": True,
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2099-01-01T00:00:00+00:00",
+        "last_task_id": "newer-task",
+        "failure_count": 2,
+        "last_error": "newer outcome",
+        "task": {"type": "task", "text": "remote scheduled work"},
+    })
+
+    _record_completed_scheduled_admission(
+        queue,
+        {
+            "id": "older-task",
+            "metadata": {"schedule_id": "guarded-remote-cron"},
+        },
+        succeeded=False,
+        reason_code="late_broker_denial",
+    )
+
+    schedule = queue.list_scheduled_tasks()["tasks"][0]
+    assert schedule["failure_count"] == 2
+    assert schedule["last_error"] == "newer outcome"
 
 
 def test_admission_completion_broadcast_preserves_bounded_evidence(monkeypatch):

@@ -304,13 +304,18 @@ def test_reconnect_keeps_a_healthy_transport_and_only_reconciles(monkeypatch):
     transport._start_session = lambda **_kwargs: events.append("start")
     monkeypatch.setattr(
         remote_ssh,
+        "validate_transport_session_identity",
+        lambda _transport: events.append("validate"),
+    )
+    monkeypatch.setattr(
+        remote_ssh,
         "reconcile_remote_operations",
         lambda *_args, **_kwargs: [],
     )
 
     transport.reconnect(timeout_sec=7)
 
-    assert events == ["reset", "bootstrap", "start"]
+    assert events == ["reset", "bootstrap", "start", "validate"]
 
 
 def test_panic_pipe_write_is_portable_and_cleanup_is_unconditional(

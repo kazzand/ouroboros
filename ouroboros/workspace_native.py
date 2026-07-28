@@ -66,17 +66,15 @@ from ouroboros.workspace_payload_native import (
 )
 from ouroboros.workspace_query_native import (
     classify_workspace_path,
+    execute_git_workspace_operation,
     execute_workspace_query_operation,
-    export_workspace_patch,
-    git_workspace,
 )
 from ouroboros.workspace_snapshot_native import (
     guarded_patch_apply as _guarded_patch_apply,
+    snapshot_operation,
 )
-from ouroboros.workspace_snapshot_native import snapshot_operation
 
 _SERVICE_LOG_TAIL_MAX = 80_000
-
 @dataclass
 class _NativeService:
     name: str
@@ -305,7 +303,13 @@ def prepare_native_operation(
         "task_id": str(task_id or ""),
     }
     if isinstance((protected_rows := args.get("_protected_paths")), list):
-        facts["protected_paths"] = [_relative_text(item) for item in protected_rows[:1000] if str(item or "").strip()]
+        if len(protected_rows) > 1000:
+            raise ValueError("protected path policy exceeds the supported limit")
+        facts["protected_paths"] = [
+            _relative_text(item)
+            for item in protected_rows
+            if str(item or "").strip()
+        ]
     if operation == "execute_reviewed_payload":
         execution_args, payload_facts = validate_reviewed_payload(
             execution_args,
@@ -1506,29 +1510,25 @@ def execute_native_operation(
                 control=control,
                 process_runner=_run_process,
             )
-        if operation == "vcs_status":
-            return NativeOperationResult(
-                git_workspace(root, args, ["status", "--porcelain"])
-            )
-        if operation == "vcs_diff":
-            if bool(args.get("artifact_export", False)):
-                return export_workspace_patch(root, args)
-            staged = bool(args.get("staged", False))
-            subcommand = ["diff"]
-            if staged:
-                subcommand.append("--staged")
-            if bool(args.get("name_only", False)):
-                subcommand.append("--name-only")
-            elif bool(args.get("stat", False)):
-                subcommand.append("--stat")
-            return NativeOperationResult(
-                git_workspace(root, args, subcommand)
+        if operation in {"vcs_status", "vcs_diff"}:
+            return execute_git_workspace_operation(
+                root,
+                operation,
+                args,
+                native_facts,
             )
         if operation == "snapshot_manifest_and_blob_export":
             return snapshot_operation(root, protected_paths=tuple(native_facts.get("protected_paths") or ()))
         if operation == "guarded_patch_apply":
             return NativeOperationResult(
-                _guarded_patch_apply(root, args, supplied_blobs)
+                _guarded_patch_apply(
+                    root,
+                    args,
+                    supplied_blobs,
+                    protected_paths=tuple(
+                        native_facts.get("protected_paths") or ()
+                    ),
+                )
             )
         if operation == "classify_ambiguous_workspace_path":
             return NativeOperationResult(classify_workspace_path(root, args))
