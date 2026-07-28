@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ouroboros.platform_layer import (
+    file_lock_exclusive,
+    file_unlock,
     kill_process_group_id,
     process_group_status,
 )
@@ -288,16 +290,10 @@ def _state_file_lock(path: pathlib.Path):
         MODE_PRIVATE_FILE,
     )
     try:
-        if os.name == "posix":
-            import fcntl
-
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        file_lock_exclusive(descriptor)
         yield
     finally:
-        if os.name == "posix":
-            import fcntl
-
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        file_unlock(descriptor)
         os.close(descriptor)
 
 

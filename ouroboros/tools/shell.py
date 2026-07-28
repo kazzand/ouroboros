@@ -68,6 +68,10 @@ from ouroboros.workspace_native import (
     _maybe_autocorrect_grep_backslash_pipe,
     _run_process as _run_native_process,
 )
+from ouroboros.workspace_payload_native import (
+    sensitive_output_component_reason as _sensitive_output_component_reason,
+    sensitive_output_name,
+)
 
 log = logging.getLogger(__name__)
 # Tracked process groups let panic kill descendant trees too.
@@ -240,13 +244,7 @@ def _protected_output_source_reason(ctx: ToolContext, source: pathlib.Path, labe
     except Exception:
         pass
 
-    name_lower = source.name.lower()
-    if (
-        source.name.startswith(".")
-        or name_lower in _SENSITIVE_OUTPUT_NAMES
-        or name_lower.endswith(_SENSITIVE_OUTPUT_SUFFIXES)
-        or any(marker in name_lower for marker in _SENSITIVE_OUTPUT_MARKERS)
-    ):
+    if sensitive_output_name(source.name):
         return f"credential-like output {source.name} is not a deliverable artifact"
 
     try:
@@ -872,23 +870,6 @@ _GLUED_REDIRECT_RE = re.compile(
 )
 _SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
-_SENSITIVE_OUTPUT_NAMES = frozenset({".env", ".env.local", "credentials.json", "secrets.json", "token.json"})
-_SENSITIVE_OUTPUT_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
-_SENSITIVE_OUTPUT_MARKERS = ("api_key", "apikey", "access_token", "bearer_token", "credential", "password", "refresh_token", "secret")
-_SENSITIVE_OUTPUT_COMPONENT_NAMES = _SENSITIVE_OUTPUT_NAMES | frozenset({"secret", "secrets", "credential", "credentials", "token", "tokens"})
-
-
-def _sensitive_output_component_reason(parts: tuple[str, ...]) -> str:
-    for part in parts:
-        text = str(part or "")
-        if not text:
-            continue
-        low = text.lower()
-        if text.startswith("."):
-            return f"hidden/control output path component {text} is not a deliverable artifact"
-        if low in _SENSITIVE_OUTPUT_COMPONENT_NAMES or low.endswith(_SENSITIVE_OUTPUT_SUFFIXES) or any(marker in low for marker in _SENSITIVE_OUTPUT_MARKERS):
-            return f"credential-like output path component {text} is not a deliverable artifact"
-    return ""
 _OUTPUT_CALL_PATH_RE = r"(?:~?/[^'\"]+|[A-Za-z]:[\\/][^'\"]+|\\\\[^'\"]+)"
 _OUTPUT_REDIRECT_PATH_RE = r"(?:~?/[^\s;|&'\"]+|[A-Za-z]:[\\/][^\s;|&'\"]+|\\\\[^\s;|&'\"]+)"
 _EMBEDDED_OUTPUT_PATH_RE = re.compile(_OUTPUT_CALL_PATH_RE)

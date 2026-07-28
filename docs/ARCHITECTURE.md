@@ -28,6 +28,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── task_lifecycle.py    ← Queue-owned atomic acceptance fences, one root-budget admission marker plus replay-safe task resume, cascade cancellation, and fenced Project deletion/quiescence; extends queue state without creating a second lifecycle authority
   │   ├── task_reaper.py       ← (v6.38.0) Variant A off-loop worker reaper (extracted from queue.py): kill/join/archive/respawn a timed-out worker on a single-owner background thread, off the loop critical path. (v6.38.1) STRICT fail-closed: if the worker will not confirm dead, it holds the slot `reaping` and leaves the task RUNNING (no terminal/task_done/retry/respawn while it may be alive), emits `task_reaper_wedged` + an owner /restart hint, and lets the custody reaper end the orphan on the next generation
   │   ├── schedule_time.py     ← Cron/timezone schedule time parsing helpers
+  │   ├── scheduled_dispatch.py ← Shared scheduled-task Project admission result and failure-state helpers; keeps timer firing on the same local/SSH placement seam as ordinary task creation
   │   ├── evolution_lifecycle.py ← Evolution campaign state + transaction lifecycle (moved from queue.py in v6.30.0): campaign file IO, start/pause, begin/update transaction, cycle-outcome recording, deterministic no_op/abandoned worktree cleanup, owner cycle reports, supervisor auto-restart request
   │   ├── events.py            ← Event dispatcher (worker→supervisor events) + managed-update assisted-merge orphan watchdog hook
   │   ├── git_ops.py           ← Git operations (clone, checkout, rescue, rollback, push, credential helper)
@@ -140,6 +141,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── server_control.py    ← Process-control helpers: restart, panic stop
       ├── remote_protocol.py   ← Strict canonical JSON + bounded binary framing, prepared-call identity, sequence and lease contracts
       ├── remote_workspace.py  ← Server-owned project-session broker, worker Pipe proxy, admission, leases, reconciliation and remote blob import
+      ├── remote_pending_operations.py ← Home-side durable pre-CONTINUE intent validation, retention and startup reconciliation through the ordinary per-Project broker admission lock
       ├── remote_ssh.py        ← Minimal-environment live OpenSSH protocol transport, health and reconnect
       ├── remote_ssh_bootstrap.py ← Bounded manifest/stat/stream verification and atomic immutable execd release installation
       ├── execd.py / execd_state.py ← Remote restricted entrypoint, operation journal/CAS, workspace identity and independent process custody
@@ -149,6 +151,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── remote_service_leases.py ← Home projection of task/service lease identity used by cancel, teardown and reconnect
       ├── remote_claude.py     ← Verified SSH snapshot → Home Claude SDK → guarded remote binary-patch bridge
       ├── remote_finalization.py ← Remote-native patch/deliverable capture plus pre-ACK redacted result/process import into Home task artifacts
+      ├── remote_snapshot_home.py ← Home-side remote snapshot manifest topology/integrity validation before materialization or patch production
       ├── remote_plan_review.py ← Bounded verified SSH snapshot adapter for existing Home plan/review faculties
       ├── remote_worker_proxy.py ← Multiprocessing worker request/reply proxy to the server-owned broker
       ├── server_entrypoint.py ← CLI argument parsing, port-binding helpers
@@ -772,10 +775,11 @@ PIDs are never copied into Home's process ledger:
 └── state/                                  ← mode 0700
     ├── continuity/host_id.json             ← mode 0600 continuity ID
     ├── workspaces/<workspace_id>/
-    │   ├── blobs/                           ← content-addressed native/import data
-    │   ├── spool/                           ← retained operation results until ACK
-    │   └── operations/                      ← fsync-before-effect operation journal
-    └── custody/<server_generation>/<workspace_id>.json
+    │   └── connections/<connection_id>/projects/<project_id>/
+    │       ├── blobs/                       ← content-addressed native/import data
+    │       ├── spool/                       ← retained operation results until ACK
+    │       └── operations/                  ← fsync-before-effect operation journal
+    └── custody/<server_generation>/<project_id>/<workspace_id>.json
                                                 ← remote PGID fingerprints + leases
 ```
 

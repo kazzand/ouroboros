@@ -593,7 +593,8 @@ def build_remote_reviewed_payload(
         REVIEWED_PAYLOAD_TOTAL_BYTES,
     )
 
-    loaded = find_skill(pathlib.Path(ctx.drive_root), skill_name, repo_path=repo_path)
+    drive_root = pathlib.Path(ctx.drive_root)
+    loaded = find_skill(drive_root, skill_name, repo_path=repo_path)
     if loaded is None or loaded.load_error:
         return f"⚠️ REMOTE_PAYLOAD_BLOCKED: skill {skill_name!r} is unavailable.", None, {}
     kind = "extension_tool" if surface else "script"
@@ -621,6 +622,24 @@ def build_remote_reviewed_payload(
             skill_name,
             loaded.review.status,
             stale=loaded.review.is_stale_for(content_hash),
+        ), None, {}
+    deps_block = _skill_deps_exec_block(drive_root, loaded)
+    if deps_block:
+        return deps_block, None, {}
+    grants = grant_status_for_skill(drive_root, loaded)
+    missing_core = list(grants.get("missing_keys") or [])
+    missing_permissions = list(grants.get("missing_permissions") or [])
+    if missing_core or missing_permissions:
+        requested = []
+        if missing_core:
+            requested.append(f"core settings keys {missing_core}")
+        if missing_permissions:
+            requested.append(f"permissions {missing_permissions}")
+        return (
+            "⚠️ REMOTE_PAYLOAD_BLOCKED: skill "
+            f"{loaded.name!r} requests {' and '.join(requested)}. "
+            "Grant them from the Skills UI after a fresh executable review "
+            "before remote execution."
         ), None, {}
     if loaded.manifest.env_from_settings:
         return (

@@ -28,6 +28,58 @@ from ouroboros.workspace_native_contract import (
     NativeOperationResult,
 )
 
+_SENSITIVE_OUTPUT_NAMES = frozenset(
+    {".env", ".env.local", "credentials.json", "secrets.json", "token.json"}
+)
+_SENSITIVE_OUTPUT_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
+_SENSITIVE_OUTPUT_MARKERS = (
+    "api_key",
+    "apikey",
+    "access_token",
+    "bearer_token",
+    "credential",
+    "password",
+    "refresh_token",
+    "secret",
+)
+_SENSITIVE_OUTPUT_COMPONENT_NAMES = _SENSITIVE_OUTPUT_NAMES | frozenset(
+    {"secret", "secrets", "credential", "credentials", "token", "tokens"}
+)
+
+
+def sensitive_output_name(name: str) -> bool:
+    text = str(name or "")
+    lowered = text.lower()
+    return (
+        text.startswith(".")
+        or lowered in _SENSITIVE_OUTPUT_NAMES
+        or lowered.endswith(_SENSITIVE_OUTPUT_SUFFIXES)
+        or any(marker in lowered for marker in _SENSITIVE_OUTPUT_MARKERS)
+    )
+
+
+def sensitive_output_component_reason(parts: tuple[str, ...]) -> str:
+    for part in parts:
+        text = str(part or "")
+        if not text:
+            continue
+        lowered = text.lower()
+        if text.startswith("."):
+            return (
+                f"hidden/control output path component {text} "
+                "is not a deliverable artifact"
+            )
+        if (
+            lowered in _SENSITIVE_OUTPUT_COMPONENT_NAMES
+            or lowered.endswith(_SENSITIVE_OUTPUT_SUFFIXES)
+            or any(marker in lowered for marker in _SENSITIVE_OUTPUT_MARKERS)
+        ):
+            return (
+                f"credential-like output path component {text} "
+                "is not a deliverable artifact"
+            )
+    return ""
+
 
 def attach_remote_verification_facts(
     workspace_root: pathlib.Path,
@@ -688,6 +740,17 @@ def collect_declared_outputs(
             if path.is_symlink():
                 failed = True
                 notes.append(f"blocked symlink output: {path}")
+                rows = []
+                break
+            rel_parts = (
+                path.relative_to(target).parts
+                if target.is_dir()
+                else (path.name,)
+            )
+            component_reason = sensitive_output_component_reason(rel_parts)
+            if component_reason:
+                failed = True
+                notes.append(f"blocked sensitive output: {path}: {component_reason}")
                 rows = []
                 break
             data = path.read_bytes()
