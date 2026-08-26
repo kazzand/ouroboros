@@ -148,6 +148,7 @@ BAND_PATHS = {
     "ouroboros/projects_registry.py": "Entered the band from 999 lines: the stuck-Working liveness sprint homed the project-thread membership lens (mtime-cached) and its broadcast-choke marker here \u2014 registry semantics belong to the registry, not to message_bus.",
     "ouroboros/protected_artifacts.py": None,
     "ouroboros/review.py": "Entered the band from 952 lines: re-anchoring the size ratchet on the official line added the candidate and pairwise base-vs-tip transition validators (validate_size_ratchet_candidate/validate_size_ratchet_transition_against_base) with merge-aware previous-manifest resolution, replacing the retired first-parent history audit (update-flow-redesign sprint, Q7-C/Q18-A/Q19-A owner decisions).",
+    "ouroboros/safety.py": "Entered the band from 954 lines with the safety-supervisor rate-limit fix: ONE shared model-call helper now serves both the primary and repair safety calls (it already deletes the duplicated call block), recognising a provider rate limit in BOTH wire shapes, taking one bounded backoff plus one retry, then failing open with a durable audit row; the bounded newest-first conversation budget is the second half. Measured split: ~70 lines of new logic (shared helper, two-shape rate-limit recognition, bounded budget) plus ~35 lines of rationale/docstrings.",
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
