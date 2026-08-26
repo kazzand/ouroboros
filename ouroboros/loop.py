@@ -40,7 +40,7 @@ from ouroboros.loop_tool_execution import (
     reclaim_negative_memo,
     reclaim_trace_refs,
 )
-from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event
+from ouroboros.loop_llm_call import RETRY_WALL_EXHAUSTED_KEY, call_llm_with_retry, emit_llm_usage_event
 from ouroboros.pricing import estimate_cost_optional
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
@@ -3496,24 +3496,21 @@ def _handle_owner_stop_finalization(
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization: the model returned no usable response
-    after the transport same-model reroute + retries (+ any configured
-    cross-model fallback). SALVAGE like the other forced rails — one tool-less
-    final answer (which itself benefits from the same-model reroute) and,
-    failing that, the last assistant text already produced — but terminalize as
-    an INFRA FAILURE, never as a completion: an outage interrupts the task with
-    the objective unmet, and calling that "completed (best effort)" was a lie
-    that hid a real outage from the owner (95 minutes of silence)."""
-    # A stale DeliveryCandidate is still the best complete text available when
-    # the provider is dead. _forced_fallback_result preserves its original
-    # evidence provenance and adds a host-owned resume disclosure rather than
-    # laundering unchanged text onto the newer evidence fingerprint.
+    """Provider-death terminalization: no usable response after the transport
+    same-model reroute, retries, and any configured cross-model fallback.
+    SALVAGE like the other forced rails — one tool-less final answer (skipped
+    when the retry wall is already spent), else the last assistant text — but
+    terminalize as an INFRA FAILURE, never a completion: an outage leaves the
+    objective unmet, and "completed (best effort)" hid that from the owner."""
+    # A stale DeliveryCandidate is still the best complete text when the provider is
+    # dead; _forced_fallback_result keeps its evidence provenance and adds a resume
+    # disclosure instead of laundering it onto the newer evidence fingerprint.
     candidate = _live_delivery_candidate(ctx)
     salvaged = candidate.full_text if candidate is not None else _last_assistant_text(ctx.messages)
     if candidate is None and not salvaged and ctx.drive_root is not None:
-        # B2: the current (possibly compacted) transcript may no longer hold the
-        # last useful assistant text, but every LLM round was persisted — fall back
-        # to the durable salvage source named by the plan (latest_llm_response_text).
+        # B2: the live (possibly compacted) transcript may no longer hold the last
+        # useful assistant text, but every LLM round was persisted — fall back to
+        # the durable salvage source (latest_llm_response_text).
         try:
             from ouroboros.observability import latest_llm_response_text
             salvaged = latest_llm_response_text(pathlib.Path(ctx.drive_root), ctx.task_id) or ""
@@ -3535,13 +3532,12 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
     text, usage, llm_trace = _forced_final_answer(
         ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable",
     )
-    # Honesty (P1): a provider outage interrupts the task — it never "completes"
-    # it. Stamp the infra-failure execution status so the outcome reducer lands
-    # on infra_failed/provider (terminal: failed) instead of the old best-effort
-    # promotion to "completed"; the salvage text still rides the result body.
-    # Skipped when a swarm routing handoff already cleared the rail (the admitted
-    # task owns its lifecycle). NOTE: "interrupted" is deliberately NOT used —
-    # STATUS_INTERRUPTED is a pre-requeue, non-terminal state in this codebase.
+    # Honesty (P1): an outage interrupts the task, it never "completes" it. Stamp the
+    # infra-failure status so the outcome reducer lands on infra_failed/provider
+    # (terminal: failed) instead of the old best-effort promotion; the salvage text
+    # still rides the result body. Skipped when a swarm routing handoff already
+    # cleared the rail (that admitted task owns its lifecycle). "interrupted" is
+    # deliberately NOT used: STATUS_INTERRUPTED is pre-requeue and non-terminal.
     if str(usage.get("reason_code") or "") == "provider_unavailable":
         usage["execution_status"] = RESULT_INFRA_FAILED
     return text, usage, llm_trace
@@ -5483,6 +5479,11 @@ def _forced_final_answer(
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
         return router_result
+    if reason_code == "provider_unavailable" and ctx.accumulated_usage.get(RETRY_WALL_EXHAUSTED_KEY):
+        # OB-01, before the prompt append: no call, no unsent prompt (ARCHITECTURE §6).
+        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+        _drain_forced_owner_directives(ctx, llm_trace)
+        return _forced_fallback_result(ctx, llm_trace, fallback_text, reason_code)
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     prompt += _forced_delegation_note(tools_ctx, llm_trace)
     _append_or_merge_user_message(ctx.messages, prompt)
@@ -5496,8 +5497,7 @@ def _forced_final_answer(
         except Exception:
             log.warning("Failed to get final response after %s", reason_code, exc_info=True)
             extracted = ""
-        ctx.accumulated_usage["execution_status"] = "failed"
-        ctx.accumulated_usage["reason_code"] = reason_code
+        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
         if not _drain_forced_owner_directives(ctx, llm_trace):
             break
         if attempt == 1:
@@ -5520,17 +5520,14 @@ def _forced_final_answer(
             "new complete answer bound to every owner directive now present.",
         )
 
-    extracted, control_degraded = _resolve_forced_delivery_control(
-        getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
-    )
+    extracted, control_degraded = _resolve_forced_delivery_control(tools_ctx, extracted)
     if extracted:
-        # Typed fact for the best_effort outcome gate: a REAL model answer
-        # was extracted (host fallback strings never set this).
+        # Typed fact for the best_effort gate: a REAL model answer was extracted
+        # (host fallback strings never set this).
         ctx.accumulated_usage["_best_effort_extracted"] = True
-        tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         plan_suffix = (
-            _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
-            if tool_ctx is not None else ""
+            _force_plan_disclosure(tools_ctx, llm_trace, forced_reason=reason_code)
+            if tools_ctx is not None else ""
         )
         full_text = _compose_delivery_suffix(
             extracted, plan_suffix + _forced_orphan_note(ctx),

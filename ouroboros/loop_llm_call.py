@@ -124,6 +124,14 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
 # large) keep failing fast. There is NO cross-model fallback here — the same
 # request is retried on the SAME model.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
+# OB-01: stamped on ``accumulated_usage`` when THIS invocation spent its TRANSIENT
+# retry wall — the same-model attempt budget, or the deadline that bounds the backoff
+# between attempts — without ever getting a usable response. A PERMANENT class
+# (auth / quota / bad request / permanent body error) fails fast and leaves the wall
+# unspent, so it is deliberately never marked. `loop._forced_final_answer` reads it
+# (on the `provider_unavailable` rail alone) to decide whether one more forced model
+# call can still land, or would only re-burn the budget against a dead provider.
+RETRY_WALL_EXHAUSTED_KEY = "_llm_retry_wall_exhausted"
 # Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
 # retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
 # cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
@@ -803,6 +811,43 @@ def _record_llm_call_error(
     return False
 
 
+def _stop_after_llm_error(
+    ctx: _LlmErrorContext,
+    *,
+    max_retries: int,
+    transient_budget: int,
+    deadline_ts: Optional[float],
+) -> bool:
+    """Retry decision for the exception path: ``True`` stops the attempt loop.
+
+    It also stamps the OB-01 marker when the TRANSIENT wall — the attempt budget,
+    or the deadline that bounds the backoff between attempts — is what ended the
+    retries. A permanent class never reaches here (it already stopped inside
+    ``_record_llm_call_error``), so the marker means exactly "more attempts on
+    this model are pointless", never "this request was refused".
+    """
+    accumulated_usage = ctx.accumulated_usage
+    error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
+    is_transient = error_kind in _TRANSIENT_RETRY_KINDS
+    # Non-transient retryable classes keep the caller's max_retries, but never
+    # exceed the loop ceiling (transient_budget) — so an attempt_cap'd fallback
+    # candidate does not waste a backoff sleep on an iteration the loop won't run.
+    # For the primary, transient_budget >= max_retries, so this is a no-op there.
+    attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
+    if ctx.attempt < attempt_budget - 1:
+        backoff = _retry_backoff_sec(accumulated_usage, error_kind, ctx.attempt, is_transient)
+        if _sleep_within_deadline(backoff, deadline_ts):
+            return False
+        _emit_retry_deadline_exhausted(
+            ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
+            round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
+            model=ctx.model, error_kind=error_kind,
+        )
+    if is_transient:
+        accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
+    return True
+
+
 def _emit_empty_response_events(
     event_type: str,
     *,
@@ -983,6 +1028,11 @@ def call_llm_with_retry(
     """
     msg = None
     drive_root = pathlib.Path(drive_logs).parent
+    # The primary model and every fallback candidate SHARE this dict, so the marker
+    # must describe THIS invocation only. Without the entry clear, a transient-exhausted
+    # primary followed by a permanent-failed fallback would still read as "the wall is
+    # spent" and wrongly skip the one forced call the permanent class is entitled to.
+    accumulated_usage.pop(RETRY_WALL_EXHAUSTED_KEY, None)
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     context_fit_event_fields = (
@@ -1152,11 +1202,17 @@ def call_llm_with_retry(
                         round_id=round_id, round_idx=round_idx, attempt=attempt,
                         model=model, error_kind=event_type,
                     )
+                if not permanent_body_error:
+                    # Transient wall spent: the attempt budget or the deadline ran out
+                    # with the model still returning nothing usable. A permanent body
+                    # error left it unspent and keeps its forced-call chance.
+                    accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
                 return None, cost
 
             accumulated_usage.pop("execution_status", None)
             accumulated_usage.pop("result_status", None)
             accumulated_usage.pop("reason_code", None)
+            accumulated_usage.pop(RETRY_WALL_EXHAUSTED_KEY, None)
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
 
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
@@ -1217,41 +1273,27 @@ def call_llm_with_retry(
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
             _clear_custom_receipts(accumulated_usage)
-            if _record_llm_call_error(
-                e,
-                _LlmErrorContext(
-                    task_id=task_id,
-                    task_type=task_type,
-                    execution_id=execution_id,
-                    round_id=round_id,
-                    llm_call_id=llm_call_id,
-                    round_idx=round_idx,
-                    attempt=attempt,
-                    model=model,
-                    request_ref=request_ref,
-                    drive_logs=drive_logs,
-                    event_queue=event_queue,
-                    accumulated_usage=accumulated_usage,
-                    context_fit_event_fields=context_fit_event_fields,
-                ),
+            error_ctx = _LlmErrorContext(
+                task_id=task_id,
+                task_type=task_type,
+                execution_id=execution_id,
+                round_id=round_id,
+                llm_call_id=llm_call_id,
+                round_idx=round_idx,
+                attempt=attempt,
+                model=model,
+                request_ref=request_ref,
+                drive_logs=drive_logs,
+                event_queue=event_queue,
+                accumulated_usage=accumulated_usage,
+                context_fit_event_fields=context_fit_event_fields,
+            )
+            if _record_llm_call_error(e, error_ctx):
+                break
+            if _stop_after_llm_error(
+                error_ctx, max_retries=max_retries,
+                transient_budget=transient_budget, deadline_ts=deadline_ts,
             ):
-                break
-            error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
-            is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-            # Non-transient retryable classes keep the caller's max_retries, but never
-            # exceed the loop ceiling (transient_budget) — so an attempt_cap'd fallback
-            # candidate does not waste a backoff sleep on an iteration the loop won't run.
-            # For the primary, transient_budget >= max_retries, so this is a no-op there.
-            attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
-            if attempt >= attempt_budget - 1:
-                break
-            backoff = _retry_backoff_sec(accumulated_usage, error_kind, attempt, is_transient)
-            if not _sleep_within_deadline(backoff, deadline_ts):
-                _emit_retry_deadline_exhausted(
-                    drive_logs, task_id=task_id, execution_id=execution_id,
-                    round_id=round_id, round_idx=round_idx, attempt=attempt,
-                    model=model, error_kind=error_kind,
-                )
                 break
 
     return None, 0.0
